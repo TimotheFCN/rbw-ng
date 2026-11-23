@@ -455,6 +455,41 @@ struct SyncResCipher {
     key: Option<String>,
     #[serde(rename = "Reprompt", alias = "reprompt")]
     reprompt: CipherRepromptType,
+    #[serde(rename = "RevisionDate", alias = "revisionDate", default)]
+    revision_date: Option<String>,
+    #[serde(rename = "Favorite", alias = "favorite", default)]
+    favorite: Option<bool>,
+    #[serde(rename = "ArchivedDate", alias = "archivedDate", default)]
+    archived_date: Option<String>,
+}
+
+// The id and revision date of a cipher the server just created or changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedCipher {
+    pub id: String,
+    pub revision_date: Option<String>,
+}
+
+impl SavedCipher {
+    fn from_response(json: &serde_json::Value) -> Self {
+        let field = |upper: &str, lower: &str| {
+            json.get(lower)
+                .or_else(|| json.get(upper))
+                .and_then(serde_json::Value::as_str)
+                .map(std::string::ToString::to_string)
+        };
+        Self {
+            id: field("Id", "id").unwrap_or_default(),
+            revision_date: field("RevisionDate", "revisionDate"),
+        }
+    }
+}
+
+// Bitwarden answers "The cipher you are updating is out of date. ..." and
+// Vaultwarden "The client copy of this cipher is out of date. ..." when
+// lastKnownRevisionDate is older than the cipher.
+fn is_out_of_date(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("out of date")
 }
 
 impl SyncResCipher {
@@ -579,6 +614,9 @@ impl SyncResCipher {
             history,
             key: self.key.clone(),
             master_password_reprompt: self.reprompt,
+            revision_date: self.revision_date.clone(),
+            favorite: self.favorite.unwrap_or(false),
+            archived: self.archived_date.is_some(),
         })
     }
 }
@@ -1618,7 +1656,7 @@ impl Client {
         fields: &[crate::db::Field],
         notes: Option<&str>,
         folder_id: Option<&str>,
-    ) -> Result<()> {
+    ) -> Result<SavedCipher> {
         let req =
             ciphers_post_req(user_id, name, data, fields, notes, folder_id);
         let client = self.blocking_reqwest_client()?;
@@ -1629,7 +1667,9 @@ impl Client {
             .send()
             .map_err(|source| Error::Reqwest { source })?;
         match res.status() {
-            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::OK => {
+                Ok(SavedCipher::from_response(&res.json_with_path()?))
+            }
             reqwest::StatusCode::UNAUTHORIZED => {
                 Err(Error::RequestUnauthorized)
             }
@@ -1675,7 +1715,8 @@ impl Client {
         folder_uuid: Option<&str>,
         history: &[crate::db::HistoryEntry],
         key: Option<&str>,
-    ) -> Result<()> {
+        last_known_revision_date: Option<&str>,
+    ) -> Result<SavedCipher> {
         let (login, card, identity, secure_note) = cipher_req_data(data);
         let req = CiphersPutReq {
             ty: cipher_type(data),
@@ -1706,6 +1747,15 @@ impl Client {
             &server,
             &format_rfc3339(std::time::SystemTime::now()),
         );
+        if let (Some(revision_date), Some(req)) =
+            (last_known_revision_date, req.as_object_mut())
+        {
+            // the server refuses the edit if the cipher changed since
+            req.insert(
+                "lastKnownRevisionDate".to_string(),
+                serde_json::Value::String(revision_date.to_string()),
+            );
+        }
         let client = self.blocking_reqwest_client()?;
         let res = client
             .put(self.api_url(&format!("/ciphers/{id}")))
@@ -1714,9 +1764,19 @@ impl Client {
             .send()
             .map_err(|source| Error::Reqwest { source })?;
         match res.status() {
-            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::OK => {
+                Ok(SavedCipher::from_response(&res.json_with_path()?))
+            }
             reqwest::StatusCode::UNAUTHORIZED => {
                 Err(Error::RequestUnauthorized)
+            }
+            reqwest::StatusCode::BAD_REQUEST => {
+                let body = res.text().unwrap_or_default();
+                if is_out_of_date(&body) {
+                    Err(Error::CipherOutOfDate)
+                } else {
+                    Err(Error::RequestFailed { status: 400 })
+                }
             }
             _ => Err(Error::RequestFailed {
                 status: res.status().as_u16(),

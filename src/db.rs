@@ -19,6 +19,15 @@ pub struct Entry {
     pub history: Vec<HistoryEntry>,
     pub key: Option<String>,
     pub master_password_reprompt: crate::api::CipherRepromptType,
+    // when the server last changed the entry, as the server wrote it. edits
+    // send it back so the server can refuse to overwrite a newer change.
+    // dbs from before rbw-ng 1.19 don't have it until the next sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_date: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub favorite: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
 }
 
 impl Entry {
