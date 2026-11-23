@@ -277,6 +277,9 @@ pub enum Error {
 
     #[error("invalid kdf type: {ty}")]
     InvalidKdfType { ty: String },
+
+    #[error("the entry changed on the server since it was last synced")]
+    CipherOutOfDate,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
