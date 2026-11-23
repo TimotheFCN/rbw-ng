@@ -46,7 +46,6 @@ What changed since `rbw` 1.15.0 is in the [changelog](CHANGELOG.md).
 | Platform | Command |
 | --- | --- |
 | macOS, Linux (Homebrew) | `brew install timothefcn/tap/rbw-ng` |
-| Arch Linux (AUR) | `yay -S rbw-ng-bin` |
 | Debian, Ubuntu | download the `.deb` from the [latest release](https://github.com/TimotheFCN/rbw-ng/releases/latest), then `sudo apt install ./rbw-ng_*.deb` |
 | Any, with Rust 1.88+ | `cargo install --locked rbw-ng` |
 | Any, prebuilt | `cargo binstall rbw-ng` |
