@@ -1,6 +1,10 @@
 # Changelog
 
-## [Unreleased]
+## [1.18.1] - 2026-11-23
+
+First packaged release. `rbw-ng` now installs with Homebrew, Cargo or a
+`.deb`, or from prebuilt archives. The commands themselves are unchanged from
+1.18.0.
 
 ### Added
 
