@@ -6,6 +6,7 @@ mod agent;
 mod biometric;
 mod daemon;
 mod debugger;
+mod embedded;
 mod notifications;
 mod peer;
 #[cfg(target_os = "macos")]
@@ -15,16 +16,18 @@ mod ssh_agent;
 mod state;
 mod timeout;
 
-async fn tokio_main(
-    startup_ack: Option<crate::daemon::StartupAck>,
-) -> anyhow::Result<()> {
-    let listener = crate::sock::listen()?;
+type SharedState = std::sync::Arc<tokio::sync::Mutex<crate::state::State>>;
 
-    if let Some(startup_ack) = startup_ack {
-        startup_ack.ack()?;
-    }
-
-    let config = rbw::config::Config::load()?;
+// The agent's state, and the lock and sync timers' channels. The embedded
+// mode runs no Touch ID helper, SSH agent or clipboard: the host has its own.
+fn new_state(
+    config: &rbw::config::Config,
+    embedded: bool,
+) -> (
+    SharedState,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+    tokio::sync::mpsc::UnboundedReceiver<()>,
+) {
     let timeout_duration =
         std::time::Duration::from_secs(config.lock_timeout);
     let sync_timeout_duration =
@@ -48,18 +51,56 @@ async fn tokio_main(
             master_password_reprompt_initialized: false,
             unlock_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(target_os = "macos")]
-            touch_id_unlock: config.touch_id_unlock,
-            ssh_confirm: config.confirms_ssh_signatures(),
+            touch_id_unlock: !embedded && config.touch_id_unlock,
+            ssh_confirm: !embedded && config.confirms_ssh_signatures(),
             #[cfg(target_os = "macos")]
             biometric_unlock: None,
             last_environment: rbw::protocol::Environment::from_process(),
             #[cfg(feature = "clipboard")]
-            clipboard: arboard::Clipboard::new()
-                .inspect_err(|e| {
-                    log::warn!("couldn't create clipboard context: {e}");
-                })
-                .ok(),
+            // the host handles the clipboard, and may run the agent where
+            // there is none (a sandbox)
+            clipboard: if embedded {
+                None
+            } else {
+                arboard::Clipboard::new()
+                    .inspect_err(|e| {
+                        log::warn!("couldn't create clipboard context: {e}");
+                    })
+                    .ok()
+            },
         }));
+
+    (state, timer_r, sync_timer_r)
+}
+
+// rbw-agent --embedded: serves one application over a private channel, in
+// the foreground, until the application closes the channel.
+async fn embedded_main(
+    options: crate::embedded::Options,
+) -> anyhow::Result<()> {
+    // the first start has no config yet: the host signs in through the agent
+    let config = if let Ok(config) = rbw::config::Config::load() {
+        config
+    } else {
+        let config = rbw::config::Config::default();
+        config.save()?;
+        config
+    };
+    let (state, timer_r, sync_timer_r) = new_state(&config, true);
+    crate::embedded::run(&options, state, timer_r, sync_timer_r).await
+}
+
+async fn tokio_main(
+    startup_ack: Option<crate::daemon::StartupAck>,
+) -> anyhow::Result<()> {
+    let listener = crate::sock::listen()?;
+
+    if let Some(startup_ack) = startup_ack {
+        startup_ack.ack()?;
+    }
+
+    let config = rbw::config::Config::load()?;
+    let (state, timer_r, sync_timer_r) = new_state(&config, false);
 
     let agent =
         crate::agent::Agent::new(timer_r, sync_timer_r, state.clone());
@@ -94,6 +135,24 @@ fn real_main() -> anyhow::Result<()> {
         env_logger::Env::default().default_filter_or("info"),
     )
     .init();
+
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(crate::embedded::ARGUMENT) {
+        let options = crate::embedded::options(&args[2..])?;
+        if let Err(e) = debugger::disable_tracing() {
+            log::warn!("{e}");
+        }
+        let runtime =
+            tokio::runtime::Runtime::new().context("failed to start")?;
+        if options.accounts {
+            return runtime.block_on(crate::embedded::run_accounts(&options));
+        }
+        if let Some(dir) = &options.dir {
+            rbw::dirs::set_base_dir(dir.clone())?;
+        }
+        rbw::dirs::make_all()?;
+        return runtime.block_on(embedded_main(options));
+    }
 
     let no_daemonize = std::env::args()
         .nth(1)

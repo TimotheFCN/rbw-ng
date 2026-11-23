@@ -49,6 +49,15 @@ pub struct Uri {
     pub uri_checksum: Option<String>,
 }
 
+impl Uri {
+    // The plaintext of a uri's checksum: the base64 sha256 of the uri.
+    pub fn checksum(uri: &str) -> String {
+        use sha2::Digest as _;
+
+        crate::base64::encode(sha2::Sha256::digest(uri.as_bytes()))
+    }
+}
+
 // backwards compatibility
 impl<'de> serde::Deserialize<'de> for Uri {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>

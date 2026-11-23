@@ -1,0 +1,623 @@
+#!/usr/bin/env python3
+"""Plays an embedding application's side of `rbw-agent --embedded`.
+
+It starts the agent the way an application would, on stdin and stdout, and
+on a socket it passes as a descriptor (`--fd`), each with a private HOME and
+`--dir`. Against a real server it walks through sign-in, fills, origin checks,
+edits, unlocking with a host key and sign-out, checking each answer and
+printing the conversation.
+
+    tools/embedded-host-sim --server http://localhost:8080 --register
+
+--register creates throwaway accounts first (Vaultwarden with
+SIGNUPS_ALLOWED=true). --channel picks stdio, socket or both (the default).
+Needs Python 3.10+, and the `cryptography` package for --register.
+"""
+
+import argparse
+import base64
+import json
+import os
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+AGENT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "target", "debug", "rbw-agent"
+)
+
+BOLD, DIM, GREEN, RED, RESET = "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[0m"
+if not sys.stdout.isatty():
+    BOLD = DIM = GREEN = RED = RESET = ""
+
+
+def register(server, email, password):
+    """Creates a Bitwarden account the way the official clients do."""
+    from cryptography.hazmat.primitives import hashes, hmac, padding, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    iterations = 600_000
+    master_key = PBKDF2HMAC(
+        hashes.SHA256(), 32, email.lower().encode(), iterations
+    ).derive(password.encode())
+    master_hash = PBKDF2HMAC(hashes.SHA256(), 32, password.encode(), 1).derive(
+        master_key
+    )
+    stretched_enc = HKDFExpand(hashes.SHA256(), 32, b"enc").derive(master_key)
+    stretched_mac = HKDFExpand(hashes.SHA256(), 32, b"mac").derive(master_key)
+
+    def encrypt(enc_key, mac_key, plaintext):
+        iv = secrets.token_bytes(16)
+        padder = padding.PKCS7(128).padder()
+        padded = padder.update(plaintext) + padder.finalize()
+        encryptor = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).encryptor()
+        ciphertext = encryptor.update(padded) + encryptor.finalize()
+        mac = hmac.HMAC(mac_key, hashes.SHA256())
+        mac.update(iv + ciphertext)
+        b64 = lambda b: base64.b64encode(b).decode()
+        return f"2.{b64(iv)}|{b64(ciphertext)}|{b64(mac.finalize())}"
+
+    user_key = secrets.token_bytes(64)
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    private_der = private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    def post(path, body):
+        request = urllib.request.Request(
+            server.rstrip("/") + path,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            return response.read().decode()
+
+    # without email verification, the server answers with the token itself
+    token = post("/identity/accounts/register/send-verification-email",
+                 {"email": email, "name": "rbw-ng demo",
+                  "receiveMarketingEmails": False}).strip().strip('"')
+    post("/identity/accounts/register/finish", {
+        "email": email,
+        "emailVerificationToken": token,
+        "masterPasswordHash": base64.b64encode(master_hash).decode(),
+        "masterPasswordHint": None,
+        "userSymmetricKey": encrypt(stretched_enc, stretched_mac, user_key),
+        "userAsymmetricKeys": {
+            "publicKey": base64.b64encode(public_der).decode(),
+            "encryptedPrivateKey": encrypt(user_key[:32], user_key[32:], private_der),
+        },
+        "kdf": 0,
+        "kdfIterations": iterations,
+    })
+
+
+def totp(secret_b32, at=None):
+    """An RFC 6238 code (SHA-1, 6 digits, 30 s)."""
+    import hashlib
+    import hmac as std_hmac
+    import struct
+
+    key = base64.b32decode(secret_b32.upper() + "=" * (-len(secret_b32) % 8))
+    counter = int((time.time() if at is None else at) // 30)
+    digest = std_hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{value % 1_000_000:06d}"
+
+
+def enable_authenticator(server, email, password):
+    """Turns on authenticator-app two-step login; returns its secret."""
+    import urllib.parse
+    import uuid
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    master_key = PBKDF2HMAC(
+        hashes.SHA256(), 32, email.lower().encode(), 600_000
+    ).derive(password.encode())
+    master_hash = base64.b64encode(
+        PBKDF2HMAC(hashes.SHA256(), 32, password.encode(), 1).derive(master_key)
+    ).decode()
+    form = urllib.parse.urlencode({
+        "grant_type": "password", "username": email, "password": master_hash,
+        "scope": "api offline_access", "client_id": "cli", "deviceType": "8",
+        "deviceIdentifier": str(uuid.uuid4()), "deviceName": "embedded-host-sim",
+    }).encode()
+    request = urllib.request.Request(server.rstrip("/") + "/identity/connect/token", data=form)
+    with urllib.request.urlopen(request) as response:
+        access_token = json.loads(response.read())["access_token"]
+
+    def post(path, body):
+        request = urllib.request.Request(
+            server.rstrip("/") + path, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {access_token}"})
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read())
+
+    answer = post("/api/two-factor/get-authenticator",
+                  {"masterPasswordHash": master_hash})
+    # newer servers nest the key and add a token proving the password check
+    nested = answer.get("authenticator") or answer
+    secret = nested.get("key") or nested.get("Key")
+    if not secret:
+        raise RuntimeError(f"no authenticator key in {sorted(nested)}")
+    body = {"key": secret, "token": totp(secret), "masterPasswordHash": master_hash}
+    if answer.get("userVerificationToken"):
+        body["userVerificationToken"] = answer["userVerificationToken"]
+    post("/api/two-factor/authenticator", body)
+    return secret
+
+
+class Host:
+    """The embedding application's end of the channel.
+
+    stdio: `rbw-agent --embedded --dir ...` on stdin and stdout. socket: the
+    same on a stream socket passed as a descriptor, `--fd N`.
+    """
+
+    def __init__(self, home, channel, verbose, accounts=False):
+        self.verbose = verbose
+        env = {
+            "PATH": "/usr/bin:/bin",
+            "HOME": home,
+            "TMPDIR": os.path.join(home, "tmp"),
+            "LANG": "en_US.UTF-8",
+            "RUST_LOG": os.environ.get("RUST_LOG", "warn"),
+        }
+        os.makedirs(env["TMPDIR"], exist_ok=True)
+        self.log = open(os.path.join(home, "agent.log"), "ab")
+        args = [AGENT, "--embedded"] + (["--accounts"] if accounts else []) + ["--dir", os.path.join(home, "rbw")]
+        if channel == "socket":
+            ours, theirs = socket.socketpair(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.process = subprocess.Popen(
+                args + ["--fd", str(theirs.fileno())], env=env,
+                pass_fds=[theirs.fileno()], stdin=subprocess.DEVNULL,
+                stdout=self.log, stderr=self.log)
+            theirs.close()
+            self.sock = ours
+            self.rfd = self.wfd = ours.fileno()
+        else:
+            self.process = subprocess.Popen(
+                args, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=self.log)
+            self.sock = None
+            self.rfd = self.process.stdout.fileno()
+            self.wfd = self.process.stdin.fileno()
+        self.buffer = b""
+        self.next_id = 0
+        self.events = []
+        self.answers = {}
+        self.ready = None
+        while self.ready is None:
+            self._read_one(timeout=10)
+
+    def _read_one(self, timeout):
+        import select
+
+        while b"\n" not in self.buffer:
+            readable, _, _ = select.select([self.rfd], [], [], timeout)
+            if not readable:
+                raise TimeoutError("the agent didn't answer in time")
+            chunk = os.read(self.rfd, 65536)
+            if not chunk:
+                raise RuntimeError("the agent closed the channel")
+            self.buffer += chunk
+        line, self.buffer = self.buffer.split(b"\n", 1)
+        message = json.loads(line)
+        if message.get("event") == "ready":
+            self.ready = message["data"]
+        elif "event" in message:
+            self._event({k: message[k] for k in ("event", "account", "data") if k in message})
+        elif "id" in message:
+            answer = ({"error": message["error"]} if "error" in message
+                      else {"result": message.get("result")})
+            self.answers[message["id"]] = answer
+
+    def _event(self, event):
+        self.events.append(event)
+        if self.verbose:
+            print(f"  {DIM}event {json.dumps(event)}{RESET}")
+
+    def _send(self, message):
+        data = json.dumps(message).encode() + b"\n"
+        while data:
+            data = data[os.write(self.wfd, data):]
+
+    def send(self, verb, params=None, deadline=60_000, account=None):
+        self.next_id += 1
+        request_id = self.next_id
+        message = {"id": request_id, "method": verb,
+                   "params": params or {}, "deadline": deadline}
+        if account is not None:
+            message["account"] = account
+        self._send(message)
+        return request_id
+
+    def ask(self, verb, params=None, timeout=60, account=None):
+        request_id = self.send(verb, params, deadline=timeout * 1000, account=account)
+        end = time.monotonic() + timeout
+        while request_id not in self.answers:
+            self._read_one(timeout=max(0.1, end - time.monotonic()))
+        answer = self.answers.pop(request_id)
+        return answer.get("result"), answer.get("error")
+
+    def cancel(self, request_id):
+        self._send({"cancel": request_id})
+
+    def drain(self, seconds):
+        end = time.monotonic() + seconds
+        while time.monotonic() < end:
+            try:
+                self._read_one(timeout=max(0.05, end - time.monotonic()))
+            except TimeoutError:
+                break
+
+    def close(self):
+        if self.sock is not None:
+            self.sock.close()
+        else:
+            self.process.stdin.close()
+        try:
+            self.process.wait(timeout=10)
+        finally:
+            if self.sock is None:
+                self.process.stdout.close()
+            self.log.close()
+
+
+SECRET_KEYS = {"password", "hostKey", "masterPassword"}
+
+
+def shown(value):
+    """The message with secrets hidden, for the transcript."""
+    if isinstance(value, dict):
+        return {k: ("•••" if k in SECRET_KEYS and isinstance(v, str)
+                    and v not in ("session", "persistent") else shown(v))
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [shown(v) for v in value]
+    return value
+
+
+class Scenario:
+    def __init__(self, verbose):
+        self.verbose = verbose
+        self.failures = 0
+        self.checks = 0
+
+    def step(self, title):
+        print(f"\n{BOLD}{title}{RESET}")
+
+    def call(self, host, verb, params=None, expect=None, error=None, account=None):
+        result, err = host.ask(verb, params, account=account)
+        where = f"[{account}] " if account else ""
+        print(f"  → {where}{verb} {json.dumps(shown(params or {}), ensure_ascii=False)}")
+        print(f"  ← {json.dumps(shown(result if err is None else {'error': err}), ensure_ascii=False)}")
+        if error is not None:
+            self.check(err is not None and err["code"] == error,
+                       f"answers {error}", err)
+        else:
+            self.check(err is None, "succeeds", err)
+            if expect is not None and err is None:
+                expect(result)
+        return result, err
+
+    def check(self, ok, what, detail=None):
+        self.checks += 1
+        if ok:
+            print(f"  {GREEN}✓ {what}{RESET}")
+        else:
+            self.failures += 1
+            print(f"  {RED}✗ {what}: {detail}{RESET}")
+
+
+def scenario(args, channel, s):
+    email = f"{channel}-{args.email}"
+    if args.register:
+        register(args.server, email, args.password)
+
+    home = tempfile.mkdtemp(prefix=f"rbw-embedded-{channel}-")
+    print(f"\n{BOLD}=== {channel} channel ==={RESET}")
+    host = Host(home, channel, args.verbose)
+    try:
+        s.step("The host starts the agent")
+        print(f"  ← vault.ready {json.dumps(host.ready)}")
+        s.check(host.ready.get("protocol") == 1, "speaks protocol 1")
+        s.call(host, "status", expect=lambda r: s.check(
+            r["state"] == "signedOut", "starts signed out", r))
+
+        s.step("Sign in, keeping a host key (Touch ID) for this session")
+        result, _ = s.call(host, "signIn", {
+            "server": args.server, "email": email,
+            "password": args.password, "wrapKey": "session",
+        }, expect=lambda r: s.check(r["state"] == "unlocked", "unlocked", r))
+        session_key = (result or {}).get("hostKey")
+        s.check(bool(session_key), "hands the host a session key")
+
+        s.step("Save logins from the save prompt")
+        gh, _ = s.call(host, "save", {
+            "origin": "https://github.com", "title": "GitHub",
+            "username": "octo", "password": "correct horse battery staple",
+        })
+        s.call(host, "save", {
+            "origin": "https://example.org", "username": "me",
+            "password": "hunter2",
+        })
+        gh_item = (gh or {}).get("item", {})
+        gh_id = gh_item.get("id")
+
+        s.step("The host lists logins: no secrets in the list")
+        s.call(host, "items", expect=lambda r: (
+            s.check(len(r["items"]) == 2, "two logins", len(r["items"])),
+            s.check("correct horse" not in json.dumps(r), "no password in the list"),
+        ))
+        s.call(host, "match", {"origin": "https://github.com"},
+               expect=lambda r: s.check(r["ids"] == [gh_id], "GitHub matches github.com", r))
+
+        s.step("Fill on the right site")
+        s.call(host, "fill", {"id": gh_id, "origin": "https://github.com",
+                              "fields": ["username", "password"]},
+               expect=lambda r: s.check(
+                   r["values"].get("password") == "correct horse battery staple",
+                   "the password comes back", None))
+
+        s.step("The agent refuses the wrong site, even if the host asks")
+        s.call(host, "fill", {"id": gh_id, "origin": "https://github.com.evil.example",
+                              "fields": ["password"]}, error="origin_mismatch")
+        s.call(host, "fill", {"id": gh_id, "origin": "http://github.com",
+                              "fields": ["password"]}, error="origin_mismatch")
+        s.call(host, "fill", {"id": gh_id, "origin": "https://evil.example",
+                              "fields": ["password"], "chosen": True},
+               expect=lambda r: s.check(True, "a login the person picked fills anyway"))
+
+        s.step("Add a verification code, then edit with revision checks")
+        result, _ = s.call(host, "update", {
+            "id": gh_id, "revision": gh_item.get("revision"),
+            "totp": "otpauth://totp/GitHub:octo?secret=JBSWY3DPEHPK3PXP&issuer=GitHub",
+        }, expect=lambda r: s.check(r["item"]["hasTotp"], "the login has a code now"))
+        new_revision = ((result or {}).get("item") or {}).get("revision")
+        s.check(new_revision and new_revision != gh_item.get("revision"),
+                "the revision moved", new_revision)
+        s.call(host, "totp", {"id": gh_id, "origin": "https://github.com"},
+               expect=lambda r: s.check(len(r["code"]) == 6 and r["period"] == 30,
+                                        "a six digit code, never the secret", r))
+        s.call(host, "update", {"id": gh_id, "revision": gh_item.get("revision"),
+                                "password": "an older edit"}, error="conflict")
+        s.call(host, "update", {"id": gh_id, "revision": new_revision,
+                                "password": "a newer password"},
+               expect=lambda r: s.check(True, "an up to date edit goes through"))
+
+        s.step("Manage logins from the host's settings")
+        result, _ = s.call(host, "save", {
+            "title": "Mail", "username": "me@example.com", "password": "first",
+            "uris": [{"uri": "https://mail.example.com", "match": "host"}],
+            "notes": "recovery codes in the drawer",
+            "totp": "otpauth://totp/Mail:me?secret=JBSWY3DPEHPK3PXP",
+        }, expect=lambda r: (
+            s.check(r["item"]["title"] == "Mail", "keeps the title", r),
+            s.check(r["item"]["uris"] == [{"uri": "https://mail.example.com", "match": "host"}],
+                    "keeps the address and its match rule", r),
+            s.check(r["item"]["hasTotp"] and r["item"]["hasNotes"], "has a code and notes", r),
+        ))
+        mail = (result or {}).get("item", {})
+        s.call(host, "reveal", {"id": mail.get("id"), "fields": ["password", "notes"]},
+               expect=lambda r: s.check(
+                   r["values"] == {"password": "first", "notes": "recovery codes in the drawer"},
+                   "shows the password and notes to the host", None))
+        result, _ = s.call(host, "update", {
+            "id": mail.get("id"), "revision": mail.get("revision"),
+            "title": "Webmail", "notes": None,
+            "uris": [{"uri": "https://mail.example.com", "match": "host"},
+                     {"uri": "https://webmail.example.net"}],
+        }, expect=lambda r: (
+            s.check(r["item"]["title"] == "Webmail", "renamed", r),
+            s.check(len(r["item"]["uris"]) == 2, "a second address", r),
+            s.check(not r["item"]["hasNotes"], "notes removed", r),
+        ))
+        mail = (result or {}).get("item", mail)
+        s.call(host, "fill", {"id": mail.get("id"), "origin": "https://webmail.example.net",
+                              "fields": ["password"]},
+               expect=lambda r: s.check(r["values"]["password"] == "first",
+                                        "fills on the added address"))
+        s.call(host, "fill", {"id": mail.get("id"), "origin": "http://evil.example",
+                              "fields": ["password"], "chosen": True},
+               error="origin_mismatch")
+        s.call(host, "update", {"id": mail.get("id"), "revision": mail.get("revision"),
+                                "title": " "}, error="bad_request")
+        s.call(host, "generate", {"kind": "letters", "length": 16},
+               expect=lambda r: s.check(len(r["password"]) == 16, "a 16 letter password", r))
+        s.call(host, "delete", {"id": mail.get("id"), "revision": "2000-01-01T00:00:00Z"},
+               error="conflict")
+        s.call(host, "delete", {"id": mail.get("id"), "revision": mail.get("revision")})
+        s.call(host, "items", expect=lambda r: s.check(
+            all(item["id"] != mail.get("id") for item in r["items"]),
+            "the deleted login is gone from the list", None))
+
+        s.step("Lock, then Touch ID: the host sends back its key")
+        s.call(host, "lock")
+        s.call(host, "fill", {"id": gh_id, "origin": "https://github.com",
+                              "fields": ["password"]}, error="locked")
+        s.call(host, "unlock", {"hostKey": base64.b64encode(os.urandom(64)).decode()},
+               error="wrong_password")
+        s.call(host, "unlock", {"hostKey": session_key},
+               expect=lambda r: s.check(r["state"] == "unlocked", "unlocked without the password"))
+        s.call(host, "fill", {"id": gh_id, "origin": "https://github.com",
+                              "fields": ["password"]},
+               expect=lambda r: s.check(r["values"]["password"] == "a newer password",
+                                        "fills the edited password"))
+
+        s.step("Opt in to Touch ID after a restart")
+        result, _ = s.call(host, "unlock", {"password": args.password,
+                                            "wrapKey": "persistent"})
+        persistent_key = (result or {}).get("hostKey")
+
+        s.step("A cancelled request never answers")
+        vault_id = host.send("sync")
+        host.cancel(vault_id)
+        host.drain(2)
+        s.check(vault_id not in host.answers, "no answer after cancel")
+    finally:
+        host.close()
+
+    s.step("The host quits and starts again: the vault is locked")
+    host = Host(home, channel, args.verbose)
+    try:
+        s.call(host, "status", expect=lambda r: s.check(
+            r["state"] == "locked" and r["hostKey"] == "persistent",
+            "locked, with a persistent key on file", r))
+        s.call(host, "unlock", {"hostKey": session_key}, error="wrong_password")
+        s.call(host, "unlock", {"hostKey": persistent_key},
+               expect=lambda r: s.check(r["state"] == "unlocked",
+                                        "Touch ID unlocks after the restart"))
+
+        s.step("Sign out: nothing stays behind")
+        s.call(host, "signOut")
+        s.call(host, "status", expect=lambda r: s.check(
+            r["state"] == "signedOut" and r["hostKey"] is None, "signed out, no key", r))
+        leftovers = [os.path.join(d, f) for d, _, files in os.walk(home) for f in files
+                     if f.endswith(".json") and "config" not in f]
+        s.check(not leftovers, "no vault copy or wrapped key on disk", leftovers)
+    finally:
+        host.close()
+
+    if s.failures:
+        print(f"agent log: {os.path.join(home, 'agent.log')}")
+    else:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def run(args):
+    s = Scenario(args.verbose)
+    channels = ["stdio", "socket"] if args.channel == "both" else [args.channel]
+    for channel in channels:
+        scenario(args, channel, s)
+        if args.register:
+            accounts_scenario(args, channel, s)
+    if args.register:
+        two_factor(args, channels[0], s)
+    print(f"\n{s.checks - s.failures}/{s.checks} checks passed")
+    return 1 if s.failures else 0
+
+
+def accounts_scenario(args, channel, s):
+    """Two accounts in one host: each in its own agent process and folder."""
+    emails = {name: f"{name}-{channel}-{args.email}" for name in ("personal", "work")}
+    for email in emails.values():
+        register(args.server, email, args.password)
+    home = tempfile.mkdtemp(prefix=f"rbw-embedded-accounts-{channel}-")
+    print(f"\n{BOLD}=== {channel} channel, two accounts ==={RESET}")
+    host = Host(home, channel, args.verbose, accounts=True)
+    try:
+        s.step("The host starts one agent for every account")
+        s.check(host.ready.get("capabilities", {}).get("accounts") is True, "it says it serves accounts")
+        s.call(host, "status", error="bad_request")
+        s.call(host, "generate", {"kind": "words"}, expect=lambda r: s.check(
+            len(r["password"].split(" ")) == 5, "generates without an account", r))
+
+        s.step("Each space signs in to its own account")
+        for name, email in emails.items():
+            s.call(host, "signIn", {"server": args.server, "email": email,
+                                    "password": args.password}, account=name,
+                   expect=lambda r: s.check(r["state"] == "unlocked", "unlocked"))
+        ids = {}
+        for name, user in (("personal", "me"), ("work", "me.at.work")):
+            result, _ = s.call(host, "save", {"origin": "https://github.com", "username": user,
+                                              "password": f"{name} password"}, account=name)
+            ids[name] = ((result or {}).get("item") or {}).get("id")
+
+        s.step("A space sees only its own account's logins")
+        for name, user in (("personal", "me"), ("work", "me.at.work")):
+            s.call(host, "items", account=name, expect=lambda r, user=user: s.check(
+                [i["username"] for i in r["items"]] == [user], f"only {user}", r["items"]))
+        s.call(host, "fill", {"id": ids["work"], "origin": "https://github.com",
+                              "fields": ["password"]}, account="personal", error="not_found")
+
+        s.step("Each account runs in its own process")
+        pids = subprocess.run(["pgrep", "-f", "--", f"--embedded --dir {os.path.join(home, 'rbw')}/"],
+                              capture_output=True, text=True).stdout.split()
+        s.check(len(pids) == 2, "two account agents", pids)
+
+        s.step("Locking one space leaves the other unlocked")
+        host.events.clear()
+        s.call(host, "lock", account="personal")
+        host.drain(0.5)
+        s.check({"event": "state", "account": "personal", "data": {"state": "locked"}} in host.events,
+                "the event names its account", host.events)
+        s.call(host, "fill", {"id": ids["personal"], "origin": "https://github.com",
+                              "fields": ["password"]}, account="personal", error="locked")
+        s.call(host, "fill", {"id": ids["work"], "origin": "https://github.com",
+                              "fields": ["password"]}, account="work",
+               expect=lambda r: s.check(r["values"]["password"] == "work password", "work still fills"))
+
+        s.step("The host can list the accounts it has")
+        s.call(host, "accounts", expect=lambda r: s.check(
+            r["accounts"] == ["personal", "work"], "personal and work", r))
+
+        s.step("Signing out of one account removes only its folder")
+        root = os.path.join(home, "rbw")
+        s.call(host, "signOut", account="work")
+        s.check(not os.path.exists(os.path.join(root, "work")), "work's folder is gone")
+        s.check(os.path.exists(os.path.join(root, "personal")), "personal's is still there")
+        s.call(host, "accounts", expect=lambda r: s.check(
+            r["accounts"] == ["personal"], "only personal is left", r))
+    finally:
+        host.close()
+    if not s.failures:
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def two_factor(args, channel, s):
+    email = "2fa-" + args.email
+    register(args.server, email, args.password)
+    secret = enable_authenticator(args.server, email, args.password)
+    home = tempfile.mkdtemp(prefix="rbw-embedded-2fa-")
+    host = Host(home, channel, args.verbose)
+    try:
+        s.step("Two-step login: the agent asks the host for a code")
+        fields = {"server": args.server, "email": email, "password": args.password}
+        s.call(host, "signIn", fields, expect=lambda r: s.check(
+            r.get("needs") == "code"
+            and any(m["id"] == "0" for m in r.get("methods", [])),
+            "asks for a code, offering the authenticator app", r))
+        s.call(host, "signIn", {**fields, "method": "0", "code": "000000"},
+               error="wrong_code")
+        # the code that turned two-step login on can't be used again, so use
+        # the next one, which the server accepts as clock drift
+        s.call(host, "signIn", {**fields, "method": "0",
+                                "code": totp(secret, time.time() + 30)},
+               expect=lambda r: s.check(r["state"] == "unlocked",
+                                        "signed in with the code"))
+        s.call(host, "signOut")
+    finally:
+        host.close()
+    shutil.rmtree(home, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--server", required=True)
+    parser.add_argument("--email", default=f"demo-{secrets.token_hex(4)}@example.com")
+    parser.add_argument("--password", default="a long demo master password")
+    parser.add_argument("--register", action="store_true")
+    parser.add_argument("--channel", choices=["stdio", "socket", "both"], default="both")
+    parser.add_argument("--verbose", action="store_true", help="show events too")
+    sys.exit(run(parser.parse_args()))
+
+
+if __name__ == "__main__":
+    main()

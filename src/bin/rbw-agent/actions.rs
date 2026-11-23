@@ -382,7 +382,7 @@ async fn login_with_code(
     unreachable!()
 }
 
-async fn login_success(
+pub async fn login_success(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     access_token: String,
     refresh_token: String,
@@ -610,7 +610,7 @@ pub async fn unlock(
     Ok(())
 }
 
-async fn unlock_success(
+pub async fn unlock_success(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     keys: rbw::locked::Keys,
     org_keys: std::collections::HashMap<String, rbw::locked::Keys>,
@@ -1085,7 +1085,7 @@ async fn respond_encrypt(
     Ok(())
 }
 
-async fn config_email() -> anyhow::Result<String> {
+pub async fn config_email() -> anyhow::Result<String> {
     let config = rbw::config::Config::load_async().await?;
     config.email.map_or_else(
         || Err(anyhow::anyhow!("failed to find email address in config")),
@@ -1093,7 +1093,7 @@ async fn config_email() -> anyhow::Result<String> {
     )
 }
 
-async fn load_db() -> anyhow::Result<rbw::db::Db> {
+pub async fn load_db() -> anyhow::Result<rbw::db::Db> {
     let config = rbw::config::Config::load_async().await?;
     if let Some(email) = &config.email {
         rbw::db::Db::load_async(&config.server_name(), email)
@@ -1104,7 +1104,7 @@ async fn load_db() -> anyhow::Result<rbw::db::Db> {
     }
 }
 
-async fn save_db(db: &rbw::db::Db) -> anyhow::Result<()> {
+pub async fn save_db(db: &rbw::db::Db) -> anyhow::Result<()> {
     let config = rbw::config::Config::load_async().await?;
     if let Some(email) = &config.email {
         db.save_async(&config.server_name(), email)

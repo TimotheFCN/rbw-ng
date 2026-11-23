@@ -1684,9 +1684,7 @@ fn check_new_field_names<'a>(
 }
 
 fn uri_checksum(uri: &str) -> String {
-    use sha2::Digest as _;
-
-    rbw::base64::encode(sha2::Sha256::digest(uri.as_bytes()))
+    rbw::db::Uri::checksum(uri)
 }
 
 // encrypts a uri together with its checksum (the base64 sha256 of the uri),

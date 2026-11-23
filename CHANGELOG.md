@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+* `rbw-agent --embedded` runs the agent for one application, such as a
+  browser's password manager, over stdin and stdout or a socket it passes,
+  instead of the agent socket. The application signs in, unlocks and fills
+  through typed requests, and gets a password or code only for one login, on
+  a page that login's addresses match. `--dir` keeps its account apart from
+  the user's own, and a host key lets it unlock again (for example behind
+  Touch ID) without holding the master password or the vault key. See
+  `docs/embedding.md`.
+* `rbw-agent --embedded --accounts` serves several accounts to one host, for
+  example one per browser profile, each in an agent process and folder of its
+  own, so one account's keys never share memory with another's and each locks
+  and signs out on its own.
+* The embedded agent manages logins as well as filling them: a host can add
+  a login with its addresses, notes and code, edit any of them, move a login
+  to the trash, show a login's secrets in its own screens, and generate
+  passwords. Its ready message lists the servers a sign-in screen can offer.
+
 ## [1.18.1] - 2026-11-23
 
 First packaged release. `rbw-ng` now installs with Homebrew, Cargo or a
