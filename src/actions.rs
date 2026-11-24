@@ -320,6 +320,19 @@ pub fn trash(
     })
 }
 
+pub fn partial(
+    access_token: &str,
+    refresh_token: &str,
+    id: &str,
+    folder_id: Option<&str>,
+    favorite: bool,
+) -> Result<(Option<RefreshedTokens>, ())> {
+    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
+        let (client, _) = api_client()?;
+        client.partial(access_token, id, folder_id, favorite)
+    })
+}
+
 pub fn list_folders(
     access_token: &str,
     refresh_token: &str,

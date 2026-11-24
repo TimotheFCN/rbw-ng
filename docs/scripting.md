@@ -177,6 +177,8 @@ never by name.
 | `rbw item create` | adds the entry on stdin and prints it as saved |
 | `rbw item edit ID` | replaces the entry with the one on stdin and prints it as saved |
 | `rbw item delete ID` | moves the entry to the trash, where the official clients can restore it |
+| `rbw item favorite ID true\|false` | marks or unmarks the entry as a favorite and prints it as saved |
+| `rbw item move ID [FOLDER_ID]` | moves the entry into a folder, or out of any folder without one, and prints it as saved |
 
 Without secrets, an entry has no `notes`, `fields` or `passwordHistory`. A
 login has its username and addresses, and `login.hasTotp`, which isn't part
@@ -188,6 +190,12 @@ these values are decrypted.
 `edit`, from Bitwarden's sync data, is `false` for an entry in a collection
 that the account can only read: editing or deleting it fails with
 `forbidden`.
+
+The folder and the favorite flag belong to the account, not to the entry.
+`rbw item favorite` and `rbw item move` change only them, with Bitwarden's
+partial update: they don't decrypt or send the entry's secrets, and they work
+on entries in read-only collections too. An unknown folder fails with
+`not_found`.
 
 Archived entries are left out of `rbw item list`. An unknown id, or a field
 the entry doesn't have, fails with `not_found`.

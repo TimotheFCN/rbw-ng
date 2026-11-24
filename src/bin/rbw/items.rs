@@ -804,6 +804,57 @@ pub fn delete(id: &str) -> anyhow::Result<()> {
     crate::actions::sync()
 }
 
+// Sets what belongs to the account rather than to the entry, its folder
+// and favorite flag, without its secrets, so that it works for entries in
+// read-only collections too.
+fn save_partial(
+    id: &str,
+    folder_id: impl FnOnce(
+        &rbw::db::Db,
+        &rbw::db::Entry,
+    ) -> anyhow::Result<Option<String>>,
+    favorite: impl FnOnce(&rbw::db::Entry) -> bool,
+) -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    let db = crate::commands::load_db()?;
+    let entry = find(&db, id)?;
+    let folder_id = folder_id(&db, entry)?;
+    let (access_token, refresh_token) = tokens(&db)?;
+    rbw::actions::partial(
+        &access_token,
+        &refresh_token,
+        &entry.id,
+        folder_id.as_deref(),
+        favorite(entry),
+    )?;
+    print_saved(&entry.id)
+}
+
+pub fn favorite(id: &str, favorite: bool) -> anyhow::Result<()> {
+    save_partial(id, |_, entry| Ok(entry.folder_id.clone()), |_| favorite)
+}
+
+// Moves an entry into a folder, or out of any folder without one.
+pub fn move_to(id: &str, folder: Option<&str>) -> anyhow::Result<()> {
+    save_partial(
+        id,
+        |db, _| {
+            folder
+                .map(|folder| {
+                    db.folders
+                        .iter()
+                        .find(|known| known.id.eq_ignore_ascii_case(folder))
+                        .map(|known| known.id.clone())
+                        .ok_or_else(|| {
+                            coded(ErrorCode::NotFound, "no such folder")
+                        })
+                })
+                .transpose()
+        },
+        |entry| entry.favorite,
+    )
+}
+
 pub fn folder_list() -> anyhow::Result<()> {
     crate::commands::unlock()?;
     let db = crate::commands::load_db()?;

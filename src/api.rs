@@ -1228,6 +1228,13 @@ struct FoldersResData {
 }
 
 #[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct CiphersPartialReq {
+    folder_id: Option<String>,
+    favorite: bool,
+}
+
+#[derive(serde::Serialize, Debug)]
 struct FoldersPostReq {
     name: String,
 }
@@ -1880,6 +1887,38 @@ impl Client {
         }
     }
 
+    // Bitwarden's partial update: the folder and favorite flag, which are
+    // the account's own and not part of the encrypted entry, so it works
+    // for entries the account can only read too.
+    pub fn partial(
+        &self,
+        access_token: &str,
+        id: &str,
+        folder_id: Option<&str>,
+        favorite: bool,
+    ) -> Result<()> {
+        let req = CiphersPartialReq {
+            folder_id: folder_id.map(std::string::ToString::to_string),
+            favorite,
+        };
+        let client = self.blocking_reqwest_client()?;
+        let res = client
+            .put(self.api_url(&format!("/ciphers/{id}/partial")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .json(&req)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        match res.status() {
+            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::UNAUTHORIZED => {
+                Err(Error::RequestUnauthorized)
+            }
+            _ => Err(Error::RequestFailed {
+                status: res.status().as_u16(),
+            }),
+        }
+    }
+
     pub fn folders(
         &self,
         access_token: &str,
@@ -2393,6 +2432,18 @@ mod tests {
             Error::DeviceRejected { message }
                 if message == "no device information provided"
         ));
+    }
+
+    #[test]
+    fn partial_update_sends_only_the_folder_and_flag() {
+        let req = CiphersPartialReq {
+            folder_id: None,
+            favorite: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({ "folderId": null, "favorite": true })
+        );
     }
 
     #[test]

@@ -191,6 +191,19 @@ def favorites(rbw, quiet):
     full["favorite"] = False
     edited = rbw.json("item", "edit", note["id"], env=quiet, stdin=json.dumps(full))
     check("edit unmarks a favorite", edited["favorite"] is False)
+    marked = rbw.json("item", "favorite", note["id"], "true", env=quiet)
+    check("item favorite marks it without the secrets",
+          marked["favorite"] is True
+          and rbw.json("item", "get", note["id"], env=quiet)["notes"] == "x", str(marked))
+    folder = rbw.json("folder", "create", "Starred things", env=quiet)
+    moved = rbw.json("item", "move", note["id"], folder["id"], env=quiet)
+    check("item move puts it in a folder and keeps the flag",
+          moved["folderId"] == folder["id"] and moved["favorite"] is True, str(moved))
+    moved = rbw.json("item", "move", note["id"], env=quiet)
+    check("item move without a folder takes it out", moved["folderId"] is None, str(moved))
+    check("item move to an unknown folder is not_found",
+          rbw.error("item", "move", note["id"], "00000000-0000-0000-0000-000000000000")["code"]
+          == "not_found")
 
     rbw.run("item", "delete", note["id"], env=quiet)
     check("delete moves an entry out of the list",
@@ -241,6 +254,9 @@ def organizations(rbw, quiet, shared_id):
     rbw.run("item", "edit", shared_id, env=quiet, stdin=json.dumps(full))
     check("edit changes it", rbw.run("item", "get", shared_id, "--field", "password",
                                      env=quiet).stdout == "new-router-password\n")
+    marked = rbw.json("item", "favorite", shared_id, "true", env=quiet)
+    check("item favorite marks it", marked["favorite"] is True
+          and marked["organizationId"] == shared["organizationId"], str(marked))
     error = rbw.error("item", "create", stdin=json.dumps({**full, "id": None}))
     check("create refuses an organization", error["code"] == "unsupported", str(error))
     rbw.run("item", "delete", shared_id, env=quiet)

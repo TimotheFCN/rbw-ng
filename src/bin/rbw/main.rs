@@ -425,6 +425,18 @@ enum Item {
     Edit { id: String },
     #[command(about = "Move an entry to the trash")]
     Delete { id: String },
+    #[command(
+        about = "Mark or unmark an entry as a favorite, without its secrets"
+    )]
+    Favorite {
+        id: String,
+        #[arg(action = clap::ArgAction::Set)]
+        favorite: bool,
+    },
+    #[command(
+        about = "Move an entry into a folder, or out of folders without one"
+    )]
+    Move { id: String, folder: Option<String> },
 }
 
 #[derive(Debug, clap::Subcommand)]
@@ -453,6 +465,8 @@ impl Item {
             Self::Create => "create",
             Self::Edit { .. } => "edit",
             Self::Delete { .. } => "delete",
+            Self::Favorite { .. } => "favorite",
+            Self::Move { .. } => "move",
         }
     }
 }
@@ -629,6 +643,10 @@ fn main() {
             Item::Create => items::create(),
             Item::Edit { id } => items::edit(&id),
             Item::Delete { id } => items::delete(&id),
+            Item::Favorite { id, favorite } => items::favorite(&id, favorite),
+            Item::Move { id, folder } => {
+                items::move_to(&id, folder.as_deref())
+            }
         },
         Opt::Folder { folder } => match folder {
             Folder::List => items::folder_list(),

@@ -26,6 +26,9 @@
     key. Listing without secrets shows a card's brand, an identity's names
     and an SSH key's public key.
   * `rbw item create` and `rbw item edit` set the favorite flag.
+  * `rbw item favorite` and `rbw item move` change an entry's favorite flag
+    and folder alone, without its secrets, also for entries in read-only
+    collections.
   * `rbw item delete` moves an entry to the trash, as the official clients
     do, instead of deleting it for good like `rbw remove`.
   * `rbw folder list|create` list and add folders as JSON. The local copy
