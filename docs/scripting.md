@@ -61,6 +61,12 @@ shares, or signs out, the account someone uses in a terminal. Each profile has
 its own configuration, local vault and agent, so a program can keep several
 accounts side by side by giving each one a profile.
 
+`rbw profiles --json` lists the profiles on this computer, as
+`[{"profile":"work","userEmail":"you@example.com","serverUrl":null}]`, with a
+`null` profile for the default one. `rbw purge --all` removes the profile
+`RBW_PROFILE` selects: its local vault, its configuration, every other file
+it keeps and its SSH agent service.
+
 ## Logging in
 
 Set the server and the account first:

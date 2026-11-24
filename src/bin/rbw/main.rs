@@ -355,7 +355,27 @@ enum Opt {
     Lock,
 
     #[command(about = "Remove the local copy of the password database")]
-    Purge,
+    Purge {
+        #[arg(
+            long,
+            help = "Also remove the profile's configuration and every other \
+                file it keeps, and its SSH agent service, so that the \
+                profile is gone"
+        )]
+        all: bool,
+    },
+
+    #[command(
+        about = "List the profiles on this computer",
+        long_about = "List the profiles on this computer\n\n\
+            Prints each profile's name, the RBW_PROFILE that selects it, and \
+            its email, or with --json an array of objects with profile \
+            (null for the default profile), userEmail and serverUrl."
+    )]
+    Profiles {
+        #[arg(long, help = "Display output as JSON")]
+        json: bool,
+    },
 
     #[command(name = "stop-agent", about = "Terminate the background agent")]
     StopAgent,
@@ -463,7 +483,8 @@ impl Opt {
             Self::Remove { .. } => "remove".to_string(),
             Self::History { .. } => "history".to_string(),
             Self::Lock => "lock".to_string(),
-            Self::Purge => "purge".to_string(),
+            Self::Purge { .. } => "purge".to_string(),
+            Self::Profiles { .. } => "profiles".to_string(),
             Self::StopAgent => "stop-agent".to_string(),
             Self::SshAgent { cmd } => {
                 format!("ssh-agent {}", cmd.subcommand_name())
@@ -741,7 +762,8 @@ fn main() {
             find_args.ignorecase,
         ),
         Opt::Lock => commands::lock(),
-        Opt::Purge => commands::purge(),
+        Opt::Purge { all } => commands::purge(all),
+        Opt::Profiles { json } => commands::profiles(json),
         Opt::StopAgent => commands::stop_agent(),
         Opt::SshAgent { cmd } => match cmd {
             SshAgent::Install => commands::ssh_agent_install(),

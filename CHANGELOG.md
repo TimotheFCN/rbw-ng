@@ -38,6 +38,9 @@
   * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such
     as `locked` or `two_step_required`, so that programs don't depend on
     the wording of messages.
+* `rbw profiles [--json]` lists the profiles on this computer, and
+  `rbw purge --all` removes a profile with its configuration and every file
+  it keeps.
 * `rbw ssh-agent install` runs `rbw-agent` as a login service of launchd
   (macOS) or systemd (Linux). The service manager holds the agent's sockets
   and starts the agent when a program connects, and `rbw` uses the same

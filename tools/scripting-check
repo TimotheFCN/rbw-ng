@@ -525,6 +525,12 @@ def scenario(server, password):
         check("purge signs out", rbw.json("status", "--json")["status"] == "unauthenticated")
         check("purge removes the session",
               not any("session.json" in files for _, _, files in os.walk(home)))
+        check("profiles lists the profile",
+              rbw.json("profiles", "--json") == [{
+                  "profile": "scripting-check", "userEmail": email, "serverUrl": server}])
+        rbw.run("purge", "--all")
+        check("purge --all removes the profile", rbw.json("profiles", "--json") == []
+              and not any(files for _, _, files in os.walk(home)))
     finally:
         rbw.stop()
         shutil.rmtree(home, ignore_errors=True)

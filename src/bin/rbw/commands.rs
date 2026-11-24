@@ -2509,7 +2509,22 @@ pub fn lock() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn purge() -> anyhow::Result<()> {
+pub fn purge(all: bool) -> anyhow::Result<()> {
+    if all {
+        crate::service::uninstall_if_installed()?;
+        stop_agent()?;
+        for dir in rbw::dirs::profile_dirs() {
+            match std::fs::remove_dir_all(&dir) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(e).with_context(|| {
+                        format!("failed to remove {}", dir.display())
+                    });
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
     stop_agent()?;
 
     remove_db()?;
@@ -2519,6 +2534,47 @@ pub fn purge() -> anyhow::Result<()> {
         }
     }
 
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Profile {
+    // null for the default profile
+    profile: Option<String>,
+    user_email: Option<String>,
+    // null for bitwarden.com
+    server_url: Option<String>,
+}
+
+pub fn profiles(json: bool) -> anyhow::Result<()> {
+    let profiles: Vec<_> = rbw::dirs::profiles()
+        .into_iter()
+        .map(|(profile, file)| {
+            let config: rbw::config::Config = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+            Profile {
+                profile,
+                user_email: config.email,
+                server_url: config.base_url,
+            }
+        })
+        .collect();
+    if json {
+        serde_json::to_writer(std::io::stdout(), &profiles)
+            .context("failed to write the profiles")?;
+        println!();
+    } else {
+        for profile in profiles {
+            println!(
+                "{}\t{}",
+                profile.profile.as_deref().unwrap_or("(default)"),
+                profile.user_email.as_deref().unwrap_or("")
+            );
+        }
+    }
     Ok(())
 }
 

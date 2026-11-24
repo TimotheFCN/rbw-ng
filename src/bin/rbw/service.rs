@@ -94,6 +94,16 @@ pub fn uninstall() -> anyhow::Result<()> {
     Ok(())
 }
 
+// For rbw purge --all: removes the service, if the profile has one.
+pub fn uninstall_if_installed() -> anyhow::Result<()> {
+    if let Ok(name) = name() {
+        if platform::installed(&name) {
+            platform::uninstall(&name)?;
+        }
+    }
+    Ok(())
+}
+
 pub fn status() -> anyhow::Result<()> {
     let name = name()?;
     let installed = platform::installed(&name);

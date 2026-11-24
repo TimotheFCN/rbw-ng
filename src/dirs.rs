@@ -84,6 +84,42 @@ pub fn service_ssh_agent_socket_file() -> std::path::PathBuf {
     data_dir().join("ssh-agent-socket")
 }
 
+// Every profile on this computer that has a configuration, with its
+// configuration file. The default profile has no name.
+pub fn profiles() -> Vec<(Option<String>, std::path::PathBuf)> {
+    let Some(entries) = config_dir()
+        .parent()
+        .and_then(|parent| std::fs::read_dir(parent).ok())
+    else {
+        return vec![];
+    };
+    let mut profiles: Vec<_> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            let profile = match name.strip_prefix("rbw-") {
+                _ if name == "rbw" => None,
+                Some(profile) if !profile.is_empty() => {
+                    Some(profile.to_string())
+                }
+                _ => return None,
+            };
+            let config = entry.path().join("config.json");
+            config.is_file().then_some((profile, config))
+        })
+        .collect();
+    profiles.sort();
+    profiles
+}
+
+// Every folder the profile keeps files in. On macOS the configuration and
+// the data share one.
+pub fn profile_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![config_dir(), data_dir(), cache_dir(), runtime_dir()];
+    dirs.dedup();
+    dirs
+}
+
 fn config_dir() -> std::path::PathBuf {
     let project_dirs =
         directories::ProjectDirs::from("", "", &profile()).unwrap();
