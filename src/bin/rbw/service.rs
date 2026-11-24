@@ -3,6 +3,12 @@
 // agent's sockets and starts the agent when a program connects. On Linux the
 // login session's SSH_AUTH_SOCK points to it; on macOS, where Apple's agent
 // keeps SSH_AUTH_SOCK, ~/.ssh/config does.
+//
+// Installing and uninstalling leave a running agent alone, so that the
+// vault stays unlocked: its keys can't move to another process without
+// being exposed on the way. Installed while an agent runs, the service
+// waits until that agent stops, which rbw notices (activate), and the
+// agent serves SSH where the service will meanwhile.
 
 // elsewhere there is no service to write files for
 #![cfg_attr(
@@ -60,18 +66,20 @@ pub fn install() -> anyhow::Result<()> {
     let agent = agent_path(&path)?;
     check_pinentry(&path)?;
 
-    platform::unload(&name)?;
-    // an agent that rbw started would hold the vault and the sockets
-    stop_running_agent()?;
-
     let service = Service { name, agent, path };
-    platform::install(&service)?;
+    let waits = platform::install(&service, running_agent().is_some())?;
 
     println!(
         "rbw-agent is installed as a {} service: it starts whenever SSH or \
         rbw needs it.",
         platform::MANAGER
     );
+    if waits {
+        println!(
+            "The agent that runs now keeps the vault as it is, and serves \
+            SSH, until it stops; the service takes over then."
+        );
+    }
     print_steps(&platform::next_steps(&ssh_socket(&service.name)));
     println!();
     println!("Check the setup with: rbw ssh-agent status");
@@ -89,10 +97,30 @@ pub fn uninstall() -> anyhow::Result<()> {
         "rbw-agent is no longer a {} service: rbw starts it itself again.",
         platform::MANAGER
     );
+    if running_agent().is_some() {
+        println!(
+            "The agent that runs now keeps the vault as it is until it stops."
+        );
+    }
     for line in platform::uninstall_notes() {
         println!("{line}");
     }
     Ok(())
+}
+
+// After rbw stopped the agent: starts the service, if it waited for that
+// agent, so that SSH reaches it again without waiting for rbw to need the
+// agent. The agent did stop either way.
+pub fn activate() {
+    if let Ok(name) = name() {
+        if platform::installed(&name) {
+            if let Err(e) = platform::activate(&name) {
+                log::warn!(
+                    "{e:#}; the service starts when rbw next needs the agent"
+                );
+            }
+        }
+    }
 }
 
 // For rbw purge --all: removes the service, if the profile has one.
@@ -579,22 +607,6 @@ fn running_agent() -> Option<u32> {
         // no agent holds it; the lock goes with the file
         _ => None,
     }
-}
-
-// Stops the agent that runs now, if any, and waits until it has exited.
-fn stop_running_agent() -> anyhow::Result<()> {
-    if running_agent().is_none() {
-        return Ok(());
-    }
-    crate::actions::quit().context("failed to stop the running rbw-agent")?;
-    let deadline = std::time::Instant::now() + START_TIMEOUT;
-    while running_agent().is_some() {
-        if std::time::Instant::now() >= deadline {
-            anyhow::bail!("the running rbw-agent didn't stop");
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-    Ok(())
 }
 
 // Writes a file in one step, so the service manager never reads half of it.

@@ -2589,7 +2589,7 @@ pub fn profiles(json: bool) -> anyhow::Result<()> {
 
 pub fn stop_agent() -> anyhow::Result<()> {
     crate::actions::quit()?;
-
+    crate::service::activate();
     Ok(())
 }
 

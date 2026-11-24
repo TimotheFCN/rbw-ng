@@ -373,6 +373,15 @@ randomness.
 ## SSH agent
 
 `rbw ssh-agent install` and `rbw ssh-agent uninstall` need no terminal.
+Installing doesn't lock the vault: an agent that runs keeps the vault as it
+is, and serves SSH at the service's socket, until it stops. When `rbw` stops
+it, for `rbw stop-agent` or a change of settings, the service takes over at
+once; when it stops otherwise, the next time `rbw` needs the agent, or at
+the next login. On Linux, uninstalling doesn't lock the vault either: the service's agent keeps
+running until it stops, and `rbw` starts one itself after that. On macOS,
+uninstalling stops the service's agent, which launchd doesn't let outlive
+its service, so the vault locks.
+
 `rbw ssh-agent status --json` describes the setup of the profile:
 
 ```json

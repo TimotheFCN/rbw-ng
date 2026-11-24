@@ -58,6 +58,7 @@ async fn tokio_main(
             #[cfg(target_os = "macos")]
             touch_id_unlock: config.touch_id_unlock,
             ssh_confirm: config.confirms_ssh_signatures(),
+            serves_service_socket: false,
             #[cfg(target_os = "macos")]
             biometric_unlock: None,
             last_environment: rbw::protocol::Environment::from_process(),

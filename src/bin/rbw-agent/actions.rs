@@ -716,6 +716,42 @@ pub async fn reload_config(
     respond_ack(sock).await
 }
 
+// The socket stays until the agent exits: then the service, which rbw
+// loads, binds the path again.
+pub async fn serve_service_socket(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let mut locked = state.lock().await;
+    if !locked.serves_service_socket {
+        let path = rbw::dirs::service_ssh_agent_socket_file();
+        // one left by an agent that stopped; the service isn't loaded, or
+        // rbw wouldn't ask
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type())
+        }) {
+            std::fs::remove_file(&path).with_context(|| {
+                format!("failed to remove {}", path.display())
+            })?;
+        }
+        let listener =
+            tokio::net::UnixListener::bind(&path).with_context(|| {
+                format!("failed to listen on {}", path.display())
+            })?;
+        let agent = crate::ssh_agent::SshAgent::new(state.clone());
+        tokio::spawn(async move {
+            if let Err(e) =
+                ssh_agent_lib::agent::listen(listener, agent).await
+            {
+                log::warn!("the service's SSH socket stopped: {e}");
+            }
+        });
+        locked.serves_service_socket = true;
+    }
+    drop(locked);
+    respond_ack(sock).await
+}
+
 pub async fn status(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,

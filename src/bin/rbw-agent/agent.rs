@@ -287,6 +287,10 @@ async fn handle_request(
             crate::actions::reload_config(sock, state.clone()).await?;
             false
         }
+        rbw::protocol::Action::ServeServiceSocket => {
+            crate::actions::serve_service_socket(sock, state.clone()).await?;
+            false
+        }
         rbw::protocol::Action::Status => {
             crate::actions::status(sock, state.clone()).await?;
             false

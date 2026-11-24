@@ -233,6 +233,11 @@ pub fn reload_config() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::ReloadConfig)
 }
 
+#[cfg(target_os = "macos")]
+pub fn serve_service_socket() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::ServeServiceSocket)
+}
+
 pub fn unlock_touch_id() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::UnlockTouchId)
 }

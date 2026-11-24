@@ -264,6 +264,9 @@ pub enum Action {
     // Take over the settings that change only what the agent does, such as
     // the lock timeout, without locking
     ReloadConfig,
+    // Serve SSH also at the socket of the macOS service, which rbw ssh-agent
+    // install leaves unloaded until this agent stops
+    ServeServiceSocket,
     Quit,
     Version,
 }

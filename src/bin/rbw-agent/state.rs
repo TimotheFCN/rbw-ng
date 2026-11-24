@@ -54,6 +54,9 @@ pub struct State {
     pub touch_id_unlock: bool,
     // Ask before every SSH signature, kept the same way.
     pub ssh_confirm: bool,
+    // whether the agent serves SSH at the macOS service's socket too, while
+    // the service waits for it to stop
+    pub serves_service_socket: bool,
     #[cfg(target_os = "macos")]
     pub biometric_unlock: Option<std::sync::Arc<crate::biometric::Session>>,
 

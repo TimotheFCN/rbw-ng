@@ -70,7 +70,11 @@ service.
   `rbw-agent` through `IdentityAgent` in `~/.ssh/config`, for all hosts or
   some. `rbw ssh-agent uninstall` removes the service, `status` shows what
   serves SSH, `status --json` says it for programs, and `socket` prints the
-  SSH socket's path.
+  SSH socket's path. Installing leaves an agent that runs, and the vault
+  with it, as it is: the agent serves SSH where the service will until it
+  stops, and the service takes over then. Uninstalling does too on Linux;
+  on macOS it stops the service's agent, which launchd doesn't let outlive
+  its service.
 * `rbw-agent --service`, the mode the service runs the agent in: in the
   foreground, with the sockets the service manager passes, and replacing an
   agent that `rbw` started before.
