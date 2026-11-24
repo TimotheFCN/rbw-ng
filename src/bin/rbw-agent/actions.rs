@@ -899,7 +899,11 @@ pub async fn sync(
     db.user_id = Some(user_id);
     db.entries = entries;
     db.folders = folders;
-    db.reprompt_mac = reprompt_mac;
+    // a locked vault can't vouch for the new flags; the old MAC still does
+    // if they didn't change, as it is checked against the entries
+    if let Some(reprompt_mac) = reprompt_mac {
+        db.reprompt_mac = Some(reprompt_mac);
+    }
     db.last_sync =
         Some(rbw::api::format_rfc3339(std::time::SystemTime::now()));
     save_db(&db).await?;

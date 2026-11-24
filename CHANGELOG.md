@@ -101,7 +101,9 @@ service.
     didn't recognize and decrypted.
   * The agent takes the entries' re-prompt flags from the server, or from a
     local copy of the vault that carries its MAC of them. It used to trust
-    the local copy when it started, which any program can edit.
+    the local copy when it started, which any program can edit. The local
+    copy gets the MAC at the first sync or unlock after the upgrade; until
+    then, the agent syncs before it decrypts anything.
   * The re-prompt checks the master password against the key of the
     unlocked vault. It checked it against the keys in the local copy of the
     vault, which a program could replace with keys that its own password

@@ -12,7 +12,8 @@
 // itself, and from a local copy that carries the agent's MAC of them, which
 // needs the vault key: an agent started later can then answer without
 // syncing first. A local copy without a valid MAC makes the agent sync
-// before it decrypts anything.
+// before it decrypts anything. The MAC is checked against the entries, so
+// one that outlived a change of the flags vouches for nothing.
 
 use hmac::Mac as _;
 

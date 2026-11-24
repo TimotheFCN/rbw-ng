@@ -405,6 +405,15 @@ def reprompt_attacks(rbw, quiet, password, protected_id, email):
     check("an agent started on the local copy it vouched for needs no sync",
           rbw.error("item", "get", protected_id)["code"] == "reprompt_required"
           and rbw.json("status", "--json")["lastSync"] == synced)
+    rbw.run("lock")
+    time.sleep(1)
+    rbw.run("sync", env=quiet)
+    synced = rbw.json("status", "--json")["lastSync"]
+    rbw.stop()
+    rbw.run("unlock", "--password-stdin", stdin=password, env=quiet)
+    check("and after a sync while it was locked",
+          rbw.error("item", "get", protected_id)["code"] == "reprompt_required"
+          and rbw.json("status", "--json")["lastSync"] == synced)
 
     # keys that open with another password, in place of the account's
     path, db = local_vault(rbw)
