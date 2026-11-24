@@ -148,6 +148,7 @@ never by name.
 | `rbw item get ID --field username\|password\|totp\|notes` | one value; for `totp`, the current code |
 | `rbw item create` | adds the entry on stdin and prints it as saved |
 | `rbw item edit ID` | replaces the entry with the one on stdin and prints it as saved |
+| `rbw item delete ID` | moves the entry to the trash, where the official clients can restore it |
 
 Without secrets, an entry has no `notes`, `fields` or `passwordHistory`. A
 login has its username and addresses, and `login.hasTotp`, which isn't part

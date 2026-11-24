@@ -740,6 +740,15 @@ pub fn edit(id: &str) -> anyhow::Result<()> {
     print_saved(&entry.id)
 }
 
+pub fn delete(id: &str) -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    let db = crate::commands::load_db()?;
+    let entry = find(&db, id)?;
+    let (access_token, refresh_token) = tokens(&db)?;
+    rbw::actions::trash(&access_token, &refresh_token, &entry.id)?;
+    crate::actions::sync()
+}
+
 #[cfg(test)]
 mod test {
     use super::*;

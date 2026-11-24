@@ -162,6 +162,12 @@ def favorites(rbw, quiet):
     edited = rbw.json("item", "edit", note["id"], env=quiet, stdin=json.dumps(full))
     check("edit unmarks a favorite", edited["favorite"] is False)
 
+    rbw.run("item", "delete", note["id"], env=quiet)
+    check("delete moves an entry out of the list",
+          all(item["id"] != note["id"] for item in rbw.json("item", "list", env=quiet)))
+    check("a deleted entry is gone",
+          rbw.error("item", "get", note["id"])["code"] == "not_found")
+
 
 def totp(secret_b32, at=None):
     """An RFC 6238 code (SHA-1, 6 digits, 30 s)."""

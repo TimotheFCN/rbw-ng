@@ -381,6 +381,8 @@ enum Item {
     Create,
     #[command(about = "Replace an entry with the one on stdin")]
     Edit { id: String },
+    #[command(about = "Move an entry to the trash")]
+    Delete { id: String },
 }
 
 impl Item {
@@ -390,6 +392,7 @@ impl Item {
             Self::Get { .. } => "get",
             Self::Create => "create",
             Self::Edit { .. } => "edit",
+            Self::Delete { .. } => "delete",
         }
     }
 }
@@ -556,6 +559,7 @@ fn main() {
             Item::Get { id, field } => items::get(&id, field),
             Item::Create => items::create(),
             Item::Edit { id } => items::edit(&id),
+            Item::Delete { id } => items::delete(&id),
         },
         Opt::Unlocked => commands::unlocked(),
         Opt::Sync => commands::sync(),

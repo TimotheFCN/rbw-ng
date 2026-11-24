@@ -1848,6 +1848,27 @@ impl Client {
         }
     }
 
+    // moves the cipher to the trash, as the official clients do
+    pub fn trash(&self, access_token: &str, id: &str) -> Result<()> {
+        let client = self.blocking_reqwest_client()?;
+        let res = client
+            .put(self.api_url(&format!("/ciphers/{id}/delete")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        match res.status() {
+            reqwest::StatusCode::OK | reqwest::StatusCode::NO_CONTENT => {
+                Ok(())
+            }
+            reqwest::StatusCode::UNAUTHORIZED => {
+                Err(Error::RequestUnauthorized)
+            }
+            _ => Err(Error::RequestFailed {
+                status: res.status().as_u16(),
+            }),
+        }
+    }
+
     pub fn folders(
         &self,
         access_token: &str,

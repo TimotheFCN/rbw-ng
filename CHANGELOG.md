@@ -23,6 +23,8 @@
     key. Listing without secrets shows a card's brand, an identity's names
     and an SSH key's public key.
   * `rbw item create` and `rbw item edit` set the favorite flag.
+  * `rbw item delete` moves an entry to the trash, as the official clients
+    do, instead of deleting it for good like `rbw remove`.
   * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such
     as `locked` or `two_step_required`, so that programs don't depend on
     the wording of messages.
