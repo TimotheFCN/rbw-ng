@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+"""Drives rbw the way a program does, against a real server.
+
+It runs the `rbw` command line with a private HOME, no terminal and the
+secrets on stdin or in the environment, and walks through what a password
+manager needs: status, logging in (with and without two-step login),
+sessions, unlocking after the agent restarted, listing, reading, creating
+and editing entries, and refusing to prompt. Each step is checked.
+
+    tools/scripting-check --server http://localhost:8080
+
+The server must allow sign-ups (Vaultwarden with SIGNUPS_ALLOWED=true): the
+check creates throwaway accounts. Needs Python 3.10+ and the `cryptography`
+package.
+"""
+
+import argparse
+import base64
+import json
+import os
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+
+BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "debug")
+
+def register(server, email, password):
+    """Creates a Bitwarden account the way the official clients do."""
+    from cryptography.hazmat.primitives import hashes, hmac, padding, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    iterations = 600_000
+    master_key = PBKDF2HMAC(
+        hashes.SHA256(), 32, email.lower().encode(), iterations
+    ).derive(password.encode())
+    master_hash = PBKDF2HMAC(hashes.SHA256(), 32, password.encode(), 1).derive(
+        master_key
+    )
+    stretched_enc = HKDFExpand(hashes.SHA256(), 32, b"enc").derive(master_key)
+    stretched_mac = HKDFExpand(hashes.SHA256(), 32, b"mac").derive(master_key)
+
+    def encrypt(enc_key, mac_key, plaintext):
+        iv = secrets.token_bytes(16)
+        padder = padding.PKCS7(128).padder()
+        padded = padder.update(plaintext) + padder.finalize()
+        encryptor = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).encryptor()
+        ciphertext = encryptor.update(padded) + encryptor.finalize()
+        mac = hmac.HMAC(mac_key, hashes.SHA256())
+        mac.update(iv + ciphertext)
+        b64 = lambda b: base64.b64encode(b).decode()
+        return f"2.{b64(iv)}|{b64(ciphertext)}|{b64(mac.finalize())}"
+
+    user_key = secrets.token_bytes(64)
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    private_der = private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    def post(path, body):
+        request = urllib.request.Request(
+            server.rstrip("/") + path,
+            data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request) as response:
+            return response.read().decode()
+
+    # without email verification, the server answers with the token itself
+    token = post("/identity/accounts/register/send-verification-email",
+                 {"email": email, "name": "rbw-ng demo",
+                  "receiveMarketingEmails": False}).strip().strip('"')
+    post("/identity/accounts/register/finish", {
+        "email": email,
+        "emailVerificationToken": token,
+        "masterPasswordHash": base64.b64encode(master_hash).decode(),
+        "masterPasswordHint": None,
+        "userSymmetricKey": encrypt(stretched_enc, stretched_mac, user_key),
+        "userAsymmetricKeys": {
+            "publicKey": base64.b64encode(public_der).decode(),
+            "encryptedPrivateKey": encrypt(user_key[:32], user_key[32:], private_der),
+        },
+        "kdf": 0,
+        "kdfIterations": iterations,
+    })
+
+
+def totp(secret_b32, at=None):
+    """An RFC 6238 code (SHA-1, 6 digits, 30 s)."""
+    import hashlib
+    import hmac as std_hmac
+    import struct
+
+    key = base64.b32decode(secret_b32.upper() + "=" * (-len(secret_b32) % 8))
+    counter = int((time.time() if at is None else at) // 30)
+    digest = std_hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    value = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+    return f"{value % 1_000_000:06d}"
+
+
+def enable_authenticator(server, email, password):
+    """Turns on authenticator-app two-step login; returns its secret."""
+    import urllib.parse
+    import uuid
+
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    master_key = PBKDF2HMAC(
+        hashes.SHA256(), 32, email.lower().encode(), 600_000
+    ).derive(password.encode())
+    master_hash = base64.b64encode(
+        PBKDF2HMAC(hashes.SHA256(), 32, password.encode(), 1).derive(master_key)
+    ).decode()
+    form = urllib.parse.urlencode({
+        "grant_type": "password", "username": email, "password": master_hash,
+        "scope": "api offline_access", "client_id": "cli", "deviceType": "8",
+        "deviceIdentifier": str(uuid.uuid4()), "deviceName": "embedded-host-sim",
+    }).encode()
+    request = urllib.request.Request(server.rstrip("/") + "/identity/connect/token", data=form)
+    with urllib.request.urlopen(request) as response:
+        access_token = json.loads(response.read())["access_token"]
+
+    def post(path, body):
+        request = urllib.request.Request(
+            server.rstrip("/") + path, data=json.dumps(body).encode(),
+            headers={"Content-Type": "application/json",
+                     "Authorization": f"Bearer {access_token}"})
+        with urllib.request.urlopen(request) as response:
+            return json.loads(response.read())
+
+    answer = post("/api/two-factor/get-authenticator",
+                  {"masterPasswordHash": master_hash})
+    # newer servers nest the key and add a token proving the password check
+    nested = answer.get("authenticator") or answer
+    secret = nested.get("key") or nested.get("Key")
+    if not secret:
+        raise RuntimeError(f"no authenticator key in {sorted(nested)}")
+    body = {"key": secret, "token": totp(secret), "masterPasswordHash": master_hash}
+    if answer.get("userVerificationToken"):
+        body["userVerificationToken"] = answer["userVerificationToken"]
+    post("/api/two-factor/authenticator", body)
+    return secret
+
+
+
+class Rbw:
+    """rbw with a private HOME, as a program would run it."""
+
+    def __init__(self, home, server, email):
+        self.env = {
+            "PATH": os.path.abspath(BIN) + ":/usr/bin:/bin",
+            "HOME": home,
+            "XDG_RUNTIME_DIR": os.path.join(home, "run"),
+            "TMPDIR": os.path.join(home, "tmp"),
+            "LANG": "en_US.UTF-8",
+            "RBW_PROFILE": "scripting-check",
+        }
+        for folder in ("run", "tmp"):
+            os.makedirs(os.path.join(home, folder), mode=0o700, exist_ok=True)
+        self.run("config", "set", "base_url", server)
+        self.run("config", "set", "email", email)
+        # a pinentry that fails, so any prompt shows up as an error
+        self.run("config", "set", "pinentry", "/bin/false")
+
+    def run(self, *args, stdin=None, env=None, check=True):
+        result = subprocess.run(
+            [os.path.join(BIN, "rbw"), *args],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            env={**self.env, **(env or {})},
+            timeout=120,
+        )
+        if check and result.returncode != 0:
+            raise AssertionError(
+                f"rbw {' '.join(args)} failed: {result.stderr.strip()}"
+            )
+        return result
+
+    def json(self, *args, **kwargs):
+        return json.loads(self.run(*args, **kwargs).stdout)
+
+    def fails(self, *args, needle, **kwargs):
+        result = self.run(*args, check=False, **kwargs)
+        if result.returncode == 0:
+            raise AssertionError(f"rbw {' '.join(args)} succeeded")
+        if needle not in result.stderr:
+            raise AssertionError(
+                f"rbw {' '.join(args)}: expected {needle!r} in {result.stderr.strip()!r}"
+            )
+        return result
+
+    def stop(self):
+        self.run("stop-agent", check=False)
+
+
+PASSED = 0
+
+
+def check(name, condition, detail=""):
+    global PASSED
+    if not condition:
+        raise AssertionError(f"{name} {detail}")
+    PASSED += 1
+    print(f"ok  {name}")
+
+
+def scenario(server, password):
+    email = f"scripting-{secrets.token_hex(4)}@example.com"
+    register(server, email, password)
+    home = tempfile.mkdtemp(prefix="rbw-scripting-")
+    rbw = Rbw(home, server, email)
+    quiet = {"RBW_NONINTERACTIVE": "1"}
+    try:
+        check("signed out", rbw.json("status", "--json")["status"] == "unauthenticated")
+        rbw.fails("item", "list", env=quiet, needle="not logged in")
+        rbw.fails("login", "--password-stdin", stdin="wrong\n", env=quiet,
+                  needle="incorrect master password")
+        check("a wrong password is refused", True)
+        session = rbw.run("login", "--password-stdin", "--session",
+                          stdin=password + "\n", env=quiet).stdout.strip()
+        check("login prints a session", len(base64.b64decode(session)) == 64)
+        status = rbw.json("status", "--json")
+        check("unlocked", status["status"] == "unlocked" and status["userEmail"] == email,
+              str(status))
+
+        created = rbw.json("item", "create", env=quiet, stdin=json.dumps({
+            "type": 1, "name": "GitHub", "notes": "recovery codes",
+            "login": {"username": "octo", "password": "first-password",
+                      "totp": "JBSWY3DPEHPK3PXP",
+                      "uris": [{"uri": "https://github.com", "match": None}]},
+            "fields": [{"name": "pin", "value": "1234", "type": 1}],
+        }))
+        item_id = created["id"]
+        check("create answers the saved item",
+              created["name"] == "GitHub" and created["login"]["username"] == "octo")
+        check("create's answer has no secrets",
+              "password" not in created["login"] and "notes" not in created)
+        encoded = base64.b64encode(json.dumps({
+            "type": 1, "name": "Mail", "login": {"username": "me", "password": "p",
+            "uris": [{"uri": "https://mail.example.com", "match": 3}]},
+        }).encode()).decode()
+        mail = rbw.json("item", "create", env=quiet, stdin=encoded)
+        check("create takes base64 JSON", mail["login"]["uris"][0]["match"] == 3)
+
+        listed = rbw.json("item", "list", env=quiet)
+        by_id = {item["id"]: item for item in listed}
+        check("list has both", item_id in by_id and mail["id"] in by_id)
+        github = by_id[item_id]
+        check("list leaves secrets out",
+              "password" not in github["login"] and "totp" not in github["login"]
+              and "fields" not in github and "notes" not in github)
+        check("list says which logins have a code",
+              github["login"]["hasTotp"] is True and by_id[mail["id"]]["login"]["hasTotp"] is False)
+        full = {i["id"]: i for i in rbw.json("item", "list", "--secrets", env=quiet)}
+        check("list --secrets has them",
+              full[item_id]["login"]["password"] == "first-password"
+              and full[item_id]["fields"][0]["value"] == "1234")
+
+        got = rbw.json("item", "get", item_id, env=quiet)
+        check("get shows the whole item",
+              got["login"]["totp"] == "JBSWY3DPEHPK3PXP" and got["notes"] == "recovery codes")
+        check("get --field password",
+              rbw.run("item", "get", item_id, "--field", "password", env=quiet).stdout == "first-password\n")
+        code = rbw.run("item", "get", item_id, "--field", "totp", env=quiet).stdout.strip()
+        check("get --field totp prints the current code",
+              code in {totp("JBSWY3DPEHPK3PXP", time.time() + d) for d in (-30, 0, 30)}, code)
+        rbw.fails("item", "get", mail["id"], "--field", "totp", env=quiet, needle="no totp available")
+        rbw.fails("item", "get", "00000000-0000-0000-0000-000000000000", env=quiet, needle="not found")
+
+        got["login"]["password"] = "second-password"
+        got["login"]["uris"].append({"uri": "https://gist.github.com", "match": 1})
+        edited = rbw.json("item", "edit", item_id, env=quiet, stdin=json.dumps(got))
+        check("edit saves", len(edited["login"]["uris"]) == 2)
+        again = rbw.json("item", "get", item_id, env=quiet)
+        check("edit changes the password and keeps the old one in history",
+              again["login"]["password"] == "second-password"
+              and [h["password"] for h in again["passwordHistory"]] == ["first-password"])
+        check("edit keeps the rest", again["notes"] == "recovery codes"
+              and again["login"]["totp"] == "JBSWY3DPEHPK3PXP")
+        rbw.fails("item", "edit", item_id, env=quiet, needle="another id",
+                  stdin=json.dumps({**again, "id": mail["id"]}))
+        rbw.fails("item", "create", env=quiet, needle="passkeys aren't supported",
+                  stdin=json.dumps({"type": 1, "name": "x", "login": {"fido2Credentials": [{}]}}))
+
+        rbw.stop()
+        check("a stopped agent is locked", rbw.json("status", "--json")["status"] == "locked")
+        listed = rbw.json("item", "list", env={**quiet, "RBW_SESSION": session})
+        check("the session unlocks a restarted agent", any(i["id"] == item_id for i in listed))
+        rbw.run("lock")
+        rbw.fails("item", "list", env=quiet, needle="the vault is locked")
+        rbw.fails("item", "list", env={**quiet, "RBW_SESSION": session},
+                  needle="the session key is invalid")
+        check("lock ends the session", True)
+        rbw.fails("unlock", env=quiet, needle="the vault is locked")
+        check("no prompt without a terminal", True)
+
+        newer = rbw.run("unlock", "--password-stdin", "--session", env=quiet,
+                        stdin=password).stdout.strip()
+        check("unlock --session prints a new session", newer and newer != session)
+        rbw.run("unlock", "--password-stdin", "--session", env=quiet, stdin=password)
+        rbw.stop()
+        rbw.fails("item", "list", env={**quiet, "RBW_SESSION": newer},
+                  needle="the session key is invalid")
+        check("a new session replaces the old one", True)
+        rbw.run("unlock", "--password-stdin", env=quiet, stdin=password)
+        rbw.run("purge")
+        check("purge signs out", rbw.json("status", "--json")["status"] == "unauthenticated")
+        check("purge removes the session",
+              not any("session.json" in files for _, _, files in os.walk(home)))
+    finally:
+        rbw.stop()
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def two_step(server, password):
+    email = f"scripting-2fa-{secrets.token_hex(4)}@example.com"
+    register(server, email, password)
+    secret = enable_authenticator(server, email, password)
+    home = tempfile.mkdtemp(prefix="rbw-scripting-")
+    rbw = Rbw(home, server, email)
+    quiet = {"RBW_NONINTERACTIVE": "1"}
+    try:
+        rbw.fails("login", "--password-stdin", stdin=password, env=quiet,
+                  needle="two-step login code required; methods: 0")
+        check("login asks for a two-step code", True)
+        rbw.fails("login", "--password-stdin", "--method", "0", "--code", "000000",
+                  stdin=password, env=quiet, needle="code is incorrect")
+        check("a wrong code is refused", True)
+        rbw.fails("login", "--password-stdin", "--method", "2", "--code", "1",
+                  stdin=password, env=quiet, needle="isn't supported")
+        # the server refuses a code twice, and enabling used this one
+        time.sleep(30 - time.time() % 30 + 1)
+        rbw.run("login", "--password-stdin", "--method", "0", "--code", totp(secret),
+                stdin=password, env=quiet)
+        check("login with the code", rbw.json("status", "--json")["status"] == "unlocked")
+    finally:
+        rbw.stop()
+        shutil.rmtree(home, ignore_errors=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--server", required=True)
+    parser.add_argument("--password", default="correct horse battery staple")
+    args = parser.parse_args()
+    try:
+        scenario(args.server, args.password)
+        two_step(args.server, args.password)
+    except AssertionError as e:
+        print(f"FAIL {e}")
+        sys.exit(1)
+    print(f"{PASSED} checks passed")
+
+
+if __name__ == "__main__":
+    main()

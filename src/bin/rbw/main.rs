@@ -5,6 +5,8 @@ use clap::{CommandFactory as _, Parser as _};
 
 mod actions;
 mod commands;
+mod items;
+mod scripting;
 mod sock;
 
 #[derive(Debug, clap::Args)]
@@ -37,13 +39,76 @@ enum Opt {
             personal API key (instead of your password) first before regular \
             logins will work."
     )]
-    Register,
+    Register {
+        #[arg(
+            long,
+            help = "Read the API key from RBW_CLIENT_ID and \
+                RBW_CLIENT_SECRET instead of asking"
+        )]
+        api_key_env: bool,
+    },
 
     #[command(about = "Log in to the Bitwarden server")]
-    Login,
+    Login {
+        #[arg(
+            long,
+            help = "Read the master password from stdin instead of asking"
+        )]
+        password_stdin: bool,
+        #[arg(
+            long,
+            value_name = "ID",
+            help = "Two-step login method of --code: 0 authenticator app, \
+                1 email, 3 YubiKey OTP. Without it, --code is the new \
+                device verification code Bitwarden emails"
+        )]
+        method: Option<u8>,
+        #[arg(long, help = "Two-step login or new device code")]
+        code: Option<String>,
+        #[arg(
+            long,
+            help = "Print a session key that unlocks the vault again \
+                through RBW_SESSION"
+        )]
+        session: bool,
+    },
 
     #[command(about = "Unlock the local Bitwarden database")]
-    Unlock,
+    Unlock {
+        #[arg(
+            long,
+            help = "Read the master password from stdin instead of asking"
+        )]
+        password_stdin: bool,
+        #[arg(
+            long,
+            help = "Print a session key that unlocks the vault again \
+                through RBW_SESSION"
+        )]
+        session: bool,
+    },
+
+    #[command(
+        about = "Show whether rbw is logged in and unlocked",
+        long_about = "Show whether rbw is logged in and unlocked\n\n\
+            Prints unauthenticated, locked or unlocked, or with --json an \
+            object with status, serverUrl and userEmail."
+    )]
+    Status {
+        #[arg(long, help = "Display output as JSON")]
+        json: bool,
+    },
+
+    #[command(
+        about = "Read and save entries as JSON, for other programs",
+        long_about = "Read and save entries as JSON, for other programs\n\n\
+            Entries are in Bitwarden's item format, the format of the \
+            official CLI, and are found by id only."
+    )]
+    Item {
+        #[command(subcommand)]
+        item: Item,
+    },
 
     #[command(about = "Check if the local Bitwarden database is unlocked")]
     Unlocked,
@@ -284,15 +349,51 @@ enum Opt {
     GenCompletions { shell: CompletionShell },
 }
 
+#[derive(Debug, clap::Subcommand)]
+enum Item {
+    #[command(about = "List every entry, without secrets unless asked")]
+    List {
+        #[arg(
+            long,
+            help = "Include passwords, codes, notes, custom fields and \
+                password history"
+        )]
+        secrets: bool,
+    },
+    #[command(about = "Show one entry, or one of its fields")]
+    Get {
+        id: String,
+        #[arg(long, value_enum, help = "Print only this field")]
+        field: Option<items::Field>,
+    },
+    #[command(about = "Add the entry on stdin, as JSON or base64 JSON")]
+    Create,
+    #[command(about = "Replace an entry with the one on stdin")]
+    Edit { id: String },
+}
+
+impl Item {
+    const fn subcommand_name(&self) -> &'static str {
+        match self {
+            Self::List { .. } => "list",
+            Self::Get { .. } => "get",
+            Self::Create => "create",
+            Self::Edit { .. } => "edit",
+        }
+    }
+}
+
 impl Opt {
     fn subcommand_name(&self) -> String {
         match self {
             Self::Config { config } => {
                 format!("config {}", config.subcommand_name())
             }
-            Self::Register => "register".to_string(),
-            Self::Login => "login".to_string(),
-            Self::Unlock => "unlock".to_string(),
+            Self::Register { .. } => "register".to_string(),
+            Self::Login { .. } => "login".to_string(),
+            Self::Unlock { .. } => "unlock".to_string(),
+            Self::Status { .. } => "status".to_string(),
+            Self::Item { item } => format!("item {}", item.subcommand_name()),
             Self::Unlocked => "unlocked".to_string(),
             Self::Sync => "sync".to_string(),
             Self::List { .. } => "list".to_string(),
@@ -387,9 +488,24 @@ fn main() {
             Config::Set { key, value } => commands::config_set(&key, &value),
             Config::Unset { key } => commands::config_unset(&key),
         },
-        Opt::Register => commands::register(),
-        Opt::Login => commands::login(),
-        Opt::Unlock => commands::unlock(),
+        Opt::Register { api_key_env } => scripting::register(api_key_env),
+        Opt::Login {
+            password_stdin,
+            method,
+            code,
+            session,
+        } => scripting::login(password_stdin, method, code, session),
+        Opt::Unlock {
+            password_stdin,
+            session,
+        } => scripting::unlock(password_stdin, session),
+        Opt::Status { json } => scripting::status(json),
+        Opt::Item { item } => match item {
+            Item::List { secrets } => items::list(secrets),
+            Item::Get { id, field } => items::get(&id, field),
+            Item::Create => items::create(),
+            Item::Edit { id } => items::edit(&id),
+        },
         Opt::Unlocked => commands::unlocked(),
         Opt::Sync => commands::sync(),
         Opt::List { fields, raw } => commands::list(&fields, raw),

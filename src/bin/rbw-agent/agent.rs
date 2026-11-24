@@ -225,6 +225,48 @@ async fn handle_request(
                 .await?;
             true
         }
+        rbw::protocol::Action::LoginWith {
+            password,
+            code,
+            session,
+        } => {
+            crate::scripted::login_with(
+                sock,
+                state.clone(),
+                password,
+                code.as_ref(),
+                *session,
+            )
+            .await?;
+            true
+        }
+        rbw::protocol::Action::RegisterWith {
+            client_id,
+            client_secret,
+        } => {
+            crate::scripted::register_with(sock, client_id, client_secret)
+                .await?;
+            true
+        }
+        rbw::protocol::Action::UnlockWith { password, session } => {
+            crate::scripted::unlock_with(
+                sock,
+                state.clone(),
+                password,
+                *session,
+            )
+            .await?;
+            true
+        }
+        rbw::protocol::Action::UnlockSession { session } => {
+            crate::scripted::unlock_session(sock, state.clone(), session)
+                .await?;
+            true
+        }
+        rbw::protocol::Action::ForgetSession => {
+            crate::scripted::forget_session(sock).await?;
+            false
+        }
         rbw::protocol::Action::Quit => std::process::exit(0),
         rbw::protocol::Action::Version => {
             crate::actions::version(sock).await?;

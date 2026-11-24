@@ -1334,6 +1334,9 @@ pub fn login() -> anyhow::Result<()> {
 
 pub fn unlock() -> anyhow::Result<()> {
     ensure_agent()?;
+    if crate::scripting::unlock_for_program()? {
+        return Ok(());
+    }
     crate::actions::login()?;
     crate::actions::unlock()?;
 
@@ -1351,6 +1354,11 @@ pub fn unlocked() -> anyhow::Result<()> {
 
 pub fn sync() -> anyhow::Result<()> {
     ensure_agent()?;
+    if crate::scripting::noninteractive()
+        && load_db().map_or(true, |db| db.needs_login())
+    {
+        anyhow::bail!("not logged in");
+    }
     crate::actions::login()?;
     crate::actions::sync()?;
 
@@ -1692,7 +1700,7 @@ fn uri_checksum(uri: &str) -> String {
 // encrypts a uri together with its checksum (the base64 sha256 of the uri),
 // which the official clients check before showing the uris of an entry
 // that has its own key
-fn encrypt_uri(
+pub fn encrypt_uri(
     uri: &str,
     match_type: Option<rbw::api::UriMatchType>,
     entry_key: Option<&str>,
@@ -2110,7 +2118,7 @@ fn password_change<'a>(
 // ciphertext, so that saving without changes adds nothing to the history and
 // leaves the server's password revision date alone. a changed one moves the
 // old one into the history, as the official clients do.
-fn edit_password(
+pub fn edit_password(
     entry: &rbw::db::Entry,
     encrypted: Option<&str>,
     current: Option<&str>,
@@ -2502,6 +2510,11 @@ pub fn purge() -> anyhow::Result<()> {
     stop_agent()?;
 
     remove_db()?;
+    if let Err(e) = std::fs::remove_file(rbw::dirs::session_file()) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e).context("failed to remove the session");
+        }
+    }
 
     Ok(())
 }
@@ -2512,7 +2525,7 @@ pub fn stop_agent() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn ensure_agent() -> anyhow::Result<()> {
+pub fn ensure_agent() -> anyhow::Result<()> {
     check_config()?;
     if matches!(check_agent_version(), Ok(())) {
         return Ok(());
@@ -2550,7 +2563,7 @@ fn check_config() -> anyhow::Result<()> {
     })
 }
 
-fn check_agent_version() -> anyhow::Result<()> {
+pub fn check_agent_version() -> anyhow::Result<()> {
     let client_version = rbw::protocol::VERSION;
     let agent_version = version_or_quit()?;
     if agent_version != client_version {
@@ -3402,7 +3415,7 @@ fn parse_editor(contents: &str) -> (Option<String>, Option<String>) {
     (password, notes)
 }
 
-fn user_id(db: &rbw::db::Db) -> anyhow::Result<&str> {
+pub fn user_id(db: &rbw::db::Db) -> anyhow::Result<&str> {
     db.user_id.as_deref().with_context(|| {
         "user id is missing from the db, please run `rbw sync` first"
             .to_string()
@@ -3411,7 +3424,7 @@ fn user_id(db: &rbw::db::Db) -> anyhow::Result<&str> {
 
 // Switches to tokens that a request had to refresh, for the requests after
 // it. The library has already saved them.
-fn update_tokens(
+pub fn update_tokens(
     tokens: Option<rbw::actions::RefreshedTokens>,
     access_token: &mut String,
     refresh_token: &mut String,
@@ -3422,7 +3435,7 @@ fn update_tokens(
     }
 }
 
-fn load_db() -> anyhow::Result<rbw::db::Db> {
+pub fn load_db() -> anyhow::Result<rbw::db::Db> {
     let config = rbw::config::Config::load()?;
     config.email.as_ref().map_or_else(
         || Err(anyhow::anyhow!("failed to find email address in config")),

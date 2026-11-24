@@ -193,6 +193,58 @@ pub fn version() -> anyhow::Result<u32> {
     }
 }
 
+pub fn login_with(
+    password: String,
+    code: Option<rbw::protocol::LoginCode>,
+    session: bool,
+) -> anyhow::Result<Option<String>> {
+    session_action(rbw::protocol::Action::LoginWith {
+        password,
+        code,
+        session,
+    })
+}
+
+pub fn register_with(
+    client_id: String,
+    client_secret: String,
+) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::RegisterWith {
+        client_id,
+        client_secret,
+    })
+}
+
+pub fn unlock_with(
+    password: String,
+    session: bool,
+) -> anyhow::Result<Option<String>> {
+    session_action(rbw::protocol::Action::UnlockWith { password, session })
+}
+
+pub fn unlock_session(session: String) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::UnlockSession { session })
+}
+
+// An action that answers with a session key when it made one.
+fn session_action(
+    action: rbw::protocol::Action,
+) -> anyhow::Result<Option<String>> {
+    let mut sock = connect()?;
+
+    sock.send(&rbw::protocol::Request::new(get_environment(), action))?;
+
+    let res = sock.recv()?;
+    match res {
+        rbw::protocol::Response::Ack => Ok(None),
+        rbw::protocol::Response::Session { session } => Ok(Some(session)),
+        rbw::protocol::Response::Error { error } => {
+            Err(anyhow::anyhow!("{error}"))
+        }
+        _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
+    }
+}
+
 fn simple_action(action: rbw::protocol::Action) -> anyhow::Result<()> {
     let mut sock = connect()?;
 

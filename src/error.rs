@@ -182,6 +182,9 @@ pub enum Error {
     #[error("pinentry cancelled")]
     PinentryCancelled,
 
+    #[error("input required, but RBW_NONINTERACTIVE is set")]
+    InteractionRequired,
+
     #[error("pinentry prompt timed out")]
     PinentryTimedOut,
 

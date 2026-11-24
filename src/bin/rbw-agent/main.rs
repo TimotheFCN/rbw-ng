@@ -10,6 +10,8 @@ mod notifications;
 mod peer;
 #[cfg(target_os = "macos")]
 mod presence;
+mod scripted;
+mod session;
 mod sock;
 mod ssh_agent;
 mod state;

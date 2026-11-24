@@ -63,6 +63,12 @@ pub fn device_id_file() -> std::path::PathBuf {
     data_dir().join("device_id")
 }
 
+// The vault key, encrypted with a session key that the program that made
+// the session keeps (see rbw unlock --session).
+pub fn session_file() -> std::path::PathBuf {
+    data_dir().join("session.json")
+}
+
 pub fn socket_file() -> std::path::PathBuf {
     runtime_dir().join("socket")
 }

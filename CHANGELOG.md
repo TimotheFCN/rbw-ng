@@ -1,5 +1,24 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+* Commands for programs that drive `rbw`, such as a browser's password
+  manager (see [docs/scripting.md](docs/scripting.md)):
+  * `rbw login --password-stdin` and `rbw unlock --password-stdin` take the
+    master password on stdin. `--method` and `--code` finish a two-step or
+    new device login, and `rbw register --api-key-env` reads the API key from
+    the environment.
+  * `--session` prints a session key that unlocks the vault again through
+    `RBW_SESSION`, even after the agent restarted. The agent keeps only the
+    vault key encrypted with it.
+  * `RBW_NONINTERACTIVE=1` makes `rbw` fail with a clear error instead of
+    opening pinentry.
+  * `rbw status [--json]` says whether the account is logged in and unlocked.
+  * `rbw item list|get|create|edit` read and save entries as JSON in
+    Bitwarden's item format, by id. Listing leaves secrets out unless asked.
+
 ## [1.18.1] - 2026-11-23
 
 First packaged release. `rbw-ng` now installs with Homebrew, Cargo or a

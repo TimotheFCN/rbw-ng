@@ -36,6 +36,9 @@ Documentation lives in the [wiki](https://github.com/TimotheFCN/rbw-ng/wiki).
   YubiKey OTP two-factor, client certificates and extra HTTP headers for
   servers behind Cloudflare Access or another proxy.
 * Profiles, to use several accounts side by side.
+* An interface for other programs: logging in and unlocking without a
+  terminal, sessions, and entries as JSON in Bitwarden's item format
+  ([docs/scripting.md](docs/scripting.md)).
 
 What changed since `rbw` 1.15.0 is in the [changelog](CHANGELOG.md).
 

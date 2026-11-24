@@ -73,6 +73,7 @@ pub const ENVIRONMENT_VARIABLES: &[&str] = &[
     "PINENTRY_USER_DATA",
     // Used to pass window information
     "PINENTRY_GEOM_HINT",
+    "RBW_NONINTERACTIVE",
 ];
 
 pub static ENVIRONMENT_VARIABLES_OS: std::sync::LazyLock<
@@ -170,6 +171,16 @@ impl Environment {
         }
     }
 
+    // Whether the caller set RBW_NONINTERACTIVE: a program that drives rbw
+    // and can't answer a prompt.
+    pub fn is_noninteractive(&self) -> bool {
+        self.env_vars.iter().any(|(name, value)| {
+            name.0 == "RBW_NONINTERACTIVE"
+                && !value.0.is_empty()
+                && value.0 != "0"
+        })
+    }
+
     pub fn tty(&self) -> Option<&std::ffi::OsStr> {
         self.tty.as_ref().map(|tty| tty.0.as_os_str())
     }
@@ -213,6 +224,27 @@ pub enum Action {
     ClipboardStore {
         text: String,
     },
+    // The same as Login, Register and Unlock, with the secrets from the
+    // caller instead of pinentry, for programs that drive rbw. With
+    // session, the answer is a session key (Response::Session) that
+    // UnlockSession takes later.
+    LoginWith {
+        password: String,
+        code: Option<LoginCode>,
+        session: bool,
+    },
+    RegisterWith {
+        client_id: String,
+        client_secret: String,
+    },
+    UnlockWith {
+        password: String,
+        session: bool,
+    },
+    UnlockSession {
+        session: String,
+    },
+    ForgetSession,
     Quit,
     Version,
 }
@@ -224,6 +256,15 @@ pub struct DecryptItem {
     pub cipherstring: String,
     pub entry_key: Option<String>,
     pub org_id: Option<String>,
+}
+
+// A two-step login code. Without a method, it is the code Bitwarden emails
+// to verify a new device.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct LoginCode {
+    // Bitwarden's id: 0 authenticator app, 1 email, 3 YubiKey OTP
+    pub method: Option<u8>,
+    pub code: String,
 }
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
@@ -244,5 +285,8 @@ pub enum Response {
     },
     Version {
         version: u32,
+    },
+    Session {
+        session: String,
     },
 }
