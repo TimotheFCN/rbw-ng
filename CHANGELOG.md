@@ -1,6 +1,12 @@
 # Changelog
 
-## [Unreleased]
+## [1.19.0] - 2026-11-24
+
+Programs can drive `rbw` without a terminal, the way they would drive
+Bitwarden's official CLI: log in, unlock and read or save entries as JSON,
+with errors that carry stable codes (see
+[docs/scripting.md](docs/scripting.md)). `rbw-agent` can also run as a login
+service.
 
 ### Added
 
