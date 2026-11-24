@@ -537,6 +537,11 @@ def generator(rbw):
           and sum(c.isdigit() for c in phrase) == 1, phrase)
     check("generate refuses a password too short for its classes",
           rbw.error("generate", "3", "--each-class")["code"] == "invalid_input")
+    error = rbw.error("generate", "8", "--capitalize")
+    check("options that don't go together fail with invalid_input",
+          error == {"code": "invalid_input",
+                    "message": "the following required arguments were not provided: --diceware"},
+          str(error))
     check("generate refuses a password without characters",
           rbw.error("generate", "8", "--no-uppercase", "--no-lowercase", "--no-numbers",
                     "--no-symbols")["code"] == "invalid_input")

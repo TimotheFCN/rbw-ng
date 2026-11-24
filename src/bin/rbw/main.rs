@@ -680,8 +680,36 @@ fn json_errors() -> bool {
         .is_some_and(|format| format == "json")
 }
 
+fn print_json_error(code: rbw::protocol::ErrorCode, message: &str) {
+    let mut error = serde_json::to_value(code).unwrap_or_default();
+    error["message"] = message.into();
+    eprintln!("{error}");
+}
+
 fn main() {
-    let opt = Opt::parse();
+    let opt = Opt::try_parse().unwrap_or_else(|e| {
+        // --help and --version print on stdout and succeed
+        if json_errors() && e.use_stderr() {
+            let message = match e.kind() {
+                clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
+                    "rbw: a command is missing".to_string()
+                }
+                // the error's lines, without the usage that follows them
+                _ => e
+                    .to_string()
+                    .lines()
+                    .take_while(|line| !line.is_empty())
+                    .map(str::trim)
+                    .collect::<Vec<_>>()
+                    .join(" ")
+                    .trim_start_matches("error: ")
+                    .to_string(),
+            };
+            print_json_error(rbw::protocol::ErrorCode::InvalidInput, &message);
+            std::process::exit(1);
+        }
+        e.exit()
+    });
 
     env_logger::Builder::from_env(
         env_logger::Env::default().default_filter_or("info"),
@@ -706,10 +734,7 @@ fn main() {
 
     if let Err(e) = res {
         if json_errors() {
-            let mut error = serde_json::to_value(rbw::error::code(&e))
-                .unwrap_or_default();
-            error["message"] = format!("{e:#}").into();
-            eprintln!("{error}");
+            print_json_error(rbw::error::code(&e), &format!("{e:#}"));
         } else {
             eprintln!("{e:#}");
         }

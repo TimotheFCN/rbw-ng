@@ -132,6 +132,9 @@ service.
   UTF-8. Such a profile kept its files outside its own folders, so that
   `RBW_PROFILE=x/../.. rbw purge --all` removed the home folder, and one that
   wasn't UTF-8 used the default profile.
+* With `RBW_ERROR_FORMAT=json`, wrong arguments, such as an unknown option,
+  fail with `invalid_input` in JSON and exit status 1, like any other error,
+  instead of a text message and status 2.
 * `rbw-agent` no longer quotes a request it can't read, in its log and in its
   answer, only names the request's action: a request from a newer `rbw` can
   carry the master password.

@@ -24,7 +24,8 @@ opens pinentry, which a program can't answer.
 
 With `RBW_ERROR_FORMAT=json`, a command that fails prints its error on
 stderr as one line of JSON, with a code that stays the same from one release
-to the next, and exits with status 1:
+to the next, and exits with status 1. So do wrong arguments, with
+`invalid_input`:
 
 ```json
 {"code":"locked","message":"rbw item list: the vault is locked"}
