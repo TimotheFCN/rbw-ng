@@ -476,71 +476,15 @@ async fn unlock_state(
         })?;
 
         #[cfg(target_os = "macos")]
+        if unlock_with_touch_id(
+            &state,
+            &db,
+            protected_key,
+            protected_private_key,
+        )
+        .await?
         {
-            let biometric_unlock = {
-                let state = state.lock().await;
-                if state.touch_id_unlock {
-                    state.biometric_unlock.clone()
-                } else {
-                    None
-                }
-            };
-            if let Some(biometric_unlock) = biometric_unlock {
-                if biometric_unlock.matches(protected_key) {
-                    let biometric_unlock_for_task = biometric_unlock.clone();
-                    let biometric_key =
-                        tokio::task::spawn_blocking(move || {
-                            biometric_unlock_for_task.unlock()
-                        })
-                        .await
-                        .context("failed to join Touch ID task")?;
-                    match biometric_key {
-                        Ok(key) => match rbw::actions::unlock_with_key(
-                            key,
-                            protected_private_key,
-                            &db.protected_org_keys,
-                        ) {
-                            Ok((keys, org_keys)) => {
-                                if set_biometric_unlocked(
-                                    state,
-                                    &biometric_unlock,
-                                    keys,
-                                    org_keys,
-                                )
-                                .await
-                                {
-                                    return Ok(());
-                                }
-                                return Err(anyhow::anyhow!(
-                                    "Touch ID session was revoked"
-                                ));
-                            }
-                            Err(error) => {
-                                log::warn!(
-                                    "failed to unlock with cached vault key: \
-                                    {error}"
-                                );
-                                state.lock().await.biometric_unlock = None;
-                            }
-                        },
-                        Err(crate::biometric::UnlockError::Canceled) => {
-                            return Err(anyhow::anyhow!(
-                                "Touch ID was canceled"
-                            ));
-                        }
-                        Err(
-                            crate::biometric::UnlockError::PasswordRequested,
-                        ) => {}
-                        Err(crate::biometric::UnlockError::Unavailable(
-                            error,
-                        )) => {
-                            log::warn!("Touch ID is unavailable: {error}");
-                        }
-                    }
-                } else {
-                    state.lock().await.biometric_unlock = None;
-                }
-            }
+            return Ok(());
         }
 
         let mut err_msg = None;
@@ -608,6 +552,152 @@ pub async fn unlock(
     respond_ack(sock).await?;
 
     Ok(())
+}
+
+// Unlocks with Touch ID if it can: true once unlocked, false when only the
+// master password can unlock.
+#[cfg(target_os = "macos")]
+async fn unlock_with_touch_id(
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    db: &rbw::db::Db,
+    protected_key: &str,
+    protected_private_key: &str,
+) -> anyhow::Result<bool> {
+    let biometric_unlock = {
+        let state = state.lock().await;
+        if state.touch_id_unlock {
+            state.biometric_unlock.clone()
+        } else {
+            None
+        }
+    };
+    let Some(biometric_unlock) = biometric_unlock else {
+        return Ok(false);
+    };
+    if !biometric_unlock.matches(protected_key) {
+        state.lock().await.biometric_unlock = None;
+        return Ok(false);
+    }
+    let biometric_unlock_for_task = biometric_unlock.clone();
+    let biometric_key = tokio::task::spawn_blocking(move || {
+        biometric_unlock_for_task.unlock()
+    })
+    .await
+    .context("failed to join Touch ID task")?;
+    match biometric_key {
+        Ok(key) => match rbw::actions::unlock_with_key(
+            key,
+            protected_private_key,
+            &db.protected_org_keys,
+        ) {
+            Ok((keys, org_keys)) => {
+                if set_biometric_unlocked(
+                    state.clone(),
+                    &biometric_unlock,
+                    keys,
+                    org_keys,
+                )
+                .await
+                {
+                    Ok(true)
+                } else {
+                    Err(rbw::error::coded(
+                        rbw::protocol::ErrorCode::TouchIdUnavailable,
+                        "Touch ID session was revoked",
+                    ))
+                }
+            }
+            Err(error) => {
+                log::warn!("failed to unlock with cached vault key: {error}");
+                state.lock().await.biometric_unlock = None;
+                Ok(false)
+            }
+        },
+        Err(crate::biometric::UnlockError::Canceled) => {
+            Err(rbw::error::coded(
+                rbw::protocol::ErrorCode::TouchIdCanceled,
+                "Touch ID was canceled",
+            ))
+        }
+        Err(crate::biometric::UnlockError::PasswordRequested) => Ok(false),
+        Err(crate::biometric::UnlockError::Unavailable(error)) => {
+            log::warn!("Touch ID is unavailable: {error}");
+            Ok(false)
+        }
+    }
+}
+
+// Whether Touch ID can unlock the vault now: it is on, and the vault was
+// unlocked with the master password since the agent started.
+#[cfg(target_os = "macos")]
+async fn touch_id_ready(
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> bool {
+    let protected_key = load_db().await.ok().and_then(|db| db.protected_key);
+    let state = state.lock().await;
+    state.touch_id_unlock
+        && state
+            .biometric_unlock
+            .as_ref()
+            .zip(protected_key)
+            .is_some_and(|(session, key)| session.matches(&key))
+}
+
+// Unlocks with Touch ID only, never asking for the master password.
+pub async fn unlock_touch_id(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let unavailable = || {
+        rbw::error::coded(
+            rbw::protocol::ErrorCode::TouchIdUnavailable,
+            "Touch ID can't unlock the vault now; unlock with the master \
+             password first",
+        )
+    };
+    let unlock_lock = state.lock().await.unlock_lock.clone();
+    let _unlock_guard = unlock_lock.lock().await;
+    if state.lock().await.needs_unlock() {
+        #[cfg(target_os = "macos")]
+        {
+            let db = load_db().await?;
+            let (Some(protected_key), Some(protected_private_key)) = (
+                db.protected_key.as_deref(),
+                db.protected_private_key.as_deref(),
+            ) else {
+                return Err(rbw::error::coded(
+                    rbw::protocol::ErrorCode::NotLoggedIn,
+                    "not logged in",
+                ));
+            };
+            if !unlock_with_touch_id(
+                &state,
+                &db,
+                protected_key,
+                protected_private_key,
+            )
+            .await?
+            {
+                return Err(unavailable());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(unavailable());
+    }
+    respond_ack(sock).await
+}
+
+pub async fn status(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let unlocked = !state.lock().await.needs_unlock();
+    #[cfg(target_os = "macos")]
+    let touch_id = !unlocked && touch_id_ready(&state).await;
+    #[cfg(not(target_os = "macos"))]
+    let touch_id = false;
+    sock.send(&rbw::protocol::Response::Status { unlocked, touch_id })
+        .await
 }
 
 pub async fn unlock_success(
@@ -753,6 +843,8 @@ pub async fn sync(
     db.user_id = Some(user_id);
     db.entries = entries;
     db.folders = folders;
+    db.last_sync =
+        Some(rbw::api::format_rfc3339(std::time::SystemTime::now()));
     save_db(&db).await?;
     #[cfg(target_os = "macos")]
     if protected_key_changed {

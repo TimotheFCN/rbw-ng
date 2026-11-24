@@ -45,8 +45,14 @@ fn password_from_stdin() -> anyhow::Result<String> {
     Ok(password)
 }
 
+fn logged_in_db() -> Option<rbw::db::Db> {
+    crate::commands::load_db()
+        .ok()
+        .filter(|db| !db.needs_login())
+}
+
 fn logged_in() -> bool {
-    crate::commands::load_db().is_ok_and(|db| !db.needs_login())
+    logged_in_db().is_some()
 }
 
 // The unlock before a command, for a program: with RBW_SESSION, unlock with
@@ -116,7 +122,23 @@ pub fn register(api_key_env: bool) -> anyhow::Result<()> {
     crate::actions::register_with(client_id, client_secret)
 }
 
-pub fn unlock(password_stdin: bool, session: bool) -> anyhow::Result<()> {
+pub fn unlock(
+    password_stdin: bool,
+    session: bool,
+    touch_id: bool,
+) -> anyhow::Result<()> {
+    if touch_id {
+        if password_stdin || session {
+            anyhow::bail!(
+                "--touch-id can't go with --password-stdin or --session"
+            );
+        }
+        crate::commands::ensure_agent()?;
+        if !logged_in() {
+            return Err(coded(ErrorCode::NotLoggedIn, "not logged in"));
+        }
+        return crate::actions::unlock_touch_id();
+    }
     if !password_stdin {
         if session {
             anyhow::bail!("--session needs --password-stdin");
@@ -139,25 +161,30 @@ struct Status {
     // null for bitwarden.com
     server_url: Option<String>,
     user_email: Option<String>,
+    last_sync: Option<String>,
+    touch_id: bool,
 }
 
 pub fn status(json: bool) -> anyhow::Result<()> {
     let config = rbw::config::Config::load().unwrap_or_default();
-    let status = if logged_in() {
+    let db = logged_in_db();
+    let (status, touch_id) = if db.is_some() {
         // not ensure_agent: a stopped agent means a locked vault
         let _ = crate::commands::check_agent_version();
-        if crate::actions::unlocked().is_ok() {
-            "unlocked"
-        } else {
-            "locked"
+        match crate::actions::status() {
+            Ok((true, _)) => ("unlocked", false),
+            Ok((false, touch_id)) => ("locked", touch_id),
+            Err(_) => ("locked", false),
         }
     } else {
-        "unauthenticated"
+        ("unauthenticated", false)
     };
     let status = Status {
         status,
         server_url: config.base_url,
         user_email: config.email,
+        last_sync: db.and_then(|db| db.last_sync),
+        touch_id,
     };
     if json {
         serde_json::to_writer(std::io::stdout(), &status)

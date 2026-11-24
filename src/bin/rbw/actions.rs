@@ -220,6 +220,28 @@ pub fn unlock_with(
     session_action(rbw::protocol::Action::UnlockWith { password, session })
 }
 
+pub fn unlock_touch_id() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::UnlockTouchId)
+}
+
+// Whether the vault is unlocked, and whether Touch ID can unlock it.
+pub fn status() -> anyhow::Result<(bool, bool)> {
+    let mut sock = connect()?;
+    sock.send(&rbw::protocol::Request::new(
+        get_environment(),
+        rbw::protocol::Action::Status,
+    ))?;
+    match sock.recv()? {
+        rbw::protocol::Response::Status { unlocked, touch_id } => {
+            Ok((unlocked, touch_id))
+        }
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code))
+        }
+        res => Err(anyhow::anyhow!("unexpected message: {res:?}")),
+    }
+}
+
 pub fn unlock_session(session: String) -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::UnlockSession { session })
 }

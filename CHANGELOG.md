@@ -15,7 +15,10 @@
     vault key encrypted with it.
   * `RBW_NONINTERACTIVE=1` makes `rbw` fail with a clear error instead of
     opening pinentry.
-  * `rbw status [--json]` says whether the account is logged in and unlocked.
+  * `rbw status [--json]` says whether the account is logged in and
+    unlocked, when the vault last synced and whether Touch ID can unlock it.
+  * `rbw unlock --touch-id` unlocks with Touch ID only, without falling
+    back to the master password.
   * `rbw item list|get|create|edit` read and save entries as JSON in
     Bitwarden's item format, by id. Listing leaves secrets out unless asked.
   * `rbw item create` and `rbw item edit` save cards, identities and SSH

@@ -83,6 +83,12 @@ enum Opt {
         password_stdin: bool,
         #[arg(
             long,
+            help = "Unlock with Touch ID only, failing instead of asking \
+                for the master password (macOS)"
+        )]
+        touch_id: bool,
+        #[arg(
+            long,
             help = "Print a session key that unlocks the vault again \
                 through RBW_SESSION"
         )]
@@ -93,7 +99,7 @@ enum Opt {
         about = "Show whether rbw is logged in and unlocked",
         long_about = "Show whether rbw is logged in and unlocked\n\n\
             Prints unauthenticated, locked or unlocked, or with --json an \
-            object with status, serverUrl and userEmail."
+            object with status, serverUrl, userEmail, lastSync and touchId."
     )]
     Status {
         #[arg(long, help = "Display output as JSON")]
@@ -589,7 +595,8 @@ fn main() {
         Opt::Unlock {
             password_stdin,
             session,
-        } => scripting::unlock(password_stdin, session),
+            touch_id,
+        } => scripting::unlock(password_stdin, session, touch_id),
         Opt::Status { json } => scripting::status(json),
         Opt::Item { item } => match item {
             Item::List { secrets } => items::list(secrets),

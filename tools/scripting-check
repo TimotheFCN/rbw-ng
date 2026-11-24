@@ -411,6 +411,12 @@ def scenario(server, password):
         status = rbw.json("status", "--json")
         check("unlocked", status["status"] == "unlocked" and status["userEmail"] == email,
               str(status))
+        check("status says when the vault synced",
+              status["lastSync"].endswith("Z") and status["touchId"] is False, str(status))
+        time.sleep(1)
+        rbw.run("sync", env=quiet)
+        check("a sync moves lastSync",
+              rbw.json("status", "--json")["lastSync"] > status["lastSync"])
 
         created = rbw.json("item", "create", env=quiet, stdin=json.dumps({
             "type": 1, "name": "GitHub", "notes": "recovery codes",
@@ -503,6 +509,8 @@ def scenario(server, password):
         check("lock ends the session", True)
         rbw.fails("unlock", env=quiet, needle="the vault is locked")
         check("no prompt without a terminal", True)
+        check("unlock --touch-id fails without a Touch ID session",
+              rbw.error("unlock", "--touch-id")["code"] == "touch_id_unavailable")
 
         newer = rbw.run("unlock", "--password-stdin", "--session", env=quiet,
                         stdin=password).stdout.strip()

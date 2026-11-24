@@ -268,6 +268,14 @@ async fn handle_request(
                 .await?;
             true
         }
+        rbw::protocol::Action::UnlockTouchId => {
+            crate::actions::unlock_touch_id(sock, state.clone()).await?;
+            true
+        }
+        rbw::protocol::Action::Status => {
+            crate::actions::status(sock, state.clone()).await?;
+            false
+        }
         rbw::protocol::Action::ForgetSession => {
             crate::scripted::forget_session(sock).await?;
             false

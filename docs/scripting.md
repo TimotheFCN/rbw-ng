@@ -106,6 +106,11 @@ is locked, `rbw` unlocks it with the session instead of asking. This works
 even after the agent stopped, its lock timeout passed or the computer
 restarted.
 
+On a Mac with `touch_id_unlock` on, `rbw unlock --touch-id` unlocks with
+Touch ID only. It fails with `touch_id_unavailable` when Touch ID can't
+unlock, because the vault wasn't unlocked with the master password since the
+agent started, and with `touch_id_canceled` when the person cancels.
+
 A session works like `BW_SESSION`, but neither half opens the vault alone.
 The agent encrypts the vault key with the random session key and keeps only
 that encrypted copy, in the profile's data folder. Your program keeps the
@@ -127,12 +132,20 @@ rbw status --json
 ```
 
 ```json
-{"status":"unlocked","serverUrl":"https://vault.example.com","userEmail":"you@example.com"}
+{"status":"unlocked","serverUrl":"https://vault.example.com","userEmail":"you@example.com","lastSync":"2026-11-24T09:41:07Z","touchId":false}
 ```
 
 `status` is `unauthenticated`, `locked` or `unlocked`, and `serverUrl` is
 `null` for bitwarden.com. `rbw status` never starts the agent; a stopped agent
 means a locked vault.
+
+`lastSync` is when the local copy of the vault last synced with the server,
+also when the agent synced on its own; when it changes, the entries may have
+changed. `touchId` says whether `rbw unlock --touch-id` can unlock the vault
+now.
+
+`rbw status --json` takes a few milliseconds, so a program can poll it every
+second or two to notice when the vault locks, unlocks or syncs.
 
 ## Entries
 

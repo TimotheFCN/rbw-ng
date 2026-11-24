@@ -245,6 +245,11 @@ pub enum Action {
         session: String,
     },
     ForgetSession,
+    // Unlock with Touch ID only, failing instead of asking for the master
+    // password
+    UnlockTouchId,
+    // Answered with Response::Status
+    Status,
     Quit,
     Version,
 }
@@ -330,5 +335,10 @@ pub enum Response {
     },
     Session {
         session: String,
+    },
+    Status {
+        unlocked: bool,
+        // Touch ID can unlock the locked vault now
+        touch_id: bool,
     },
 }

@@ -241,6 +241,9 @@ pub struct Db {
     // have them until the next sync.
     #[serde(default)]
     pub folders: Vec<Folder>,
+    // when the agent last synced, as RFC 3339
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync: Option<String>,
 }
 
 // A temporary file in the same directory as the db, so that renaming it over
