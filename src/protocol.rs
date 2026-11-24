@@ -197,6 +197,10 @@ impl Environment {
     }
 }
 
+// A secret in a request, wiped from memory when dropped: the agent lives
+// for long.
+pub type Secret = zeroize::Zeroizing<String>;
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum Action {
@@ -217,32 +221,32 @@ pub enum Action {
         items: Vec<DecryptItem>,
     },
     Encrypt {
-        plaintext: String,
+        plaintext: Secret,
         entry_key: Option<String>,
         org_id: Option<String>,
     },
     ClipboardStore {
-        text: String,
+        text: Secret,
     },
     // The same as Login, Register and Unlock, with the secrets from the
     // caller instead of pinentry, for programs that drive rbw. With
     // session, the answer is a session key (Response::Session) that
     // UnlockSession takes later.
     LoginWith {
-        password: String,
+        password: Secret,
         code: Option<LoginCode>,
         session: bool,
     },
     RegisterWith {
         client_id: String,
-        client_secret: String,
+        client_secret: Secret,
     },
     UnlockWith {
-        password: String,
+        password: Secret,
         session: bool,
     },
     UnlockSession {
-        session: String,
+        session: Secret,
     },
     ForgetSession,
     // Unlock with Touch ID only, failing instead of asking for the master
@@ -253,7 +257,7 @@ pub enum Action {
     // one given, or the one pinentry asks for without it
     UnlockEntry {
         id: String,
-        password: Option<String>,
+        password: Option<Secret>,
     },
     // Answered with Response::Status
     Status,

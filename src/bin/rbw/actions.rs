@@ -154,7 +154,7 @@ pub fn encrypt(
     sock.send(&rbw::protocol::Request::new(
         get_environment(),
         rbw::protocol::Action::Encrypt {
-            plaintext: plaintext.to_string(),
+            plaintext: plaintext.to_string().into(),
             entry_key: entry_key.map(std::string::ToString::to_string),
             org_id: org_id.map(std::string::ToString::to_string),
         },
@@ -172,7 +172,7 @@ pub fn encrypt(
 
 pub fn clipboard_store(text: &str) -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::ClipboardStore {
-        text: text.to_string(),
+        text: text.to_string().into(),
     })
 }
 
@@ -194,7 +194,7 @@ pub fn version() -> anyhow::Result<u32> {
 }
 
 pub fn login_with(
-    password: String,
+    password: rbw::protocol::Secret,
     code: Option<rbw::protocol::LoginCode>,
     session: bool,
 ) -> anyhow::Result<Option<String>> {
@@ -207,7 +207,7 @@ pub fn login_with(
 
 pub fn register_with(
     client_id: String,
-    client_secret: String,
+    client_secret: rbw::protocol::Secret,
 ) -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::RegisterWith {
         client_id,
@@ -216,7 +216,7 @@ pub fn register_with(
 }
 
 pub fn unlock_with(
-    password: String,
+    password: rbw::protocol::Secret,
     session: bool,
 ) -> anyhow::Result<Option<String>> {
     session_action(rbw::protocol::Action::UnlockWith { password, session })
@@ -224,7 +224,7 @@ pub fn unlock_with(
 
 pub fn unlock_entry(
     id: String,
-    password: Option<String>,
+    password: Option<rbw::protocol::Secret>,
 ) -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::UnlockEntry { id, password })
 }
@@ -255,7 +255,7 @@ pub fn status() -> anyhow::Result<(bool, bool)> {
     }
 }
 
-pub fn unlock_session(session: String) -> anyhow::Result<()> {
+pub fn unlock_session(session: rbw::protocol::Secret) -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::UnlockSession { session })
 }
 

@@ -274,7 +274,7 @@ async fn handle_request(
                 state.clone(),
                 &environment,
                 id,
-                password.as_deref(),
+                password.as_ref().map(|password| password.as_str()),
             )
             .await?;
             true

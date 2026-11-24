@@ -23,14 +23,20 @@ pub fn noninteractive() -> bool {
         .is_some_and(|value| !value.is_empty() && value != "0")
 }
 
-fn env_secret(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|value| !value.is_empty())
+fn env_secret(name: &str) -> Option<rbw::protocol::Secret> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .map(Into::into)
 }
 
 // The master password, from stdin: everything up to the end, without the
 // final line break.
-pub fn password_from_stdin() -> anyhow::Result<String> {
-    let mut password = String::new();
+pub fn password_from_stdin() -> anyhow::Result<rbw::protocol::Secret> {
+    // room for any password, so that the buffer doesn't grow and leave
+    // copies behind
+    let mut password =
+        rbw::protocol::Secret::new(String::with_capacity(1024));
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut password)
         .context("failed to read the master password from stdin")?;
     if password.ends_with('\n') {
@@ -133,7 +139,7 @@ pub fn register(api_key_env: bool) -> anyhow::Result<()> {
         anyhow::bail!("--api-key-env needs {CLIENT_ID} and {CLIENT_SECRET}");
     };
     crate::commands::ensure_agent()?;
-    crate::actions::register_with(client_id, client_secret)
+    crate::actions::register_with(client_id.to_string(), client_secret)
 }
 
 pub fn unlock(

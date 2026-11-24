@@ -1,5 +1,5 @@
 use anyhow::Context as _;
-use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
 pub struct Sock(tokio::net::UnixStream);
 
@@ -17,13 +17,13 @@ impl Sock {
         }
 
         let Self(sock) = self;
-        sock.write_all(
-            serde_json::to_string(res)
-                .context("failed to serialize message")?
-                .as_bytes(),
-        )
-        .await
-        .context("failed to write message to socket")?;
+        // answers carry decrypted secrets
+        let json = zeroize::Zeroizing::new(
+            serde_json::to_vec(res).context("failed to serialize message")?,
+        );
+        sock.write_all(&json)
+            .await
+            .context("failed to write message to socket")?;
         sock.write_all(b"\n")
             .await
             .context("failed to write message to socket")?;
@@ -35,19 +35,46 @@ impl Sock {
     ) -> anyhow::Result<std::result::Result<rbw::protocol::Request, String>>
     {
         let Self(sock) = self;
-        let mut buf = tokio::io::BufStream::new(sock);
-        let mut line = String::new();
-        buf.read_line(&mut line)
+        let line = read_line(sock)
             .await
             .context("failed to read message from socket")?;
-        Ok(serde_json::from_str(&line).map_err(|e| unparsable(&line, &e)))
+        Ok(serde_json::from_slice(&line).map_err(|e| unparsable(&line, &e)))
+    }
+}
+
+// Reads a request, the one line a client sends, into memory that is wiped
+// once it is parsed: requests carry master passwords and secrets. The
+// buffer grows by hand, so that a move leaves no copy behind.
+async fn read_line(
+    sock: &mut tokio::net::UnixStream,
+) -> std::io::Result<zeroize::Zeroizing<Vec<u8>>> {
+    let mut line = zeroize::Zeroizing::new(Vec::with_capacity(4096));
+    let mut chunk = zeroize::Zeroizing::new([0; 4096]);
+    loop {
+        let read = sock.read(&mut chunk[..]).await?;
+        if read == 0 {
+            return Ok(line);
+        }
+        let end = chunk[..read].iter().position(|&byte| byte == b'\n');
+        let take = end.map_or(read, |end| end + 1);
+        if line.len() + take > line.capacity() {
+            let mut larger = zeroize::Zeroizing::new(Vec::with_capacity(
+                (line.len() + take).max(line.capacity() * 2),
+            ));
+            larger.extend_from_slice(&line);
+            line = larger;
+        }
+        line.extend_from_slice(&chunk[..take]);
+        if end.is_some() {
+            return Ok(line);
+        }
     }
 }
 
 // Why a request can't be read, without quoting it: requests carry master
 // passwords and secrets, and the error goes to the agent's log. The action's
 // type is enough to see that a client is newer than the agent.
-fn unparsable(line: &str, error: &serde_json::Error) -> String {
+fn unparsable(line: &[u8], error: &serde_json::Error) -> String {
     #[derive(serde::Deserialize)]
     struct Request {
         action: Action,
@@ -57,7 +84,7 @@ fn unparsable(line: &str, error: &serde_json::Error) -> String {
         #[serde(rename = "type")]
         ty: String,
     }
-    let action = serde_json::from_str::<Request>(line)
+    let action = serde_json::from_slice::<Request>(line)
         .ok()
         .map(|request| request.action.ty)
         .filter(|ty| {
@@ -116,12 +143,33 @@ pub fn listen() -> anyhow::Result<tokio::net::UnixListener> {
 
 #[cfg(test)]
 mod tests {
-    use super::unparsable;
+    use super::{read_line, unparsable};
+
+    #[tokio::test]
+    async fn requests_are_read_to_their_line_break() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let long = "x".repeat(10_000);
+        for (sent, read) in [
+            ("{}\nignored".to_string(), "{}\n".to_string()),
+            (format!("{long}\n"), format!("{long}\n")),
+            ("no line break".to_string(), "no line break".to_string()),
+        ] {
+            let (mut client, mut agent) =
+                tokio::net::UnixStream::pair().unwrap();
+            client.write_all(sent.as_bytes()).await.unwrap();
+            drop(client);
+            assert_eq!(
+                *read_line(&mut agent).await.unwrap(),
+                read.as_bytes()
+            );
+        }
+    }
 
     fn error(line: &str) -> String {
         let error = serde_json::from_str::<rbw::protocol::Request>(line)
             .expect_err(line);
-        unparsable(line, &error)
+        unparsable(line.as_bytes(), &error)
     }
 
     #[test]
