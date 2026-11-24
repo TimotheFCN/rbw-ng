@@ -14,11 +14,47 @@ the agent instead of a key derivation or a fresh decryption of the vault.
 `RBW_NONINTERACTIVE=1` makes `rbw` fail instead of asking. Without it, `rbw`
 opens pinentry, which a program can't answer.
 
-| When | The error contains |
+| When | Code |
 | --- | --- |
-| The account isn't logged in | `not logged in` |
-| The vault is locked and there is no session | `the vault is locked` |
-| Anything else would ask | `input required, but RBW_NONINTERACTIVE is set` |
+| The account isn't logged in | `not_logged_in` |
+| The vault is locked and there is no session | `locked` |
+| Anything else would ask | `input_required` |
+
+## Errors
+
+With `RBW_ERROR_FORMAT=json`, a command that fails prints its error on
+stderr as one line of JSON, with a code that stays the same from one release
+to the next, and exits with status 1:
+
+```json
+{"code":"locked","message":"rbw item list: the vault is locked"}
+```
+
+The message is for people and can change. Some codes carry more:
+
+| Code | Meaning |
+| --- | --- |
+| `not_logged_in` | the profile isn't logged in, or the server no longer accepts its login |
+| `locked` | the vault is locked |
+| `input_required` | `rbw` would have to ask, and `RBW_NONINTERACTIVE` is set |
+| `incorrect_password` | the master password (or API key) is wrong |
+| `two_step_required` | the login needs a two-step code; `methods` lists the method ids |
+| `two_step_code_sent` | the server emailed a two-step code |
+| `new_device_code_required` | the login needs the code the server emailed to verify this device |
+| `incorrect_code` | the two-step or new device code is wrong |
+| `two_step_unsupported` | none of the account's two-step methods are supported |
+| `session_invalid` | `RBW_SESSION` no longer unlocks the vault |
+| `touch_id_canceled` | the person canceled Touch ID |
+| `touch_id_unavailable` | Touch ID can't unlock the vault now |
+| `not_found` | no entry or folder with this id, or the entry has no such field |
+| `conflict` | the entry changed on the server since the last sync |
+| `forbidden` | the server refused, for example an entry in a read-only collection |
+| `unsupported` | `rbw` can't do this yet |
+| `invalid_input` | the input or the arguments are wrong |
+| `network` | the server can't be reached |
+| `server` | the server answered with an error; `status` is its HTTP status, if any |
+| `agent` | `rbw-agent` can't be started or reached |
+| `other` | anything else |
 
 Use a profile of your own (`RBW_PROFILE=myapp`) so that your program never
 shares, or signs out, the account someone uses in a terminal. Each profile has
@@ -43,13 +79,13 @@ rbw login --password-stdin [--session] < password
 
 When the server asks for more, the login fails with one of these errors:
 
-| The error contains | Next step |
+| Code | Next step |
 | --- | --- |
-| `two-step login code required; methods: 0, 1, 3` | ask for a code from one of the methods listed, then run `rbw login --password-stdin --method ID --code CODE` |
-| `two-step login code required; Bitwarden emailed it` | the answer to `--method 1` without a code: Bitwarden emailed the code |
-| `new device verification code required` | run `--code CODE` without `--method`, with the code Bitwarden emailed |
-| `incorrect master password` | ask again |
-| `the two-step login code is incorrect` | ask for a new code |
+| `two_step_required` | ask for a code from one of the `methods`, then run `rbw login --password-stdin --method ID --code CODE` |
+| `two_step_code_sent` | the answer to `--method 1 --code ""`: Bitwarden emailed the code |
+| `new_device_code_required` | run `--code CODE` without `--method`, with the code Bitwarden emailed |
+| `incorrect_password` | ask again |
+| `incorrect_code` | ask for a new code |
 
 The method ids are Bitwarden's: `0` authenticator app, `1` email, `3` YubiKey
 OTP. A login that succeeds also unlocks.
@@ -82,8 +118,7 @@ A session ends when:
 * a new `--session` replaces it;
 * the master password changes.
 
-After that, a command with the old key fails with `the session key is
-invalid`.
+After that, a command with the old key fails with `session_invalid`.
 
 ## Status
 
@@ -119,9 +154,8 @@ Without secrets, an entry has no `login.password`, `login.totp`, `notes`,
 Bitwarden's format, says whether the login has a code. Listing without secrets
 is also faster, since only names, usernames and addresses are decrypted.
 
-Archived entries are left out of `rbw item list`. A missing field fails with
-`no username available`, `no password available` or `no totp available`, and
-an unknown id fails with `not found`.
+Archived entries are left out of `rbw item list`. An unknown id, or a field
+the entry doesn't have, fails with `not_found`.
 
 `create` and `edit` take JSON or base64 JSON (what `bw encode` makes) on stdin.
 They print the entry as the server saved it, without secrets. They save:

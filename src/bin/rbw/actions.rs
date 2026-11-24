@@ -1,7 +1,5 @@
 use std::{io::Read as _, os::unix::ffi::OsStringExt as _};
 
-use anyhow::Context as _;
-
 pub fn register() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::Register)
 }
@@ -25,8 +23,8 @@ pub fn unlocked() -> anyhow::Result<()> {
             let res = sock.recv()?;
             match res {
                 rbw::protocol::Response::Ack => Ok(()),
-                rbw::protocol::Response::Error { error } => {
-                    Err(anyhow::anyhow!("{error}"))
+                rbw::protocol::Response::Error { error, code } => {
+                    Err(agent_error(error, code))
                 }
                 _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
             }
@@ -99,7 +97,7 @@ pub fn decrypt_many(
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::DecryptMany { plaintexts } => Ok(plaintexts),
-        rbw::protocol::Response::Error { error }
+        rbw::protocol::Response::Error { error, .. }
             if error.contains("unknown variant `DecryptMany`") =>
         {
             // an agent from before batch decryption with the same protocol
@@ -114,8 +112,8 @@ pub fn decrypt_many(
             };
             items.iter().map(decrypt_one).collect()
         }
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("failed to decrypt: {error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code).context("failed to decrypt"))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
@@ -140,7 +138,7 @@ fn decrypt_one(
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::Decrypt { plaintext } => Ok(Ok(plaintext)),
-        rbw::protocol::Response::Error { error } => Ok(Err(error)),
+        rbw::protocol::Response::Error { error, .. } => Ok(Err(error)),
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
 }
@@ -163,8 +161,8 @@ pub fn encrypt(
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::Encrypt { cipherstring } => Ok(cipherstring),
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("failed to encrypt: {error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code).context("failed to encrypt"))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
@@ -186,8 +184,8 @@ pub fn version() -> anyhow::Result<u32> {
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::Version { version } => Ok(version),
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("failed to get version: {error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code).context("failed to get version"))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
@@ -238,8 +236,8 @@ fn session_action(
     match res {
         rbw::protocol::Response::Ack => Ok(None),
         rbw::protocol::Response::Session { session } => Ok(Some(session)),
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("{error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
@@ -253,21 +251,32 @@ fn simple_action(action: rbw::protocol::Action) -> anyhow::Result<()> {
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::Ack => Ok(()),
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("{error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
 }
 
+// An error the agent answered with, with its code.
+fn agent_error(
+    error: String,
+    code: Option<rbw::protocol::ErrorCode>,
+) -> anyhow::Error {
+    rbw::error::coded(code.unwrap_or(rbw::protocol::ErrorCode::Other), error)
+}
+
 fn connect() -> anyhow::Result<crate::sock::Sock> {
-    crate::sock::Sock::connect().with_context(|| {
+    crate::sock::Sock::connect().map_err(|e| {
         let log = rbw::dirs::agent_stderr_file();
-        format!(
-            "failed to connect to rbw-agent \
-            (this often means that the agent failed to start; \
-            check {} for agent logs)",
-            log.display()
+        rbw::error::coded(
+            rbw::protocol::ErrorCode::Agent,
+            format!(
+                "failed to connect to rbw-agent \
+                (this often means that the agent failed to start; \
+                check {} for agent logs): {e}",
+                log.display()
+            ),
         )
     })
 }

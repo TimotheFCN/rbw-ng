@@ -1046,6 +1046,7 @@ pub async fn clipboard_store(
 ) -> anyhow::Result<()> {
     sock.send(&rbw::protocol::Response::Error {
         error: "clipboard not supported".to_string(),
+        code: Some(rbw::protocol::ErrorCode::Unsupported),
     })
     .await?;
 

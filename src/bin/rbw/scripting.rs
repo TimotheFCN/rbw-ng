@@ -3,6 +3,8 @@
 // or in the environment, and sessions. See docs/scripting.md.
 
 use anyhow::Context as _;
+use rbw::error::coded;
+use rbw::protocol::ErrorCode;
 
 // Set by a program that can't answer a prompt: rbw fails instead of
 // opening pinentry.
@@ -35,7 +37,10 @@ fn password_from_stdin() -> anyhow::Result<String> {
         }
     }
     if password.is_empty() {
-        anyhow::bail!("no master password on stdin");
+        return Err(coded(
+            ErrorCode::InvalidInput,
+            "no master password on stdin",
+        ));
     }
     Ok(password)
 }
@@ -53,14 +58,16 @@ pub fn unlock_for_program() -> anyhow::Result<bool> {
         return Ok(false);
     }
     if !logged_in() {
-        anyhow::bail!("not logged in");
+        return Err(coded(ErrorCode::NotLoggedIn, "not logged in"));
     }
     if crate::actions::unlocked().is_ok() {
         return Ok(true);
     }
     match session {
         Some(session) => crate::actions::unlock_session(session)?,
-        None => anyhow::bail!("the vault is locked"),
+        None => {
+            return Err(coded(ErrorCode::Locked, "the vault is locked"));
+        }
     }
     Ok(true)
 }
@@ -119,7 +126,7 @@ pub fn unlock(password_stdin: bool, session: bool) -> anyhow::Result<()> {
     let password = password_from_stdin()?;
     crate::commands::ensure_agent()?;
     if !logged_in() {
-        anyhow::bail!("not logged in");
+        return Err(coded(ErrorCode::NotLoggedIn, "not logged in"));
     }
     print_session(crate::actions::unlock_with(password, session)?);
     Ok(())

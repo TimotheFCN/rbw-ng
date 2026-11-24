@@ -95,6 +95,7 @@ impl Agent {
                             if let Err(send_err) = sock
                                 .send(&rbw::protocol::Response::Error {
                                     error: format!("{e:#}"),
+                                    code: Some(rbw::error::code(&e)),
                                 })
                                 .await
                             {
@@ -138,7 +139,11 @@ async fn handle_request(
     let req = match req {
         Ok(msg) => msg,
         Err(error) => {
-            sock.send(&rbw::protocol::Response::Error { error }).await?;
+            sock.send(&rbw::protocol::Response::Error {
+                error,
+                code: Some(rbw::protocol::ErrorCode::InvalidInput),
+            })
+            .await?;
             return Ok(());
         }
     };

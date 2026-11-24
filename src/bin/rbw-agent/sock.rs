@@ -12,7 +12,7 @@ impl Sock {
         &mut self,
         res: &rbw::protocol::Response,
     ) -> anyhow::Result<()> {
-        if let rbw::protocol::Response::Error { error } = res {
+        if let rbw::protocol::Response::Error { error, .. } = res {
             log::warn!("{error}");
         }
 

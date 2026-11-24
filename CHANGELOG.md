@@ -18,6 +18,9 @@
   * `rbw status [--json]` says whether the account is logged in and unlocked.
   * `rbw item list|get|create|edit` read and save entries as JSON in
     Bitwarden's item format, by id. Listing leaves secrets out unless asked.
+  * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such
+    as `locked` or `two_step_required`, so that programs don't depend on
+    the wording of messages.
 * `rbw ssh-agent install` runs `rbw-agent` as a login service of launchd
   (macOS) or systemd (Linux). The service manager holds the agent's sockets
   and starts the agent when a program connects, and `rbw` uses the same

@@ -202,6 +202,15 @@ class Rbw:
             )
         return result
 
+    def error(self, *args, **kwargs):
+        """The JSON error of a command that fails, with RBW_ERROR_FORMAT=json."""
+        env = {"RBW_NONINTERACTIVE": "1", "RBW_ERROR_FORMAT": "json",
+               **kwargs.pop("env", {})}
+        result = self.run(*args, check=False, env=env, **kwargs)
+        if result.returncode == 0:
+            raise AssertionError(f"rbw {' '.join(args)} succeeded")
+        return json.loads(result.stderr.strip().splitlines()[-1])
+
     def stop(self):
         self.run("stop-agent", check=False)
 
@@ -226,6 +235,11 @@ def scenario(server, password):
     try:
         check("signed out", rbw.json("status", "--json")["status"] == "unauthenticated")
         rbw.fails("item", "list", env=quiet, needle="not logged in")
+        check("errors have codes", rbw.error("item", "list") == {
+            "code": "not_logged_in", "message": "rbw item list: not logged in"})
+        check("a wrong password has its code",
+              rbw.error("login", "--password-stdin", stdin="wrong")["code"]
+              == "incorrect_password")
         rbw.fails("login", "--password-stdin", stdin="wrong\n", env=quiet,
                   needle="incorrect master password")
         check("a wrong password is refused", True)
@@ -279,6 +293,11 @@ def scenario(server, password):
               code in {totp("JBSWY3DPEHPK3PXP", time.time() + d) for d in (-30, 0, 30)}, code)
         rbw.fails("item", "get", mail["id"], "--field", "totp", env=quiet, needle="no totp available")
         rbw.fails("item", "get", "00000000-0000-0000-0000-000000000000", env=quiet, needle="not found")
+        check("an unknown id is not_found",
+              rbw.error("item", "get", "00000000-0000-0000-0000-000000000000")["code"]
+              == "not_found")
+        check("a broken item is invalid_input",
+              rbw.error("item", "create", stdin="{")["code"] == "invalid_input")
 
         got["login"]["password"] = "second-password"
         got["login"]["uris"].append({"uri": "https://gist.github.com", "match": 1})
@@ -301,8 +320,12 @@ def scenario(server, password):
         check("the session unlocks a restarted agent", any(i["id"] == item_id for i in listed))
         rbw.run("lock")
         rbw.fails("item", "list", env=quiet, needle="the vault is locked")
+        check("locked has its code", rbw.error("item", "list")["code"] == "locked")
         rbw.fails("item", "list", env={**quiet, "RBW_SESSION": session},
                   needle="the session key is invalid")
+        check("an old session has its code",
+              rbw.error("item", "list", env={"RBW_SESSION": session})["code"]
+              == "session_invalid")
         check("lock ends the session", True)
         rbw.fails("unlock", env=quiet, needle="the vault is locked")
         check("no prompt without a terminal", True)
@@ -333,12 +356,15 @@ def two_step(server, password):
     rbw = Rbw(home, server, email)
     quiet = {"RBW_NONINTERACTIVE": "1"}
     try:
-        rbw.fails("login", "--password-stdin", stdin=password, env=quiet,
-                  needle="two-step login code required; methods: 0")
-        check("login asks for a two-step code", True)
-        rbw.fails("login", "--password-stdin", "--method", "0", "--code", "000000",
-                  stdin=password, env=quiet, needle="code is incorrect")
-        check("a wrong code is refused", True)
+        error = rbw.error("login", "--password-stdin", stdin=password)
+        check("login asks for a two-step code",
+              error["code"] == "two_step_required" and error["methods"] == [0]
+              and "two-step login code required; methods: 0" in error["message"], str(error))
+        error = rbw.error("login", "--password-stdin", "--method", "0", "--code", "000000",
+                          stdin=password)
+        check("a wrong code is refused",
+              error["code"] == "incorrect_code" and "code is incorrect" in error["message"],
+              str(error))
         rbw.fails("login", "--password-stdin", "--method", "2", "--code", "1",
                   stdin=password, env=quiet, needle="isn't supported")
         # the server refuses a code twice, and enabling used this one

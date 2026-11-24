@@ -507,6 +507,13 @@ fn parse_field(s: &str) -> Result<(String, String), String> {
         })
 }
 
+// RBW_ERROR_FORMAT=json prints errors as JSON with a code, for programs
+// that drive rbw. See docs/scripting.md.
+fn json_errors() -> bool {
+    std::env::var_os("RBW_ERROR_FORMAT")
+        .is_some_and(|format| format == "json")
+}
+
 fn main() {
     let opt = Opt::parse();
 
@@ -760,7 +767,14 @@ fn main() {
     .with_context(|| format!("rbw {subcommand_name}"));
 
     if let Err(e) = res {
-        eprintln!("{e:#}");
+        if json_errors() {
+            let mut error = serde_json::to_value(rbw::error::code(&e))
+                .unwrap_or_default();
+            error["message"] = format!("{e:#}").into();
+            eprintln!("{error}");
+        } else {
+            eprintln!("{e:#}");
+        }
         std::process::exit(1);
     }
 }

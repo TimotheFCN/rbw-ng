@@ -267,12 +267,54 @@ pub struct LoginCode {
     pub code: String,
 }
 
+// What went wrong, for programs that drive rbw: the "code" of the JSON
+// error that RBW_ERROR_FORMAT=json prints. The codes are stable; a new kind
+// of failure gets a new code.
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, PartialEq, Eq,
+)]
+#[serde(tag = "code", rename_all = "snake_case")]
+pub enum ErrorCode {
+    NotLoggedIn,
+    Locked,
+    // rbw would have to ask, and RBW_NONINTERACTIVE is set
+    InputRequired,
+    IncorrectPassword,
+    // Bitwarden's ids of the methods the server offers, that rbw supports
+    TwoStepRequired { methods: Vec<u8> },
+    TwoStepCodeSent,
+    NewDeviceCodeRequired,
+    IncorrectCode,
+    TwoStepUnsupported,
+    SessionInvalid,
+    TouchIdCanceled,
+    TouchIdUnavailable,
+    // no such entry, folder or field
+    NotFound,
+    // the entry changed on the server since the last sync
+    Conflict,
+    // the server refused the change, for example a read-only collection
+    Forbidden,
+    // rbw can't do this yet
+    Unsupported,
+    InvalidInput,
+    // the server can't be reached
+    Network,
+    // the server answered with an error
+    Server { status: Option<u16> },
+    // rbw-agent can't be started or reached
+    Agent,
+    Other,
+}
+
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "type")]
 pub enum Response {
     Ack,
     Error {
         error: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        code: Option<ErrorCode>,
     },
     Decrypt {
         plaintext: String,

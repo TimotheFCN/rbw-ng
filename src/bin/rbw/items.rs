@@ -3,6 +3,8 @@
 // Entries are found by id only, never by name. See docs/scripting.md.
 
 use anyhow::Context as _;
+use rbw::error::coded;
+use rbw::protocol::ErrorCode;
 use serde_json::{json, Value};
 
 const LOGIN: u8 = 1;
@@ -230,7 +232,7 @@ fn find<'a>(
     db.entries
         .iter()
         .find(|entry| entry.id.eq_ignore_ascii_case(id))
-        .ok_or_else(|| anyhow::anyhow!("not found"))
+        .ok_or_else(|| coded(ErrorCode::NotFound, "not found"))
 }
 
 pub fn list(secrets: bool) -> anyhow::Result<()> {
@@ -275,7 +277,10 @@ pub fn get(id: &str, field: Option<Field>) -> anyhow::Result<()> {
         (_, Field::Totp) => (None, "totp"),
     };
     let Some(cipherstring) = cipherstring else {
-        anyhow::bail!("no {name} available");
+        return Err(coded(
+            ErrorCode::NotFound,
+            format!("no {name} available"),
+        ));
     };
     let mut value =
         crate::actions::decrypt_many(vec![rbw::protocol::DecryptItem {
@@ -351,7 +356,10 @@ fn read_item(input: &str) -> anyhow::Result<ItemIn> {
     let item: ItemIn = serde_json::from_str(&json)
         .context("the item on stdin isn't a Bitwarden item")?;
     if item.organization_id.is_some() {
-        anyhow::bail!("items in organizations aren't supported yet");
+        return Err(coded(
+            ErrorCode::Unsupported,
+            "items in organizations aren't supported yet",
+        ));
     }
     if item
         .login
@@ -359,11 +367,17 @@ fn read_item(input: &str) -> anyhow::Result<ItemIn> {
         .and_then(|login| login.fido2_credentials.as_ref())
         .is_some_and(|credentials| !credentials.is_empty())
     {
-        anyhow::bail!("passkeys aren't supported yet");
+        return Err(coded(
+            ErrorCode::Unsupported,
+            "passkeys aren't supported yet",
+        ));
     }
     match item.ty {
         LOGIN | SECURE_NOTE => Ok(item),
-        _ => anyhow::bail!("only logins and secure notes can be saved"),
+        _ => Err(coded(
+            ErrorCode::Unsupported,
+            "only logins and secure notes can be saved",
+        )),
     }
 }
 
@@ -371,7 +385,10 @@ fn read_stdin_item() -> anyhow::Result<ItemIn> {
     let mut input = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
         .context("failed to read the item from stdin")?;
-    read_item(&input)
+    read_item(&input).map_err(|e| match rbw::error::code(&e) {
+        ErrorCode::Other => coded(ErrorCode::InvalidInput, format!("{e:#}")),
+        _ => e,
+    })
 }
 
 // Encrypts a value for an entry; the official clients store an empty value
@@ -442,7 +459,7 @@ fn tokens(db: &rbw::db::Db) -> anyhow::Result<(String, String)> {
     let (Some(access_token), Some(refresh_token)) =
         (db.access_token.clone(), db.refresh_token.clone())
     else {
-        anyhow::bail!("not logged in");
+        return Err(coded(ErrorCode::NotLoggedIn, "not logged in"));
     };
     Ok((access_token, refresh_token))
 }
@@ -493,13 +510,19 @@ pub fn edit(id: &str) -> anyhow::Result<()> {
         .as_deref()
         .is_some_and(|given| !given.eq_ignore_ascii_case(id))
     {
-        anyhow::bail!("the item on stdin has another id");
+        return Err(coded(
+            ErrorCode::InvalidInput,
+            "the item on stdin has another id",
+        ));
     }
     crate::commands::unlock()?;
     let db = crate::commands::load_db()?;
     let entry = find(&db, id)?;
     if type_id(&entry.data) != item.ty {
-        anyhow::bail!("an item's type can't change");
+        return Err(coded(
+            ErrorCode::InvalidInput,
+            "an item's type can't change",
+        ));
     }
     let user_id = crate::commands::user_id(&db)?.to_string();
     let (access_token, refresh_token) = tokens(&db)?;

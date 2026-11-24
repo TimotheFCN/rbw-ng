@@ -3,6 +3,8 @@
 // password manager. See docs/scripting.md.
 
 use anyhow::Context as _;
+use rbw::error::coded;
+use rbw::protocol::ErrorCode;
 
 // The ways rbw can finish a two-step login, with Bitwarden's ids.
 const TWO_STEP_METHODS: &[(rbw::api::TwoFactorProviderType, u8)] = &[
@@ -63,10 +65,13 @@ pub async fn login_with(
                 .find(|(_, method_id)| *method_id == id)
                 .map(|(method, _)| method)
                 .ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "two-step login method {id} isn't supported; use \
-                         one of {}",
-                        method_ids(TWO_STEP_METHODS)
+                    coded(
+                        ErrorCode::InvalidInput,
+                        format!(
+                            "two-step login method {id} isn't supported; \
+                             use one of {}",
+                            method_ids(TWO_STEP_METHODS)
+                        ),
                     )
                 })?,
         ),
@@ -115,8 +120,9 @@ pub async fn login_with(
             sso_email_2fa_session_token,
         }) => {
             if token.is_some() {
-                return Err(anyhow::anyhow!(
-                    "the two-step login code is incorrect"
+                return Err(coded(
+                    ErrorCode::IncorrectCode,
+                    "the two-step login code is incorrect",
                 ));
             }
             let offered: Vec<_> = TWO_STEP_METHODS
@@ -125,9 +131,10 @@ pub async fn login_with(
                 .filter(|(method, _)| providers.contains(method))
                 .collect();
             if offered.is_empty() {
-                return Err(anyhow::anyhow!(
+                return Err(coded(
+                    ErrorCode::TwoStepUnsupported,
                     "none of this account's two-step login methods are \
-                     supported"
+                     supported",
                 ));
             }
             if method == Some(rbw::api::TwoFactorProviderType::Email) {
@@ -135,34 +142,50 @@ pub async fn login_with(
                     rbw::actions::send_two_factor_email(&email, &token)
                         .await?;
                 }
-                return Err(anyhow::anyhow!(
-                    "two-step login code required; Bitwarden emailed it"
+                return Err(coded(
+                    ErrorCode::TwoStepCodeSent,
+                    "two-step login code required; Bitwarden emailed it",
                 ));
             }
-            Err(anyhow::anyhow!(
-                "two-step login code required; methods: {}",
-                method_ids(&offered)
+            Err(coded(
+                ErrorCode::TwoStepRequired {
+                    methods: offered.iter().map(|(_, id)| *id).collect(),
+                },
+                format!(
+                    "two-step login code required; methods: {}",
+                    method_ids(&offered)
+                ),
             ))
         }
         Err(rbw::error::Error::NewDeviceVerificationRequired) => {
             if token.is_some() {
-                return Err(anyhow::anyhow!(
+                return Err(coded(
+                    ErrorCode::IncorrectCode,
                     "the new device verification code is incorrect; \
-                     Bitwarden emailed a new one"
+                     Bitwarden emailed a new one",
                 ));
             }
-            Err(anyhow::anyhow!(
-                "new device verification code required; Bitwarden emailed \
-                 it to {email}"
+            Err(coded(
+                ErrorCode::NewDeviceCodeRequired,
+                format!(
+                    "new device verification code required; Bitwarden \
+                     emailed it to {email}"
+                ),
             ))
         }
         Err(rbw::error::Error::IncorrectPassword { message }) => {
             if token.is_some() {
-                Err(anyhow::anyhow!(
-                    "the two-step login code is incorrect: {message}"
+                Err(coded(
+                    ErrorCode::IncorrectCode,
+                    format!(
+                        "the two-step login code is incorrect: {message}"
+                    ),
                 ))
             } else {
-                Err(anyhow::anyhow!("incorrect master password: {message}"))
+                Err(coded(
+                    ErrorCode::IncorrectPassword,
+                    format!("incorrect master password: {message}"),
+                ))
             }
         }
         Err(e) => Err(e).context("failed to log in to bitwarden instance"),
@@ -186,7 +209,10 @@ pub async fn register_with(
         match rbw::actions::register(&email, apikey).await {
             Ok(()) => {}
             Err(rbw::error::Error::IncorrectPassword { message }) => {
-                return Err(anyhow::anyhow!("incorrect api key: {message}"))
+                return Err(coded(
+                    ErrorCode::IncorrectPassword,
+                    format!("incorrect api key: {message}"),
+                ))
             }
             Err(e) => {
                 return Err(e)
@@ -209,7 +235,7 @@ async fn logged_in_account() -> anyhow::Result<Account> {
         .ok()
         .filter(|db| !db.needs_login());
     let Some(db) = db else {
-        return Err(anyhow::anyhow!("not logged in"));
+        return Err(coded(ErrorCode::NotLoggedIn, "not logged in"));
     };
     let email = crate::actions::config_email().await?;
     Ok(Account { email, db })
@@ -229,7 +255,7 @@ pub async fn unlock_with(
         db.protected_key.clone(),
         db.protected_private_key.clone(),
     ) else {
-        return Err(anyhow::anyhow!("not logged in"));
+        return Err(coded(ErrorCode::NotLoggedIn, "not logged in"));
     };
     let memory = db.memory;
     let parallelism = db.parallelism;
@@ -255,7 +281,7 @@ pub async fn unlock_with(
     .context("the password check stopped")?
     .map_err(|e| match e {
         rbw::error::Error::IncorrectPassword { .. } => {
-            anyhow::anyhow!("incorrect master password")
+            coded(ErrorCode::IncorrectPassword, "incorrect master password")
         }
         e => anyhow::Error::new(e).context("failed to unlock database"),
     })?;
@@ -282,12 +308,12 @@ async fn new_session(
     let db = crate::actions::load_db().await?;
     let protected_key = db
         .protected_key
-        .ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+        .ok_or_else(|| coded(ErrorCode::NotLoggedIn, "not logged in"))?;
     let (session_key, wrapped) = {
         let state = state.lock().await;
         let vault_key = state
             .key(None)
-            .ok_or_else(|| anyhow::anyhow!("the vault is locked"))?;
+            .ok_or_else(|| coded(ErrorCode::Locked, "the vault is locked"))?;
         crate::session::wrap(vault_key, &protected_key)?
     };
     crate::session::save(&wrapped)?;
@@ -308,9 +334,10 @@ pub async fn unlock_session(
         db.protected_key.as_deref(),
         db.protected_private_key.as_deref(),
     ) else {
-        return Err(anyhow::anyhow!("not logged in"));
+        return Err(coded(ErrorCode::NotLoggedIn, "not logged in"));
     };
-    let invalid = || anyhow::anyhow!("the session key is invalid");
+    let invalid =
+        || coded(ErrorCode::SessionInvalid, "the session key is invalid");
     let Some(wrapped) = crate::session::load() else {
         return Err(invalid());
     };
