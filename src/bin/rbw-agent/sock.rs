@@ -40,26 +40,34 @@ impl Sock {
         buf.read_line(&mut line)
             .await
             .context("failed to read message from socket")?;
-        Ok(serde_json::from_str(&line).map_err(|e| {
-            format!("failed to parse message '{}': {e}", quote_start(&line))
-        }))
+        Ok(serde_json::from_str(&line).map_err(|e| unparsable(&line, &e)))
     }
 }
 
-// a request can be megabytes long (a batch decryption of a large vault), and
-// the error that quotes it goes to the agent log and back to the client, so
-// only quote the start of it
-fn quote_start(line: &str) -> std::borrow::Cow<'_, str> {
-    const MAX_LEN: usize = 200;
-    let line = line.trim_end();
-    if line.len() <= MAX_LEN {
-        return line.into();
+// Why a request can't be read, without quoting it: requests carry master
+// passwords and secrets, and the error goes to the agent's log. The action's
+// type is enough to see that a client is newer than the agent.
+fn unparsable(line: &str, error: &serde_json::Error) -> String {
+    #[derive(serde::Deserialize)]
+    struct Request {
+        action: Action,
     }
-    let mut end = MAX_LEN;
-    while !line.is_char_boundary(end) {
-        end -= 1;
+    #[derive(serde::Deserialize)]
+    struct Action {
+        #[serde(rename = "type")]
+        ty: String,
     }
-    format!("{}... ({} bytes)", &line[..end], line.len()).into()
+    let action = serde_json::from_str::<Request>(line)
+        .ok()
+        .map(|request| request.action.ty)
+        .filter(|ty| {
+            ty.len() <= 32 && ty.bytes().all(|b| b.is_ascii_alphanumeric())
+        });
+    let request = action.map_or_else(
+        || "a request".to_string(),
+        |action| format!("a request for {action}"),
+    );
+    format!("failed to parse {request} at column {}", error.column())
 }
 
 pub fn listen() -> anyhow::Result<tokio::net::UnixListener> {
@@ -74,22 +82,37 @@ pub fn listen() -> anyhow::Result<tokio::net::UnixListener> {
 
 #[cfg(test)]
 mod tests {
-    use super::quote_start;
+    use super::unparsable;
 
-    #[test]
-    fn short_requests_are_quoted_whole() {
-        assert_eq!(
-            quote_start("{\"type\":\"Nope\"}\n"),
-            "{\"type\":\"Nope\"}"
-        );
+    fn error(line: &str) -> String {
+        let error = serde_json::from_str::<rbw::protocol::Request>(line)
+            .expect_err(line);
+        unparsable(line, &error)
     }
 
     #[test]
-    fn long_requests_are_cut_on_a_char_boundary() {
-        let line = format!("{}{}", "a".repeat(199), "é".repeat(1000));
-        let quoted = quote_start(&line);
-        assert!(quoted.starts_with(&"a".repeat(199)));
-        assert!(quoted.ends_with(&format!("... ({} bytes)", line.len())));
-        assert!(quoted.len() < 250);
+    fn requests_that_cant_be_read_are_named_not_quoted() {
+        let password = "hunter2-master-password";
+        for line in [
+            format!(
+                r#"{{"action":{{"type":"UnlockLater","password":"{password}"}}}}"#
+            ),
+            format!(
+                r#"{{"action":{{"type":"UnlockWith","password":{password}}}}}"#
+            ),
+            format!(
+                r#"{{"action":{{"type":"UnlockWith","password":["{password}"],"session":false}}}}"#
+            ),
+            format!(r#"{{"action":{{"type":"{password} x"}}}}"#),
+            format!(r#"{{"action":"{password}"}}"#),
+            password.to_string(),
+        ] {
+            let message = error(&line);
+            assert!(!message.contains("hunter2"), "{message}");
+        }
+        assert_eq!(
+            error(r#"{"action":{"type":"UnlockLater","password":"x"}}"#),
+            "failed to parse a request for UnlockLater at column 31"
+        );
     }
 }

@@ -19,6 +19,12 @@
   * `rbw item list|get|create|edit` read and save entries as JSON in
     Bitwarden's item format, by id. Listing leaves secrets out unless asked.
 
+### Fixed
+
+* `rbw-agent` no longer quotes a request it can't read, in its log and in its
+  answer, only names the request's action: a request from a newer `rbw` can
+  carry the master password.
+
 ## [1.18.1] - 2026-11-23
 
 First packaged release. `rbw-ng` now installs with Homebrew, Cargo or a
