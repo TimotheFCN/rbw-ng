@@ -41,6 +41,7 @@ The message is for people and can change. Some codes carry more:
 | `two_step_required` | the login needs a two-step code; `methods` lists the method ids |
 | `two_step_code_sent` | the server emailed a two-step code |
 | `new_device_code_required` | the login needs the code the server emailed to verify this device |
+| `registration_required` | the server wants this device registered with the account's API key first |
 | `incorrect_code` | the two-step or new device code is wrong |
 | `two_step_unsupported` | none of the account's two-step methods are supported |
 | `session_invalid` | `RBW_SESSION` no longer unlocks the vault |
@@ -91,15 +92,26 @@ When the server asks for more, the login fails with one of these errors:
 | `two_step_required` | ask for a code from one of the `methods`, then run `rbw login --password-stdin --method ID --code CODE` |
 | `two_step_code_sent` | the answer to `--method 1 --code ""`: Bitwarden emailed the code |
 | `new_device_code_required` | run `--code CODE` without `--method`, with the code Bitwarden emailed |
+| `registration_required` | run `rbw register --api-key-env` (see below), then log in again |
 | `incorrect_password` | ask again |
 | `incorrect_code` | ask for a new code |
 
 The method ids are Bitwarden's: `0` authenticator app, `1` email, `3` YubiKey
 OTP. A login that succeeds also unlocks.
 
-bitwarden.com may refuse a password login from a device it doesn't know. Run
-`rbw register --api-key-env` once first, with the account's personal API key
-in `RBW_CLIENT_ID` and `RBW_CLIENT_SECRET`.
+Bitwarden servers from before mid-2025 may refuse a password login from a
+device they don't know by asking for a captcha, which `rbw` can't show: the
+login fails with `registration_required`. Register the device once with the
+account's personal API key, from the web vault's security settings:
+
+```sh
+RBW_CLIENT_ID=user.... RBW_CLIENT_SECRET=... rbw register --api-key-env
+```
+
+then log in again. A wrong key fails with `incorrect_password`. Current
+servers ask for an emailed code instead (`new_device_code_required`), and
+registering first works there too: the API key login makes the device known,
+so the password login that follows needs no code.
 
 ## Unlocking and sessions
 

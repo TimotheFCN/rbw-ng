@@ -357,6 +357,13 @@ def api(server, email, password):
     return call, master_hash
 
 
+def api_key(server, email, password):
+    """The account's personal API key: its client id and secret."""
+    call, master_hash = api(server, email, password)
+    key = call("/api/accounts/api-key", {"masterPasswordHash": master_hash})
+    return "user." + call("/api/accounts/profile")["id"], key["apiKey"]
+
+
 def enable_authenticator(server, email, password):
     """Turns on authenticator-app two-step login; returns its secret."""
     post, master_hash = api(server, email, password)
@@ -633,6 +640,28 @@ def two_step(server, password):
         shutil.rmtree(home, ignore_errors=True)
 
 
+def registering(server, password):
+    """Registering the device with the personal API key, then logging in."""
+    email = f"scripting-key-{secrets.token_hex(4)}@example.com"
+    register(server, email, password)
+    client_id, client_secret = api_key(server, email, password)
+    home = tempfile.mkdtemp(prefix="rbw-scripting-")
+    rbw = Rbw(home, server, email)
+    quiet = {"RBW_NONINTERACTIVE": "1"}
+    try:
+        error = rbw.error("register", "--api-key-env", env={
+            "RBW_CLIENT_ID": client_id, "RBW_CLIENT_SECRET": "wrong"})
+        check("register refuses a wrong API key",
+              error["code"] == "incorrect_password", str(error))
+        rbw.run("register", "--api-key-env", env={
+            **quiet, "RBW_CLIENT_ID": client_id, "RBW_CLIENT_SECRET": client_secret})
+        rbw.run("login", "--password-stdin", stdin=password, env=quiet)
+        check("login after register", rbw.json("status", "--json")["status"] == "unlocked")
+    finally:
+        rbw.stop()
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--server", required=True)
@@ -641,6 +670,7 @@ def main():
     try:
         scenario(args.server, args.password)
         two_step(args.server, args.password)
+        registering(args.server, args.password)
     except AssertionError as e:
         print(f"FAIL {e}")
         sys.exit(1)

@@ -2254,6 +2254,9 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
                     | "TOTP code is not a number" => {
                         return Error::IncorrectPassword { message };
                     }
+                    "Incorrect client_secret" | "Invalid client_id" => {
+                        return Error::IncorrectApiKey;
+                    }
                     s => {
                         if s.starts_with("Invalid TOTP code! Server time: ") {
                             return Error::IncorrectPassword { message };
@@ -2415,6 +2418,34 @@ mod tests {
             client.exchange_refresh_token("old"),
             Err(Error::RequestFailed { status: 502 })
         ));
+    }
+
+    #[test]
+    fn vaultwarden_refuses_a_wrong_api_key_in_its_error_model() {
+        let res: ConnectErrorRes = serde_json::from_str(
+            r#"{"error":"","error_description":"","errorModel":{"message":"Incorrect client_secret","object":"error"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_login_error(&res, 400),
+            Error::IncorrectApiKey
+        ));
+    }
+
+    #[test]
+    fn a_captcha_means_registering_with_the_api_key() {
+        // what Bitwarden servers before mid-2025 answered to a password
+        // login from a device they didn't know
+        let res: ConnectErrorRes = serde_json::from_str(
+            r#"{"error":"invalid_grant","error_description":"Captcha required.","HCaptcha_SiteKey":"x"}"#,
+        )
+        .unwrap();
+        let error = classify_login_error(&res, 400);
+        assert!(matches!(error, Error::RegistrationRequired));
+        assert_eq!(
+            crate::error::code(&anyhow::Error::new(error)),
+            crate::protocol::ErrorCode::RegistrationRequired
+        );
     }
 
     #[test]

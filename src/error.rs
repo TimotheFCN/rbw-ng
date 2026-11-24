@@ -301,6 +301,7 @@ impl Error {
             Self::NewDeviceVerificationRequired => {
                 ErrorCode::NewDeviceCodeRequired
             }
+            Self::RegistrationRequired => ErrorCode::RegistrationRequired,
             Self::CipherOutOfDate => ErrorCode::Conflict,
             Self::RequestFailed { status: 403 } => ErrorCode::Forbidden,
             Self::RequestFailed { status: 404 } => ErrorCode::NotFound,

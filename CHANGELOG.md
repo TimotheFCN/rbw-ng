@@ -46,6 +46,8 @@
   * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such
     as `locked` or `two_step_required`, so that programs don't depend on
     the wording of messages.
+  * A login that the server refuses until the device is registered with
+    the account's API key fails with `registration_required`.
 * `rbw profiles [--json]` lists the profiles on this computer, and
   `rbw purge --all` removes a profile with its configuration and every file
   it keeps.
@@ -71,6 +73,8 @@
 
 ### Fixed
 
+* `rbw register` with a wrong API key on Vaultwarden says the key is
+  incorrect instead of reporting a server error.
 * An agent started while another one answers on rbw's socket now leaves it
   alone instead of taking over its path.
 

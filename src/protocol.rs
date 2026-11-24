@@ -312,6 +312,9 @@ pub enum ErrorCode {
     TwoStepRequired { methods: Vec<u8> },
     TwoStepCodeSent,
     NewDeviceCodeRequired,
+    // the server wants the device registered with the account's personal
+    // API key (rbw register) before it accepts the master password
+    RegistrationRequired,
     IncorrectCode,
     TwoStepUnsupported,
     SessionInvalid,
