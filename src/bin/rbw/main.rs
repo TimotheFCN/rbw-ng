@@ -388,6 +388,11 @@ enum Item {
         #[arg(long, value_enum, help = "Print only this field")]
         field: Option<items::Field>,
     },
+    #[command(
+        about = "Show a login's current code, its period and when it \
+            expires, as JSON"
+    )]
+    Code { id: String },
     #[command(about = "Add the entry on stdin, as JSON or base64 JSON")]
     Create,
     #[command(about = "Replace an entry with the one on stdin")]
@@ -418,6 +423,7 @@ impl Item {
         match self {
             Self::List { .. } => "list",
             Self::Get { .. } => "get",
+            Self::Code { .. } => "code",
             Self::Create => "create",
             Self::Edit { .. } => "edit",
             Self::Delete { .. } => "delete",
@@ -588,6 +594,7 @@ fn main() {
         Opt::Item { item } => match item {
             Item::List { secrets } => items::list(secrets),
             Item::Get { id, field } => items::get(&id, field),
+            Item::Code { id } => items::code(&id),
             Item::Create => items::create(),
             Item::Edit { id } => items::edit(&id),
             Item::Delete { id } => items::delete(&id),

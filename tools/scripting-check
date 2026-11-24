@@ -459,6 +459,13 @@ def scenario(server, password):
         check("get --field totp prints the current code",
               code in {totp("JBSWY3DPEHPK3PXP", time.time() + d) for d in (-30, 0, 30)}, code)
         rbw.fails("item", "get", mail["id"], "--field", "totp", env=quiet, needle="no totp available")
+        now = time.time()
+        code = rbw.json("item", "code", item_id, env=quiet)
+        check("item code has the code and when it expires",
+              code["period"] == 30 and now < code["expiresAt"] <= now + 31
+              and code["code"] == totp("JBSWY3DPEHPK3PXP", code["expiresAt"] - 1), str(code))
+        check("item code without a code is not_found",
+              rbw.error("item", "code", mail["id"])["code"] == "not_found")
         rbw.fails("item", "get", "00000000-0000-0000-0000-000000000000", env=quiet, needle="not found")
         check("an unknown id is not_found",
               rbw.error("item", "get", "00000000-0000-0000-0000-000000000000")["code"]

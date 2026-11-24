@@ -146,6 +146,7 @@ never by name.
 | `rbw item list --secrets` | every entry, with passwords, codes' secrets, notes, custom fields and password history |
 | `rbw item get ID` | one entry, with its secrets |
 | `rbw item get ID --field username\|password\|totp\|notes` | one value; for `totp`, the current code |
+| `rbw item code ID` | the current code as `{"code":"123456","period":30,"expiresAt":1795000000}`, with `expiresAt` in Unix seconds |
 | `rbw item create` | adds the entry on stdin and prints it as saved |
 | `rbw item edit ID` | replaces the entry with the one on stdin and prints it as saved |
 | `rbw item delete ID` | moves the entry to the trash, where the official clients can restore it |

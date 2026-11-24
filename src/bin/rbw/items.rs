@@ -311,6 +311,34 @@ pub fn get(id: &str, field: Option<Field>) -> anyhow::Result<()> {
     Ok(())
 }
 
+// The current code of a login, with the time it stays valid, so that a
+// program can count it down.
+pub fn code(id: &str) -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    let db = crate::commands::load_db()?;
+    let entry = find(&db, id)?;
+    let rbw::db::EntryData::Login {
+        totp: Some(totp), ..
+    } = &entry.data
+    else {
+        return Err(coded(ErrorCode::NotFound, "no totp available"));
+    };
+    let secret =
+        crate::actions::decrypt_many(vec![rbw::protocol::DecryptItem {
+            cipherstring: totp.clone(),
+            entry_key: entry.key.clone(),
+            org_id: entry.org_id.clone(),
+        }])?
+        .remove(0)
+        .map_err(|error| anyhow::anyhow!("failed to decrypt: {error}"))?;
+    let code = rbw::totp::current(&secret)?;
+    print_json(&json!({
+        "code": code.code,
+        "period": code.period,
+        "expiresAt": code.expires_at,
+    }))
+}
+
 // An item as a program sends it, in Bitwarden's format. Other keys, such
 // as object, id or collectionIds, are ignored.
 #[derive(serde::Deserialize, Debug)]

@@ -30,6 +30,8 @@
   * `rbw item edit` and `rbw item delete` work on entries shared through
     an organization, and items say with `edit` whether the account may
     change them.
+  * `rbw item code` prints a login's current code with its period and when
+    it expires, so a program can count it down.
   * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such
     as `locked` or `two_step_required`, so that programs don't depend on
     the wording of messages.
