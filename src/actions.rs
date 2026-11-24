@@ -87,6 +87,28 @@ pub fn unlock<S: std::hash::BuildHasher>(
     crate::locked::Keys,
     std::collections::HashMap<String, crate::locked::Keys>,
 )> {
+    let key = vault_key(
+        email,
+        password,
+        kdf,
+        iterations,
+        memory,
+        parallelism,
+        protected_key,
+    )?;
+    unlock_with_key(key, protected_private_key, protected_org_keys)
+}
+
+// The vault key that the master password decrypts from the protected key.
+pub fn vault_key(
+    email: &str,
+    password: &crate::locked::Password,
+    kdf: crate::api::KdfType,
+    iterations: u32,
+    memory: Option<u32>,
+    parallelism: Option<u32>,
+    protected_key: &str,
+) -> Result<crate::locked::Keys> {
     let identity = crate::identity::Identity::new(
         email,
         password,
@@ -98,17 +120,13 @@ pub fn unlock<S: std::hash::BuildHasher>(
 
     let protected_key =
         crate::cipherstring::CipherString::new(protected_key)?;
-    let key = match protected_key.decrypt_locked_symmetric(&identity.keys) {
-        Ok(master_keys) => crate::locked::Keys::new(master_keys),
-        Err(Error::InvalidMac) => {
-            return Err(Error::IncorrectPassword {
-                message: "Password is incorrect. Try again.".to_string(),
-            })
-        }
-        Err(e) => return Err(e),
-    };
-
-    unlock_with_key(key, protected_private_key, protected_org_keys)
+    match protected_key.decrypt_locked_symmetric(&identity.keys) {
+        Ok(master_keys) => Ok(crate::locked::Keys::new(master_keys)),
+        Err(Error::InvalidMac) => Err(Error::IncorrectPassword {
+            message: "Password is incorrect. Try again.".to_string(),
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn unlock_with_key<S: std::hash::BuildHasher>(

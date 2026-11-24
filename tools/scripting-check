@@ -47,6 +47,34 @@ def encrypt(enc_key, mac_key, plaintext):
     return f"2.{b64(iv)}|{b64(ciphertext)}|{b64(mac.finalize())}"
 
 
+def decrypt(enc_key, mac_key, cipherstring):
+    """Opens a type 2 cipherstring, checking its MAC."""
+    from cryptography.hazmat.primitives import hashes, hmac, padding
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    iv, ciphertext, mac = (base64.b64decode(part) for part in cipherstring[2:].split("|"))
+    check_mac = hmac.HMAC(mac_key, hashes.SHA256())
+    check_mac.update(iv + ciphertext)
+    check_mac.verify(mac)
+    decryptor = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).decryptor()
+    padded = decryptor.update(ciphertext) + decryptor.finalize()
+    unpadder = padding.PKCS7(128).unpadder()
+    return unpadder.update(padded) + unpadder.finalize()
+
+
+def stretched_key(email, password, iterations=600_000):
+    """The key that the master password derives, to encrypt the vault key."""
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+
+    master_key = PBKDF2HMAC(
+        hashes.SHA256(), 32, email.lower().encode(), iterations
+    ).derive(password.encode())
+    return (HKDFExpand(hashes.SHA256(), 32, b"enc").derive(master_key),
+            HKDFExpand(hashes.SHA256(), 32, b"mac").derive(master_key))
+
+
 def rsa_keys():
     """A new RSA key pair, as DER: the public key and the private key."""
     from cryptography.hazmat.primitives import serialization
@@ -249,6 +277,39 @@ def share_login(server, email, password, public_der):
     return cipher["id"], protected["id"]
 
 
+def protected_kinds(server, email, password):
+    """A card, an identity, a secure note and an SSH key that ask for the
+    master password again, each with notes and a custom field; returns
+    their ids by kind."""
+    call, _ = api(server, email, password)
+    user_key = decrypt(*stretched_key(email, password),
+                       call("/api/accounts/profile")["key"])
+    seal = lambda text: encrypt(user_key[:32], user_key[32:], text.encode())
+    user_id = call("/api/accounts/profile")["id"]
+    common = lambda kind: {
+        "name": seal(f"Protected {kind}"), "reprompt": 1, "encryptedFor": user_id,
+        "notes": seal(f"{kind} notes"),
+        "fields": [{"type": 0, "name": seal("PIN"), "value": seal(f"{kind} pin")}],
+    }
+    items = {
+        "card": {"type": 3, "card": {
+            "cardholderName": seal("Alex Martin"), "brand": seal("Visa"),
+            "number": seal("4111111111111111"), "expMonth": seal("09"),
+            "expYear": seal("2029"), "code": seal("123")}},
+        "identity": {"type": 4, "identity": {
+            "title": seal("Mx"), "firstName": seal("Alex"), "lastName": seal("Martin"),
+            "address1": seal("1 rue de la Paix"), "phone": seal("+33 1 23 45 67 89"),
+            "email": seal("alex@example.com"), "ssn": seal("1 23 45"),
+            "passportNumber": seal("19AB12345")}},
+        "note": {"type": 2, "secureNote": {"type": 0}},
+        "ssh key": {"type": 5, "sshKey": {
+            "privateKey": seal(SSH_PRIVATE_KEY), "publicKey": seal("ssh-ed25519 AAAA"),
+            "keyFingerprint": seal(SSH_FINGERPRINT)}},
+    }
+    return {kind: call("/api/ciphers", {**common(kind), **item})["id"]
+            for kind, item in items.items()}
+
+
 def organizations(rbw, quiet, shared_id):
     """An entry shared through an organization: read, edited, deleted."""
     shared = next(i for i in rbw.json("item", "list", env=quiet) if i["id"] == shared_id)
@@ -272,6 +333,108 @@ def organizations(rbw, quiet, shared_id):
           all(i["id"] != shared_id for i in rbw.json("item", "list", env=quiet)))
 
 
+def agent(rbw, action):
+    """One request to the profile's agent, as any program of the user can
+    send it."""
+    import socket
+
+    request = {"tty": None, "action": action, "environment": {
+        "tty": None, "env_vars": [[b64(b"RBW_NONINTERACTIVE"), b64(b"1")]]}}
+    with socket.socket(socket.AF_UNIX) as sock:
+        sock.connect(os.path.join(rbw.env["XDG_RUNTIME_DIR"], "rbw-scripting-check", "socket"))
+        sock.sendall(json.dumps(request).encode() + b"\n")
+        return json.loads(sock.makefile().readline())
+
+
+def local_vault(rbw):
+    """The path and the contents of the profile's local copy of the vault."""
+    folder = os.path.join(rbw.env["HOME"], ".cache", "rbw-scripting-check")
+    [name] = [name for name in os.listdir(folder) if name.endswith(".json")]
+    path = os.path.join(folder, name)
+    with open(path) as file:
+        return path, json.load(file)
+
+
+def save_local_vault(path, db):
+    with open(path, "w") as file:
+        json.dump(db, file)
+
+
+def reprompt_attacks(rbw, quiet, password, protected_id, email):
+    """What another program of the same user can try, with the agent's
+    socket and the local copy of the vault, to read an entry that asks for
+    the master password again."""
+    path, db = local_vault(rbw)
+    bank = next(entry for entry in db["entries"] if entry["id"] == protected_id)
+    value = {"cipherstring": bank["data"]["Login"]["password"],
+             "entry_key": bank["key"], "org_id": bank["org_id"]}
+    answer = agent(rbw, {"type": "Decrypt", **value})
+    check("the agent refuses the protected value",
+          answer.get("code") == {"code": "reprompt_required"}, str(answer))
+    stripped = value["cipherstring"].rsplit("|", 1)[0]
+    answer = agent(rbw, {"type": "Decrypt", **value, "cipherstring": stripped})
+    check("and the value without its MAC",
+          answer["type"] == "Error" and "bank-password" not in json.dumps(answer), str(answer))
+
+    bank["master_password_reprompt"] = 0
+    save_local_vault(path, db)
+    rbw.stop()
+    rbw.run("unlock", "--password-stdin", stdin=password, env=quiet)
+    check("an agent started on an edited local copy keeps the entry closed",
+          rbw.error("item", "get", protected_id)["code"] == "reprompt_required")
+    synced = rbw.json("status", "--json")["lastSync"]
+    rbw.stop()
+    time.sleep(1)
+    rbw.run("unlock", "--password-stdin", stdin=password, env=quiet)
+    check("an agent started on the local copy it vouched for needs no sync",
+          rbw.error("item", "get", protected_id)["code"] == "reprompt_required"
+          and rbw.json("status", "--json")["lastSync"] == synced)
+
+    # keys that open with another password, in place of the account's
+    path, db = local_vault(rbw)
+    original = dict(db)
+    fake_key = secrets.token_bytes(64)
+    _, private_der = rsa_keys()
+    db.update({
+        "kdf": 0, "iterations": 600_000, "memory": None, "parallelism": None,
+        "protected_key": encrypt(*stretched_key(email, "not the password"), fake_key),
+        "protected_private_key": encrypt(fake_key[:32], fake_key[32:], private_der),
+        "protected_org_keys": {},
+    })
+    save_local_vault(path, db)
+    error = rbw.error("item", "unlock", protected_id, "--password-stdin",
+                      stdin="not the password")
+    save_local_vault(path, original)
+    check("item unlock wants the password of the unlocked vault",
+          error["code"] == "incorrect_password", str(error))
+
+
+def reprompt_kinds(rbw, quiet, kinds):
+    """Cards, identities, notes and SSH keys that ask for the master password
+    again."""
+    listed = {item["id"]: item for item in rbw.json("item", "list", "--secrets", env=quiet)}
+    shown = {"card": ("card", {"brand"}),
+             "identity": ("identity", {"title", "firstName", "middleName", "lastName"}),
+             "note": ("secureNote", {"type"}),
+             "ssh key": ("sshKey", {"publicKey", "keyFingerprint"})}
+    for kind, item_id in kinds.items():
+        check(f"get needs the {kind} unlocked",
+              rbw.error("item", "get", item_id)["code"] == "reprompt_required")
+        item = listed[item_id]
+        key, keys = shown[kind]
+        check(f"list --secrets shows only the {kind}'s name and what list shows",
+              "notes" not in item and "fields" not in item
+              and set(item[key]) <= keys, str(item))
+    check("a note's notes need it unlocked",
+          rbw.error("item", "get", kinds["note"], "--field", "notes")["code"]
+          == "reprompt_required")
+    error = rbw.error("item", "edit", kinds["card"], stdin=json.dumps(listed[kinds["card"]]))
+    check("editing a card needs it unlocked", error["code"] == "reprompt_required", str(error))
+    found = rbw.run("search", "note notes")
+    check("search doesn't look into closed notes, nor ask for the password",
+          found.returncode == 0 and found.stdout == "", found.stderr)
+
+
 def reprompt(rbw, quiet, password, protected_id):
     """An entry that asks for the master password again."""
     listed = next(i for i in rbw.json("item", "list", env=quiet) if i["id"] == protected_id)
@@ -285,7 +448,7 @@ def reprompt(rbw, quiet, password, protected_id):
           str(in_list))
     check("code needs it too",
           rbw.error("item", "code", protected_id)["code"] == "reprompt_required")
-    check("the password alone is no secret",
+    check("its username is no secret",
           rbw.run("item", "get", protected_id, "--field", "username", env=quiet).stdout == "me\n")
     error = rbw.error("item", "unlock", protected_id, "--password-stdin", stdin="wrong")
     check("unlock refuses a wrong password", error["code"] == "incorrect_password", str(error))
@@ -471,6 +634,7 @@ def scenario(server, password):
     email = f"scripting-{secrets.token_hex(4)}@example.com"
     public_der = register(server, email, password)
     shared_id, protected_id = share_login(server, email, password, public_der)
+    protected = protected_kinds(server, email, password)
     home = tempfile.mkdtemp(prefix="rbw-scripting-")
     rbw = Rbw(home, server, email)
     quiet = {"RBW_NONINTERACTIVE": "1"}
@@ -611,6 +775,8 @@ def scenario(server, password):
         rbw.run("config", "set", "lock_timeout", "3600")
         rbw.run("unlock", "--password-stdin", env=quiet, stdin=password)
         reprompt(rbw, quiet, password, protected_id)
+        reprompt_kinds(rbw, quiet, protected)
+        reprompt_attacks(rbw, quiet, password, protected_id, email)
         rbw.run("purge")
         check("purge signs out", rbw.json("status", "--json")["status"] == "unauthenticated")
         check("purge removes the session",

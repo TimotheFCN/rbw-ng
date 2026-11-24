@@ -1,5 +1,4 @@
 use anyhow::Context as _;
-use sha2::Digest as _;
 
 pub async fn register(
     sock: &mut crate::sock::Sock,
@@ -776,7 +775,30 @@ pub async fn unlock_success(
     {
         state.biometric_unlock = biometric_unlock;
     }
+    let reprompt_mac = state.master_password_reprompt_mac();
+    drop(state);
+    if let Some(reprompt_mac) = reprompt_mac {
+        store_reprompt_mac(reprompt_mac).await;
+    }
     Ok(())
+}
+
+// After a sync while the vault was locked, which couldn't vouch for the
+// entries' reprompt flags. The MAC only spares a later agent a sync, so
+// failing to store it fails nothing.
+async fn store_reprompt_mac(reprompt_mac: String) {
+    let stored = async {
+        let mut db = load_db().await?;
+        if db.reprompt_mac.as_deref() != Some(reprompt_mac.as_str()) {
+            db.reprompt_mac = Some(reprompt_mac);
+            save_db(&db).await?;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(e) = stored {
+        log::warn!("failed to store the reprompt flags' MAC: {e:#}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -863,7 +885,11 @@ pub async fn sync(
         .protected_key
         .as_deref()
         .is_some_and(|old_protected_key| old_protected_key != protected_key);
-    state.lock().await.set_master_password_reprompt(&entries);
+    let reprompt_mac = {
+        let mut state = state.lock().await;
+        state.set_master_password_reprompt(&entries);
+        state.master_password_reprompt_mac()
+    };
     if let Some(tokens) = tokens {
         tokens.store_in(&mut db);
     }
@@ -873,6 +899,7 @@ pub async fn sync(
     db.user_id = Some(user_id);
     db.entries = entries;
     db.folders = folders;
+    db.reprompt_mac = reprompt_mac;
     db.last_sync =
         Some(rbw::api::format_rfc3339(std::time::SystemTime::now()));
     save_db(&db).await?;
@@ -917,8 +944,8 @@ async fn decrypt_cipher(
 // Decrypts one cipherstring as part of a request that may decrypt several.
 // If the user cancels or fails a master password reprompt, the request sets
 // reprompt_declined, and the remaining reprompt-protected values in the same
-// request fail without asking again. Values are never decrypted without a
-// successful prompt of their own.
+// request fail without asking again. A password that checks out opens the
+// entry, as rbw item unlock does.
 async fn decrypt_cipher_in_request(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     environment: &rbw::protocol::Environment,
@@ -927,23 +954,24 @@ async fn decrypt_cipher_in_request(
     org_id: Option<&str>,
     reprompt_declined: &mut bool,
 ) -> anyhow::Result<String> {
+    learn_master_password_reprompt(&state).await?;
+    let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
+        .context("failed to parse encrypted secret")?;
+
     let mut state = state.lock().await;
-    if !state.master_password_reprompt_initialized() {
-        let db = load_db().await?;
-        state.set_master_password_reprompt(&db.entries);
-    }
     if state.needs_unlock() {
         return Err(anyhow::anyhow!(
             "failed to find decryption keys in in-memory state"
         ));
     }
-
-    let mut sha256 = sha2::Sha256::new();
-    sha256.update(cipherstring);
-    let master_password_reprompt: [u8; 32] = sha256.finalize().into();
-    if let Some(entry_id) = state
-        .reprompt_entry(&master_password_reprompt)
-        .map(str::to_string)
+    let Some(protected) = &state.master_password_reprompt else {
+        return Err(anyhow::anyhow!(
+            "the agent doesn't know yet which entries ask for the master \
+             password again; try again"
+        ));
+    };
+    if let Some(entry_id) =
+        protected.get(&cipherstring.fingerprint()).cloned()
     {
         if !state.use_unlocked_entry(&entry_id) {
             if environment.is_noninteractive() {
@@ -961,10 +989,15 @@ async fn decrypt_cipher_in_request(
                      request"
                 ));
             }
-            if let Err(e) = confirm_master_password(environment).await {
+            // other requests wait for the state until pinentry is answered
+            let account = PasswordCheck::load(&state).await?;
+            if let Err(e) =
+                confirm_master_password(environment, &account).await
+            {
                 *reprompt_declined = true;
                 return Err(e);
             }
+            state.unlock_entry(&entry_id);
         }
     }
 
@@ -986,8 +1019,6 @@ async fn decrypt_cipher_in_request(
         None
     };
 
-    let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
-        .context("failed to parse encrypted secret")?;
     let plaintext = String::from_utf8(
         cipherstring
             .decrypt_symmetric(keys, entry_key.as_ref())
@@ -998,18 +1029,47 @@ async fn decrypt_cipher_in_request(
     Ok(plaintext)
 }
 
-// The account's unlock material, to check a master password against.
+// Before the agent decrypts anything, it learns which values need the
+// master password again (see reprompt.rs): from the local copy of the vault
+// if it carries the agent's MAC, or else from a sync.
+async fn learn_master_password_reprompt(
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    {
+        let mut state = state.lock().await;
+        if state.master_password_reprompt.is_some() || state.needs_unlock() {
+            return Ok(());
+        }
+        state.trust_master_password_reprompt(&load_db().await?);
+        if state.master_password_reprompt.is_some() {
+            return Ok(());
+        }
+    }
+    sync(None, state.clone()).await.context(
+        "failed to sync, which tells the agent which entries ask for the \
+         master password again",
+    )
+}
+
+// Checks a master password against the vault this agent has unlocked.
 struct PasswordCheck {
-    db: rbw::db::Db,
     email: String,
     kdf: rbw::api::KdfType,
     iterations: u32,
+    memory: Option<u32>,
+    parallelism: Option<u32>,
     protected_key: String,
-    protected_private_key: String,
+    vault_key: rbw::locked::Keys,
 }
 
 impl PasswordCheck {
-    async fn load() -> anyhow::Result<Self> {
+    async fn load(state: &crate::state::State) -> anyhow::Result<Self> {
+        let Some(vault_key) = state.priv_key.clone() else {
+            return Err(rbw::error::coded(
+                rbw::protocol::ErrorCode::Locked,
+                "the vault is locked",
+            ));
+        };
         let db = load_db().await?;
         let Some(kdf) = db.kdf else {
             return Err(anyhow::anyhow!("failed to find kdf type in db"));
@@ -1019,49 +1079,78 @@ impl PasswordCheck {
                 "failed to find number of iterations in db"
             ));
         };
-        let Some(protected_key) = db.protected_key.clone() else {
+        let Some(protected_key) = db.protected_key else {
             return Err(anyhow::anyhow!(
                 "failed to find protected key in db"
             ));
         };
-        let Some(protected_private_key) = db.protected_private_key.clone()
-        else {
-            return Err(anyhow::anyhow!(
-                "failed to find protected private key in db"
-            ));
-        };
         let email = config_email().await?;
         Ok(Self {
-            db,
             email,
             kdf,
             iterations,
+            memory: db.memory,
+            parallelism: db.parallelism,
             protected_key,
-            protected_private_key,
+            vault_key,
         })
     }
 
-    fn check(
+    // The local copy of the vault, where the key derivation's settings and
+    // the protected key come from, is a file another program could replace
+    // with ones its own password opens. So the password must yield the key
+    // of the vault that is unlocked.
+    async fn check(
         &self,
         password: &rbw::locked::Password,
-    ) -> rbw::error::Result<()> {
-        rbw::actions::unlock(
-            &self.email,
-            password,
-            self.kdf,
-            self.iterations,
-            self.db.memory,
-            self.db.parallelism,
-            &self.protected_key,
-            &self.protected_private_key,
-            &self.db.protected_org_keys,
-        )
-        .map(drop)
+    ) -> anyhow::Result<()> {
+        let email = self.email.clone();
+        let password = password.clone();
+        let (kdf, iterations, memory, parallelism) =
+            (self.kdf, self.iterations, self.memory, self.parallelism);
+        let protected_key = self.protected_key.clone();
+        // the key derivation takes a moment, so keep it off the event loop
+        let vault_key = tokio::task::spawn_blocking(move || {
+            rbw::actions::vault_key(
+                &email,
+                &password,
+                kdf,
+                iterations,
+                memory,
+                parallelism,
+                &protected_key,
+            )
+        })
+        .await
+        .context("the password check stopped")?;
+        let incorrect = || {
+            rbw::error::coded(
+                rbw::protocol::ErrorCode::IncorrectPassword,
+                "incorrect master password",
+            )
+        };
+        match vault_key {
+            Ok(vault_key) if same_key(&vault_key, &self.vault_key) => Ok(()),
+            Ok(_) | Err(rbw::error::Error::IncorrectPassword { .. }) => {
+                Err(incorrect())
+            }
+            Err(e) => Err(e).context("failed to check the password"),
+        }
     }
+}
+
+// In constant time, as the other key can be one another program chose.
+fn same_key(a: &rbw::locked::Keys, b: &rbw::locked::Keys) -> bool {
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .fold(0, |differ, (a, b)| differ | (a ^ b))
+        == 0
 }
 
 // Opens an entry with master password reprompt for a while, once the master
 // password checks out: the one given, or else the one pinentry asks for.
+// The state isn't locked meanwhile, so that other requests go on.
 pub async fn unlock_entry(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
@@ -1069,55 +1158,39 @@ pub async fn unlock_entry(
     id: &str,
     password: Option<&str>,
 ) -> anyhow::Result<()> {
+    let account = PasswordCheck::load(&*state.lock().await).await?;
+    match password {
+        Some(password) => {
+            let mut bytes = rbw::locked::Vec::new();
+            bytes.extend(password.as_bytes().iter().copied());
+            account.check(&rbw::locked::Password::new(bytes)).await?;
+        }
+        None => confirm_master_password(environment, &account).await?,
+    }
     let mut state = state.lock().await;
-    if state.needs_unlock() {
+    // locking meanwhile closes every entry
+    if state
+        .priv_key
+        .as_ref()
+        .is_none_or(|key| !same_key(key, &account.vault_key))
+    {
         return Err(rbw::error::coded(
             rbw::protocol::ErrorCode::Locked,
             "the vault is locked",
         ));
     }
-    match password {
-        Some(password) => {
-            let mut bytes = rbw::locked::Vec::new();
-            bytes.extend(password.as_bytes().iter().copied());
-            match PasswordCheck::load()
-                .await?
-                .check(&rbw::locked::Password::new(bytes))
-            {
-                Ok(()) => {}
-                Err(rbw::error::Error::IncorrectPassword { message }) => {
-                    return Err(rbw::error::coded(
-                        rbw::protocol::ErrorCode::IncorrectPassword,
-                        format!("incorrect master password: {message}"),
-                    ));
-                }
-                Err(e) => {
-                    return Err(e).context("failed to check the password")
-                }
-            }
-        }
-        None => confirm_master_password(environment).await?,
-    }
     state.unlock_entry(id);
+    drop(state);
     respond_ack(sock).await
 }
 
-// Asks for the master password before revealing a value from an entry with
-// master password reprompt enabled. The caller holds the state lock for the
-// whole prompt, so other requests wait until it is answered.
+// Asks pinentry for the master password, three times at most.
 async fn confirm_master_password(
     environment: &rbw::protocol::Environment,
+    account: &PasswordCheck,
 ) -> anyhow::Result<()> {
-    let account = PasswordCheck::load().await?;
-    let mut err_msg = None;
+    let mut err = None;
     for i in 1_u8..=3 {
-        let err = if i > 1 {
-            // this unwrap is safe because we only ever continue the loop
-            // if we have set err_msg
-            Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
-        } else {
-            None
-        };
         let password = rbw::pinentry::getpin(
             &config_pinentry().await?,
             "Master Password",
@@ -1128,23 +1201,19 @@ async fn confirm_master_password(
         )
         .await
         .context("failed to read password from pinentry")?;
-        match account.check(&password) {
-            Ok(()) => {
-                break;
+        match account.check(&password).await {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if i < 3
+                    && rbw::error::code(&e)
+                        == rbw::protocol::ErrorCode::IncorrectPassword =>
+            {
+                err = Some(format!("{e} (attempt {}/3)", i + 1));
             }
-            Err(rbw::error::Error::IncorrectPassword { message }) => {
-                if i == 3 {
-                    return Err(rbw::error::Error::IncorrectPassword {
-                        message,
-                    })
-                    .context("failed to unlock database");
-                }
-                err_msg = Some(message);
-            }
-            Err(e) => return Err(e).context("failed to unlock database"),
+            Err(e) => return Err(e),
         }
     }
-    Ok(())
+    unreachable!()
 }
 
 pub async fn decrypt(

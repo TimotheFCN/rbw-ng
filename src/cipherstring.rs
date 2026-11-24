@@ -6,14 +6,16 @@ use aes::cipher::{
 use hmac::Mac as _;
 use pkcs8::DecodePrivateKey as _;
 use rand::RngCore as _;
+use sha2::Digest as _;
 use zeroize::Zeroize as _;
 
 pub enum CipherString {
     Symmetric {
-        // ty: 2 (AES_256_CBC_HMAC_SHA256)
+        // ty: 2 (AES_256_CBC_HMAC_SHA256), always with its MAC: without it,
+        // anyone could have changed the ciphertext
         iv: Vec<u8>,
         ciphertext: Vec<u8>,
-        mac: Option<Vec<u8>>,
+        mac: Vec<u8>,
     },
     Asymmetric {
         // ty: 4 (RSA_2048_OAEP_SHA1)
@@ -37,13 +39,13 @@ impl CipherString {
             });
         }
 
-        let ty = ty[0] - b'0';
+        let ty = ty[0].wrapping_sub(b'0');
         let contents = parts[1];
 
         match ty {
             2 => {
                 let parts: Vec<&str> = contents.split('|').collect();
-                if parts.len() < 2 || parts.len() > 3 {
+                if parts.len() != 3 {
                     return Err(Error::InvalidCipherString {
                         reason: format!(
                             "type 2 cipherstring with {} parts",
@@ -52,18 +54,20 @@ impl CipherString {
                     });
                 }
 
-                let iv = crate::base64::decode(parts[0])
-                    .map_err(|source| Error::InvalidBase64 { source })?;
-                let ciphertext = crate::base64::decode(parts[1])
-                    .map_err(|source| Error::InvalidBase64 { source })?;
-                let mac =
-                    if parts.len() > 2 {
-                        Some(crate::base64::decode(parts[2]).map_err(
-                            |source| Error::InvalidBase64 { source },
-                        )?)
-                    } else {
-                        None
-                    };
+                let decode = |part| {
+                    crate::base64::decode(part)
+                        .map_err(|source| Error::InvalidBase64 { source })
+                };
+                let iv = decode(parts[0])?;
+                let ciphertext = decode(parts[1])?;
+                let mac = decode(parts[2])?;
+                if iv.len() != 16 || mac.len() != 32 {
+                    return Err(Error::InvalidCipherString {
+                        reason: "type 2 cipherstring with a wrong IV or MAC \
+                                 length"
+                            .to_string(),
+                    });
+                }
 
                 Ok(Self::Symmetric {
                     iv,
@@ -116,8 +120,26 @@ impl CipherString {
         Ok(Self::Symmetric {
             iv,
             ciphertext,
-            mac: Some(mac),
+            mac,
         })
+    }
+
+    // Identifies the encrypted value whatever text it came as: the same IV
+    // and ciphertext decrypt to the same plaintext.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        let mut digest = sha2::Sha256::new();
+        match self {
+            Self::Symmetric { iv, ciphertext, .. } => {
+                digest.update([2]);
+                digest.update(iv);
+                digest.update(ciphertext);
+            }
+            Self::Asymmetric { ciphertext } => {
+                digest.update([4]);
+                digest.update(ciphertext);
+            }
+        }
+        digest.finalize().into()
     }
 
     pub fn decrypt_symmetric(
@@ -135,7 +157,7 @@ impl CipherString {
                 entry_key.unwrap_or(keys),
                 iv,
                 ciphertext,
-                mac.as_deref(),
+                mac,
             )?;
             cipher
                 .decrypt_padded_vec_mut::<block_padding::Pkcs7>(ciphertext)
@@ -161,12 +183,7 @@ impl CipherString {
         {
             let mut res = crate::locked::Vec::new();
             res.extend(ciphertext.iter().copied());
-            let cipher = decrypt_common_symmetric(
-                keys,
-                iv,
-                ciphertext,
-                mac.as_deref(),
-            )?;
+            let cipher = decrypt_common_symmetric(keys, iv, ciphertext, mac)?;
             cipher
                 .decrypt_padded_mut::<block_padding::Pkcs7>(res.data_mut())
                 .map_err(|source| Error::Decrypt { source })?;
@@ -216,18 +233,14 @@ fn decrypt_common_symmetric(
     keys: &crate::locked::Keys,
     iv: &[u8],
     ciphertext: &[u8],
-    mac: Option<&[u8]>,
+    mac: &[u8],
 ) -> Result<cbc::Decryptor<aes::Aes256>> {
-    if let Some(mac) = mac {
-        let mut key =
-            hmac::Hmac::<sha2::Sha256>::new_from_slice(keys.mac_key())
-                .map_err(|source| Error::CreateHmac { source })?;
-        key.update(iv);
-        key.update(ciphertext);
-
-        if key.verify(mac.into()).is_err() {
-            return Err(Error::InvalidMac);
-        }
+    let mut key = hmac::Hmac::<sha2::Sha256>::new_from_slice(keys.mac_key())
+        .map_err(|source| Error::CreateHmac { source })?;
+    key.update(iv);
+    key.update(ciphertext);
+    if key.verify(mac.into()).is_err() {
+        return Err(Error::InvalidMac);
     }
 
     cbc::Decryptor::<aes::Aes256>::new_from_slices(keys.enc_key(), iv)
@@ -244,12 +257,8 @@ impl std::fmt::Display for CipherString {
             } => {
                 let iv = crate::base64::encode(iv);
                 let ciphertext = crate::base64::encode(ciphertext);
-                if let Some(mac) = &mac {
-                    let mac = crate::base64::encode(mac);
-                    write!(f, "2.{iv}|{ciphertext}|{mac}")
-                } else {
-                    write!(f, "2.{iv}|{ciphertext}")
-                }
+                let mac = crate::base64::encode(mac);
+                write!(f, "2.{iv}|{ciphertext}|{mac}")
             }
             Self::Asymmetric { ciphertext } => {
                 let ciphertext = crate::base64::encode(ciphertext);
@@ -311,5 +320,68 @@ fn test_pkcs7_unpad() {
     for (input, expected) in tests {
         let got = pkcs7_unpad(input);
         assert_eq!(got, expected);
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn keys() -> crate::locked::Keys {
+        let mut keys = crate::locked::Vec::new();
+        keys.extend((0..64).map(|i: u8| i.wrapping_mul(37)));
+        crate::locked::Keys::new(keys)
+    }
+
+    #[test]
+    fn a_symmetric_cipherstring_needs_its_mac() {
+        let keys = keys();
+        let encrypted = CipherString::encrypt_symmetric(&keys, b"hunter2")
+            .unwrap()
+            .to_string();
+        let parsed = CipherString::new(&encrypted).unwrap();
+        assert_eq!(
+            parsed.decrypt_symmetric(&keys, None).unwrap(),
+            b"hunter2"
+        );
+
+        let (without_mac, _) = encrypted.rsplit_once('|').unwrap();
+        assert!(matches!(
+            CipherString::new(without_mac),
+            Err(Error::InvalidCipherString { .. })
+        ));
+        let (start, mac) = encrypted.rsplit_once('|').unwrap();
+        let mut mac = crate::base64::decode(mac).unwrap();
+        mac[0] ^= 1;
+        let tampered = format!("{start}|{}", crate::base64::encode(&mac));
+        assert!(matches!(
+            CipherString::new(&tampered)
+                .unwrap()
+                .decrypt_symmetric(&keys, None),
+            Err(Error::InvalidMac)
+        ));
+        for broken in ["2.", "2.a|b", "!.x", "2.AAAA|AAAA|AAAA"] {
+            assert!(CipherString::new(broken).is_err(), "{broken}");
+        }
+    }
+
+    #[test]
+    fn fingerprints_ignore_the_text_and_the_mac() {
+        let keys = keys();
+        let encrypted =
+            CipherString::encrypt_symmetric(&keys, b"hunter2").unwrap();
+        let other =
+            CipherString::encrypt_symmetric(&keys, b"hunter2").unwrap();
+        assert_ne!(encrypted.fingerprint(), other.fingerprint());
+        let CipherString::Symmetric { iv, ciphertext, .. } = &encrypted
+        else {
+            unreachable!();
+        };
+        let same = CipherString::Symmetric {
+            iv: iv.clone(),
+            ciphertext: ciphertext.clone(),
+            mac: vec![0; 32],
+        };
+        assert_eq!(encrypted.fingerprint(), same.fingerprint());
     }
 }

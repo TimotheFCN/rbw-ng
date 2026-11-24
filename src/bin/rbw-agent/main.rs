@@ -11,6 +11,7 @@ mod notifications;
 mod peer;
 #[cfg(target_os = "macos")]
 mod presence;
+mod reprompt;
 mod scripted;
 mod session;
 mod sock;
@@ -51,8 +52,7 @@ async fn tokio_main(
             sync_timeout,
             sync_timeout_duration,
             notifications_handler,
-            master_password_reprompt: std::collections::HashMap::new(),
-            master_password_reprompt_initialized: false,
+            master_password_reprompt: None,
             unlocked_entries: std::collections::HashMap::new(),
             unlock_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(target_os = "macos")]

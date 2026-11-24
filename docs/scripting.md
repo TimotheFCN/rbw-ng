@@ -245,26 +245,48 @@ yet:
 ### Entries that ask for the master password again
 
 An entry with Bitwarden's master password re-prompt has `"reprompt": 1`.
-Its secrets (password, code, card number and security code, social security
-and passport numbers, private key and hidden fields) stay closed while the
-vault is unlocked. With `RBW_NONINTERACTIVE`, reading one fails with
-`reprompt_required`, and `rbw item list --secrets` lists the entry without
-them; in a terminal, pinentry asks for the master password each time. Its
-other values read as usual.
+While the vault is unlocked, everything of it stays closed but its name and
+what `rbw item list` shows: a login's username and addresses, a card's brand,
+an identity's title and names, an SSH key's public key and fingerprint. Its
+notes, custom fields and password history stay closed too. With
+`RBW_NONINTERACTIVE`, reading a closed value fails with `reprompt_required`,
+and `rbw item list --secrets` lists the entry as `rbw item list` does; in a
+terminal, pinentry asks for the master password. Searches by name
+(`rbw search`, `rbw get NAME`) don't look into its notes and fields.
 
 Ask the person for the master password and pass it to
-`rbw item unlock ID --password-stdin`. The agent checks it against the
-account's keys, as an unlock does, and fails with `incorrect_password` if it
-is wrong. The entry is then open: its secrets read, and it can be edited,
-until it goes unread for two minutes or the vault locks. Each read keeps it
-open, so a program that shows the entry and refreshes its code every period
-keeps it open while it is shown. This follows the official clients, which
-ask again each time such an entry is opened and not while it stays open.
-Without `--password-stdin`, `rbw item unlock` asks through pinentry.
+`rbw item unlock ID --password-stdin`. The agent checks that it opens the
+vault that is unlocked, and fails with `incorrect_password` if it doesn't.
+The entry is then open: its values read, and it can be edited, until it goes
+unread for two minutes or the vault locks. Each read keeps it open, so a
+program that shows the entry and refreshes its code every period keeps it
+open while it is shown. This follows the official clients, which ask again
+each time such an entry is opened and not while it stays open. Without
+`--password-stdin`, `rbw item unlock` asks through pinentry, and a password
+given to pinentry when a value is read opens the entry the same way.
 
-Editing an entry that asks for the master password again needs it open too:
-otherwise `edit` fails with `reprompt_required`, since it couldn't tell
-whether the password changed.
+Editing such an entry needs it open too, whatever its kind: otherwise `edit`
+fails with `reprompt_required`.
+
+The agent, not `rbw`, keeps these values closed: it decrypts none of them
+without the master password, whatever program asks. It knows which entries
+ask for it from the server, and from a local copy of the vault that carries
+its MAC of them, which needs the vault key. A local copy that another
+program edited makes the agent sync before it decrypts anything.
+
+As in the official clients, the re-prompt is a safeguard against someone at
+an unlocked computer, not more encryption: such an entry is encrypted with
+the same key as the rest of the vault. A program that runs as the same user
+can still:
+
+* read every entry without the re-prompt, through the agent, while the
+  vault is unlocked;
+* read an entry while it is open;
+* turn the re-prompt off on the server with the access token in the local
+  copy of the vault, then have the agent sync. The change shows on the
+  server and in the other clients;
+* trick the person into typing the master password, for example with
+  `rbw config set pinentry` or a prompt of its own.
 
 ## Folders
 

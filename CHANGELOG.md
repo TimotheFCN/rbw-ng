@@ -78,9 +78,33 @@ service.
   for settings that change only what the agent does: `lock_timeout`,
   `sync_interval`, `pinentry`, `pinentry_timeout`, `touch_id_unlock` and
   `ssh_confirm`. A running agent takes them over at once.
+* A master password given to pinentry for an entry with master password
+  re-prompt opens the entry for two minutes, as `rbw item unlock` does, so
+  that reading its values asks once, not once per value.
 
 ### Fixed
 
+* Master password re-prompt held back less than it should, and other
+  programs of the same user could get past it:
+  * An entry with re-prompt now keeps closed everything but what lists show
+    of it: its name, a login's username and addresses, a card's brand, an
+    identity's title and names, an SSH key's public key and fingerprint. Its
+    notes, custom fields (also text ones), password history and the rest of
+    a card or an identity were readable without the password. `rbw search`
+    and `rbw get NAME` no longer look into the notes and fields of such an
+    entry.
+  * `rbw-agent` decrypts no cipherstring without its MAC. Without one, a
+    program could strip the MAC from a protected value, which the agent then
+    didn't recognize and decrypted.
+  * The agent takes the entries' re-prompt flags from the server, or from a
+    local copy of the vault that carries its MAC of them. It used to trust
+    the local copy when it started, which any program can edit.
+  * The re-prompt checks the master password against the key of the
+    unlocked vault. It checked it against the keys in the local copy of the
+    vault, which a program could replace with keys that its own password
+    opens.
+  * `rbw item edit` needs every kind of entry with re-prompt open, not only
+    logins.
 * `rbw register` with a wrong API key on Vaultwarden says the key is
   incorrect instead of reporting a server error.
 * An agent started while another one answers on rbw's socket now leaves it

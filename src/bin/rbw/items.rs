@@ -675,6 +675,18 @@ fn decrypt(
     }
 }
 
+// An entry with master password reprompt must be open to be edited, as to
+// be read, since an edit replaces the values it keeps closed. Decrypting
+// one of them tells.
+fn require_open(entry: &rbw::db::Entry) -> anyhow::Result<()> {
+    match entry.protected_values().first() {
+        Some(value) if entry.master_password_reprompt() => {
+            decrypt(entry, value).map(drop)
+        }
+        _ => Ok(()),
+    }
+}
+
 // The public key and SHA-256 fingerprint of an OpenSSH private key, as the
 // official clients store them.
 fn ssh_public_key(private_key: &str) -> anyhow::Result<(String, String)> {
@@ -788,6 +800,7 @@ pub fn edit(id: &str) -> anyhow::Result<()> {
     let db = crate::commands::load_db()?;
     let entry = find(&db, id)?;
     check_writable(entry)?;
+    require_open(entry)?;
     if !same_id(item.organization_id.as_deref(), entry.org_id.as_deref()) {
         return Err(coded(
             ErrorCode::Unsupported,

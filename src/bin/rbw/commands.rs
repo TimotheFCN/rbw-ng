@@ -3036,9 +3036,13 @@ fn decrypt_search_cipher(
         .as_ref()
         .map(|folder| decryptor.decrypt(folder, None, None))
         .transpose()?;
+    // an entry with master password reprompt keeps its notes and fields
+    // closed, so a search doesn't look in them
+    let open = !entry.master_password_reprompt();
     let notes = entry
         .notes
         .as_ref()
+        .filter(|_| open)
         .map(|notes| {
             decryptor.decrypt(
                 notes,
@@ -3066,6 +3070,7 @@ fn decrypt_search_cipher(
     let fields = entry
         .fields
         .iter()
+        .filter(|_| open)
         .filter_map(|field| {
             if field.ty == Some(rbw::api::FieldType::Hidden) {
                 None
@@ -5295,6 +5300,30 @@ mod test {
             |c| c.ends_with("name"),
         )
         .is_err());
+    }
+
+    #[test]
+    fn searches_leave_the_closed_values_of_reprompt_entries_alone() {
+        let mut entry = make_full_entry("a");
+        entry.master_password_reprompt =
+            rbw::api::CipherRepromptType::Password;
+        let protected = entry.protected_values();
+        let asked = record_batch(
+            std::slice::from_ref(&entry),
+            &|entry, decryptor| decrypt_search_cipher(entry, decryptor),
+        );
+        assert!(asked
+            .iter()
+            .all(|item| !protected.contains(&item.cipherstring.as_str())));
+        let found = replay_with(
+            std::slice::from_ref(&entry),
+            |entry, decryptor| decrypt_search_cipher(entry, decryptor),
+            |c| protected.contains(&c),
+        )
+        .unwrap();
+        assert_eq!(found[0].name, "plain a name");
+        assert_eq!(found[0].notes, None);
+        assert_eq!(found[0].fields, Vec::<String>::new());
     }
 
     #[test]

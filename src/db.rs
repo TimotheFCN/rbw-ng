@@ -37,6 +37,85 @@ impl Entry {
     pub fn master_password_reprompt(&self) -> bool {
         self.master_password_reprompt != crate::api::CipherRepromptType::None
     }
+
+    // The encrypted values that an entry with master password reprompt
+    // keeps closed: all but its name and what a list shows of it (a login's
+    // username and addresses, a card's brand, an identity's title and names,
+    // an SSH key's public key and fingerprint). The official clients show
+    // no more of such an entry before the password.
+    pub fn protected_values(&self) -> Vec<&str> {
+        let mut values = vec![self.notes.as_deref()];
+        for field in &self.fields {
+            values.extend([field.name.as_deref(), field.value.as_deref()]);
+        }
+        values.extend(
+            self.history
+                .iter()
+                .map(|history| Some(history.password.as_str())),
+        );
+        match &self.data {
+            EntryData::Login {
+                username: _,
+                password,
+                totp,
+                uris: _,
+            } => values.extend([password.as_deref(), totp.as_deref()]),
+            EntryData::Card {
+                cardholder_name,
+                number,
+                brand: _,
+                exp_month,
+                exp_year,
+                code,
+            } => values.extend([
+                cardholder_name.as_deref(),
+                number.as_deref(),
+                exp_month.as_deref(),
+                exp_year.as_deref(),
+                code.as_deref(),
+            ]),
+            EntryData::Identity {
+                title: _,
+                first_name: _,
+                middle_name: _,
+                last_name: _,
+                address1,
+                address2,
+                address3,
+                city,
+                state,
+                postal_code,
+                country,
+                phone,
+                email,
+                ssn,
+                license_number,
+                passport_number,
+                username,
+            } => values.extend([
+                address1.as_deref(),
+                address2.as_deref(),
+                address3.as_deref(),
+                city.as_deref(),
+                state.as_deref(),
+                postal_code.as_deref(),
+                country.as_deref(),
+                phone.as_deref(),
+                email.as_deref(),
+                ssn.as_deref(),
+                license_number.as_deref(),
+                passport_number.as_deref(),
+                username.as_deref(),
+            ]),
+            EntryData::SecureNote => {}
+            EntryData::SshKey {
+                private_key,
+                public_key: _,
+                fingerprint: _,
+            } => values.push(private_key.as_deref()),
+        }
+        values.into_iter().flatten().collect()
+    }
 }
 
 #[derive(serde::Serialize, Debug, Clone, Eq, PartialEq)]
@@ -244,6 +323,11 @@ pub struct Db {
     // when the agent last synced, as RFC 3339
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_sync: Option<String>,
+    // the agent's MAC of which values need the master password again, as
+    // it learned them from the server, so that an agent started later can
+    // trust the entries' reprompt flags without syncing first
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprompt_mac: Option<String>,
 }
 
 // A temporary file in the same directory as the db, so that renaming it over

@@ -1,5 +1,3 @@
-use sha2::Digest as _;
-
 // How long an entry with master password reprompt stays open after it was
 // unlocked or last read. The official clients ask again each time such an
 // entry is opened and keep it open while it is shown; a program that shows
@@ -42,9 +40,10 @@ pub struct State {
     pub sync_timeout: crate::timeout::Timeout,
     pub sync_timeout_duration: std::time::Duration,
     pub notifications_handler: crate::notifications::Handler,
-    // the protected values' hashes, with the id of their entry
-    pub master_password_reprompt: std::collections::HashMap<[u8; 32], String>,
-    pub master_password_reprompt_initialized: bool,
+    // the values that need the master password again (see reprompt.rs),
+    // or None until the agent knows them from a sync or from a local copy
+    // of the vault that carries its MAC
+    pub master_password_reprompt: Option<crate::reprompt::Protected>,
     // entries that rbw item unlock opened, by id, with when they were
     // last read
     pub unlocked_entries: std::collections::HashMap<String, LastUse>,
@@ -104,12 +103,6 @@ impl State {
         self.timeout.clear();
     }
 
-    // The entry a value belongs to, if the value needs the master password
-    // again.
-    pub fn reprompt_entry(&self, hash: &[u8; 32]) -> Option<&str> {
-        self.master_password_reprompt.get(hash).map(String::as_str)
-    }
-
     pub fn unlock_entry(&mut self, id: &str) {
         self.unlocked_entries
             .insert(id.to_ascii_lowercase(), LastUse::now());
@@ -144,86 +137,37 @@ impl State {
         self.sync_timeout.set(self.sync_timeout_duration);
     }
 
-    // the way we structure the client/agent split in rbw makes the master
-    // password reprompt feature a bit complicated to implement - it would be
-    // a lot easier to just have the client do the prompting, but that would
-    // leave it open to someone reading the cipherstring from the local
-    // database and passing it to the agent directly, bypassing the client.
-    // the agent is the thing that holds the unlocked secrets, so it also
-    // needs to be the thing guarding access to master password reprompt
-    // entries. we only pass individual cipherstrings to the agent though, so
-    // the agent needs to be able to recognize the cipherstrings that need
-    // reprompting, without the additional context of the entry they came
-    // from. in addition, because the reprompt state is stored in the sync db
-    // in plaintext, we can't just read it from the db directly, because
-    // someone could just edit the file on disk before making the request.
-    //
-    // therefore, the solution we choose here is to keep an in-memory set of
-    // cipherstrings that we know correspond to entries with master password
-    // reprompt enabled. this set is only updated when the agent itself does
-    // a sync, so it can't be bypassed by editing the on-disk file directly.
-    // if the agent gets a request for any of those cipherstrings that it saw
-    // marked as master password reprompt during the most recent sync, it
-    // forces a reprompt. each cipherstring maps to its entry's id, so that
-    // rbw item unlock can open one entry for a while.
+    // Learns which values need the master password again from entries the
+    // agent synced from the server.
     pub fn set_master_password_reprompt(
         &mut self,
         entries: &[rbw::db::Entry],
     ) {
-        self.master_password_reprompt.clear();
-
-        let mut hasher = sha2::Sha256::new();
-        for entry in entries {
-            if !entry.master_password_reprompt() {
-                continue;
-            }
-            let mut insert = |s: Option<&str>| {
-                if let Some(s) = s {
-                    if !s.is_empty() {
-                        hasher.update(s);
-                        self.master_password_reprompt.insert(
-                            hasher.finalize_reset().into(),
-                            entry.id.clone(),
-                        );
-                    }
-                }
-            };
-
-            match &entry.data {
-                rbw::db::EntryData::Login { password, totp, .. } => {
-                    insert(password.as_deref());
-                    insert(totp.as_deref());
-                }
-                rbw::db::EntryData::Card { number, code, .. } => {
-                    insert(number.as_deref());
-                    insert(code.as_deref());
-                }
-                rbw::db::EntryData::Identity {
-                    ssn,
-                    passport_number,
-                    ..
-                } => {
-                    insert(ssn.as_deref());
-                    insert(passport_number.as_deref());
-                }
-                rbw::db::EntryData::SecureNote => {}
-                rbw::db::EntryData::SshKey { private_key, .. } => {
-                    insert(private_key.as_deref());
-                }
-            }
-
-            for field in &entry.fields {
-                if field.ty == Some(rbw::api::FieldType::Hidden) {
-                    insert(field.value.as_deref());
-                }
-            }
-        }
-
-        self.master_password_reprompt_initialized = true;
+        self.master_password_reprompt =
+            Some(crate::reprompt::protected(entries));
     }
 
-    pub fn master_password_reprompt_initialized(&self) -> bool {
-        self.master_password_reprompt_initialized
+    // Learns them from the local copy of the vault, if it carries the
+    // agent's MAC of them under the vault key, so that no other program
+    // changed them.
+    pub fn trust_master_password_reprompt(&mut self, db: &rbw::db::Db) {
+        let (Some(keys), Some(mac)) = (&self.priv_key, &db.reprompt_mac)
+        else {
+            return;
+        };
+        let protected = crate::reprompt::protected(&db.entries);
+        if crate::reprompt::verify(keys, &protected, mac) {
+            self.master_password_reprompt = Some(protected);
+        }
+    }
+
+    // The MAC that lets a later agent trust the local copy of the vault,
+    // when the vault is unlocked and the agent knows the protected values.
+    pub fn master_password_reprompt_mac(&self) -> Option<String> {
+        Some(crate::reprompt::mac(
+            self.priv_key.as_ref()?,
+            self.master_password_reprompt.as_ref()?,
+        ))
     }
 
     pub fn last_environment(&self) -> &rbw::protocol::Environment {
