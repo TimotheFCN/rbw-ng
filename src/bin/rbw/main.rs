@@ -507,7 +507,10 @@ enum SshAgent {
         about = "Show whether the agent runs as a service and serves the \
             session's SSH_AUTH_SOCK"
     )]
-    Status,
+    Status {
+        #[arg(long, help = "Display output as JSON")]
+        json: bool,
+    },
     #[command(about = "Print the path of the agent's SSH socket")]
     Socket,
 }
@@ -517,7 +520,7 @@ impl SshAgent {
         match self {
             Self::Install => "install",
             Self::Uninstall => "uninstall",
-            Self::Status => "status",
+            Self::Status { .. } => "status",
             Self::Socket => "socket",
         }
         .to_string()
@@ -768,7 +771,7 @@ fn main() {
         Opt::SshAgent { cmd } => match cmd {
             SshAgent::Install => commands::ssh_agent_install(),
             SshAgent::Uninstall => service::uninstall(),
-            SshAgent::Status => service::status(),
+            SshAgent::Status { json } => service::status(json),
             SshAgent::Socket => {
                 service::socket();
                 Ok(())

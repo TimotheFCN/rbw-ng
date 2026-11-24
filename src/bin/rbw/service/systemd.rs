@@ -27,8 +27,9 @@ pub fn installed(name: &str) -> bool {
     unit_dir().is_ok_and(|dir| dir.join(service_unit(name)).exists())
 }
 
+// The names of the other profiles' services: only one can set the session's
+// SSH_AUTH_SOCK.
 pub fn other_installs(name: &str) -> anyhow::Result<Vec<String>> {
-    let own = ssh_socket_unit(name);
     let dir = unit_dir()?;
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Ok(vec![]);
@@ -36,12 +37,15 @@ pub fn other_installs(name: &str) -> anyhow::Result<Vec<String>> {
     Ok(entries
         .filter_map(Result::ok)
         .filter_map(|entry| entry.file_name().into_string().ok())
-        .filter(|file| {
-            file.starts_with("rbw")
-                && file.ends_with("-agent-ssh.socket")
-                && *file != own
+        .filter_map(|file| {
+            file.strip_suffix("-ssh.socket")
+                .filter(|other| {
+                    other.starts_with("rbw")
+                        && other.ends_with("-agent")
+                        && *other != name
+                })
+                .map(str::to_string)
         })
-        .map(|file| dir.join(file).display().to_string())
         .collect())
 }
 

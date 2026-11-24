@@ -48,7 +48,8 @@
   macOS, Apple's `ssh-agent` keeps `SSH_AUTH_SOCK`, and SSH reaches
   `rbw-agent` through `IdentityAgent` in `~/.ssh/config`, for all hosts or
   some. `rbw ssh-agent uninstall` removes the service, `status` shows what
-  serves SSH, and `socket` prints the SSH socket's path.
+  serves SSH, `status --json` says it for programs, and `socket` prints the
+  SSH socket's path.
 * `rbw-agent --service`, the mode the service runs the agent in: in the
   foreground, with the sockets the service manager passes, and replacing an
   agent that `rbw` started before.

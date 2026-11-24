@@ -220,3 +220,26 @@ yet:
 
 A folder is `{"object":"folder","id":"...","name":"..."}`, as in Bitwarden's
 format. An entry's `folderId` puts it in a folder.
+
+## SSH agent
+
+`rbw ssh-agent install` and `rbw ssh-agent uninstall` need no terminal.
+`rbw ssh-agent status --json` describes the setup of the profile:
+
+```json
+{"supported":true,"installed":true,"otherProfiles":[],"running":true,"socket":"/run/user/1000/rbw/ssh-agent-socket","ssh":{"agent":"rbw","socket":"/run/user/1000/rbw/ssh-agent-socket"}}
+```
+
+* `supported`: the system has launchd or systemd;
+* `installed`: the profile's agent runs as a service;
+* `otherProfiles`: the profiles whose service keeps this one from being
+  installed (on Linux, where only one can set `SSH_AUTH_SOCK`), `null` for
+  the default profile;
+* `running`: the agent runs now. A service starts it when a program
+  connects;
+* `socket`: the socket that serves the profile's SSH keys;
+* `ssh`: the agent `ssh` uses for a host without settings of its own:
+  `agent` is `rbw` (this profile), `other`, `none` or `unknown`, with its
+  `socket`.
+
+The keys the agent serves are the vault's SSH key entries.

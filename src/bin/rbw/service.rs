@@ -49,9 +49,10 @@ pub fn install() -> anyhow::Result<()> {
     let name = name()?;
     if let Some(other) = platform::other_installs(&name)?.first() {
         anyhow::bail!(
-            "{other} already serves SSH keys for another rbw profile, and \
-            only one can; uninstall it first with \
-            `RBW_PROFILE=<profile> rbw ssh-agent uninstall`"
+            "another rbw profile's service already serves SSH keys ({}), \
+            and only one can; uninstall it first with \
+            `RBW_PROFILE=<profile> rbw ssh-agent uninstall`",
+            platform::describe(other)
         );
     }
 
@@ -104,7 +105,34 @@ pub fn uninstall_if_installed() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn status() -> anyhow::Result<()> {
+// rbw ssh-agent status --json, for programs that show the setup.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Status {
+    // whether this system has a service manager rbw supports
+    supported: bool,
+    installed: bool,
+    // the profiles whose service keeps this one from being installed; null
+    // is the default profile
+    other_profiles: Vec<Option<String>>,
+    running: bool,
+    // the socket that serves this profile's keys
+    socket: std::path::PathBuf,
+    // the agent ssh uses for a host without settings of its own
+    ssh: SshStatus,
+}
+
+#[derive(serde::Serialize)]
+struct SshStatus {
+    // rbw, other, none or unknown
+    agent: &'static str,
+    socket: Option<std::path::PathBuf>,
+}
+
+pub fn status(json: bool) -> anyhow::Result<()> {
+    if json {
+        return status_json();
+    }
     let name = name()?;
     let installed = platform::installed(&name);
     let service = if installed {
@@ -170,6 +198,56 @@ pub fn status() -> anyhow::Result<()> {
     );
     println!("SSH_AUTH_SOCK: {auth_sock}");
     Ok(())
+}
+
+fn status_json() -> anyhow::Result<()> {
+    let name = name()?;
+    let socket = ssh_socket(&name);
+    let is_rbw = |path: &std::path::Path| {
+        path == socket || path == rbw::dirs::ssh_agent_socket_file()
+    };
+    let at = |path: std::path::PathBuf| SshStatus {
+        agent: if is_rbw(&path) { "rbw" } else { "other" },
+        socket: Some(path),
+    };
+    let none = SshStatus {
+        agent: "none",
+        socket: None,
+    };
+    let ssh = match ssh_default_agent() {
+        Ok(SshAgent::Configured(path)) => at(path),
+        Ok(SshAgent::Variable { name, .. }) => {
+            std::env::var_os(name).map_or(none, |path| at(path.into()))
+        }
+        Ok(SshAgent::Disabled) => none,
+        Err(_) => SshStatus {
+            agent: "unknown",
+            socket: None,
+        },
+    };
+    let status = Status {
+        supported: platform::check_supported().is_ok(),
+        installed: platform::installed(&name),
+        other_profiles: platform::other_installs(&name)?
+            .iter()
+            .map(|other| profile_of(other))
+            .collect(),
+        running: running_agent().is_some(),
+        socket,
+        ssh,
+    };
+    serde_json::to_writer(std::io::stdout(), &status)
+        .context("failed to write the status")?;
+    println!();
+    Ok(())
+}
+
+// The profile of a service name: rbw-<profile>-agent, or rbw-agent for
+// the default profile.
+fn profile_of(name: &str) -> Option<String> {
+    name.strip_suffix("-agent")
+        .and_then(|dir| dir.strip_prefix("rbw-"))
+        .map(str::to_string)
 }
 
 pub fn socket() {
@@ -575,6 +653,15 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn profiles_of_service_names() {
+        assert_eq!(super::profile_of("rbw-agent"), None);
+        assert_eq!(
+            super::profile_of("rbw-work-agent").as_deref(),
+            Some("work")
+        );
+    }
+
     #[test]
     fn shell_quoting_survives_quotes() {
         assert_eq!(super::shell_quote("a b"), "'a b'");
