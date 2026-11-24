@@ -28,6 +28,8 @@ service.
     back to the master password.
   * `rbw item list|get|create|edit` read and save entries as JSON in
     Bitwarden's item format, by id. Listing leaves secrets out unless asked.
+    `rbw item edit` fails with `conflict` if the entry changed on the server
+    since the `revisionDate` it is given, as `rbw item get` printed it.
   * `rbw item create` and `rbw item edit` save cards, identities and SSH
     keys too. An SSH key's public key and fingerprint come from its private
     key. Listing without secrets shows a card's brand, an identity's names
@@ -108,10 +110,6 @@ service.
     logins.
 * `rbw register` with a wrong API key on Vaultwarden says the key is
   incorrect instead of reporting a server error.
-* `rbw item edit` takes the `revisionDate` of the entry on stdin, and fails
-  with `conflict` if the entry changed on the server since the program read
-  it, not only since the last sync. `rbw item favorite` and `rbw item move`
-  keep the folder or the flag that another device set since the last sync.
 * Logging in or registering with a server address that leads to no Bitwarden
   server says so, instead of failing to parse JSON or, with
   `RBW_ERROR_FORMAT=json`, reporting `not_found`.

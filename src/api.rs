@@ -1981,15 +1981,13 @@ impl Client {
         }
     }
 
-    // A website's icon from the server's icon service, or none if it has
-    // none. Like the official clients' request, it carries the host name
-    // only: no token and no Bitwarden headers, just what reaching the
-    // server takes (the extra headers and the client certificate).
-    // The icon service's image for a host, or None when it has none. It
-    // follows redirects itself: within the server's origin with the extra
-    // headers and client certificate that reaching the server takes, and
-    // elsewhere without them, only over https and to no address of this
-    // computer or its network. A redirect it won't follow means no icon.
+    // The icon service's image for a host, or None when it has none. Like
+    // the official clients' request, it carries the host name only: no
+    // token and no Bitwarden headers. It follows redirects itself: within
+    // the server's origin with the extra headers and client certificate
+    // that reaching the server takes, and elsewhere without them, only over
+    // https and to no address of this computer or its network. A redirect
+    // it won't follow means no icon.
     pub fn icon(
         &self,
         icons_url: &str,

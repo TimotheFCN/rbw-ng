@@ -30,10 +30,9 @@ pub fn installed(name: &str) -> bool {
     plist_path(name).is_ok_and(|path| path.exists())
 }
 
-// Each profile has a socket of its own, and none takes SSH_AUTH_SOCK.
+// Each profile's job has a socket of its own, and none takes SSH_AUTH_SOCK,
+// so they don't keep each other out.
 #[allow(clippy::unnecessary_wraps)]
-// Each profile's job has a socket of its own, so they don't keep each other
-// out.
 pub fn other_installs(_name: &str) -> anyhow::Result<Vec<String>> {
     Ok(vec![])
 }
