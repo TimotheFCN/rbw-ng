@@ -292,6 +292,9 @@ pub enum Error {
 
     #[error("invalid profile: {reason}")]
     InvalidProfile { reason: String },
+
+    #[error("invalid url")]
+    InvalidUrl { source: url::ParseError },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

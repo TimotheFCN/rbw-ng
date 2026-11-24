@@ -1248,6 +1248,9 @@ const BITWARDEN_CLIENT_VERSION: &str = "2024.12.0";
 // to 50 kB.
 const ICON_SIZE_LIMIT: u64 = 1024 * 1024;
 const ICON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+// Vaultwarden with an external icon service answers with a redirect, which
+// can lead to one more.
+const ICON_REDIRECTS: usize = 5;
 
 // DeviceType.LinuxDesktop, as per Bitwarden API device types.
 const DEVICE_TYPE: u8 = 8;
@@ -1367,16 +1370,20 @@ impl Client {
     // Bitwarden-Client-Version header, the server refuses to edit items
     // that have their own encryption key.
     fn blocking_reqwest_client(&self) -> Result<reqwest::blocking::Client> {
-        self.blocking_reqwest_client_with(self.default_headers())
+        self.blocking_reqwest_client_with(
+            self.default_headers(),
+            self.redirect_policy(),
+        )
     }
 
     fn blocking_reqwest_client_with(
         &self,
         headers: axum::http::HeaderMap,
+        redirect: reqwest::redirect::Policy,
     ) -> Result<reqwest::blocking::Client> {
         let mut builder = reqwest::blocking::Client::builder()
             .user_agent(Self::user_agent())
-            .redirect(self.redirect_policy())
+            .redirect(redirect)
             .default_headers(headers);
         if let Some(client_cert_path) = self.client_cert_path.as_ref() {
             let buf = std::fs::read(client_cert_path).map_err(|e| {
@@ -1935,36 +1942,82 @@ impl Client {
     // none. Like the official clients' request, it carries the host name
     // only: no token and no Bitwarden headers, just what reaching the
     // server takes (the extra headers and the client certificate).
+    // The icon service's image for a host, or None when it has none. It
+    // follows redirects itself: within the server's origin with the extra
+    // headers and client certificate that reaching the server takes, and
+    // elsewhere without them, only over https and to no address of this
+    // computer or its network. A redirect it won't follow means no icon.
     pub fn icon(
         &self,
         icons_url: &str,
         host: &str,
     ) -> Result<Option<Vec<u8>>> {
-        let client =
-            self.blocking_reqwest_client_with(self.extra_headers.clone())?;
-        let res = client
-            .get(format!("{icons_url}/{host}/icon.png"))
-            .timeout(ICON_TIMEOUT)
-            .send()
-            .map_err(|source| Error::Reqwest { source })?;
-        match res.status() {
-            reqwest::StatusCode::OK => {
-                let mut icon = vec![];
-                std::io::Read::read_to_end(
-                    &mut std::io::Read::take(res, ICON_SIZE_LIMIT + 1),
-                    &mut icon,
+        let mut url =
+            url::Url::parse(&format!("{icons_url}/{host}/icon.png"))
+                .map_err(|source| Error::InvalidUrl { source })?;
+        let server = url.origin();
+        let to_server = self.blocking_reqwest_client_with(
+            self.extra_headers.clone(),
+            reqwest::redirect::Policy::none(),
+        )?;
+        let elsewhere = reqwest::blocking::Client::builder()
+            .user_agent(Self::user_agent())
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|source| Error::CreateReqwestClient { source })?;
+        let deadline = std::time::Instant::now() + ICON_TIMEOUT;
+        for _ in 0..=ICON_REDIRECTS {
+            let client = if url.origin() == server {
+                &to_server
+            } else {
+                &elsewhere
+            };
+            let res = client
+                .get(url.clone())
+                .timeout(
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now()),
                 )
-                .map_err(|source| Error::IconRead { source })?;
-                if icon.len() as u64 > ICON_SIZE_LIMIT {
-                    return Err(Error::IconTooLarge);
+                .send()
+                .map_err(|source| Error::Reqwest { source })?;
+            match res.status() {
+                reqwest::StatusCode::OK => {
+                    let mut icon = vec![];
+                    std::io::Read::read_to_end(
+                        &mut std::io::Read::take(res, ICON_SIZE_LIMIT + 1),
+                        &mut icon,
+                    )
+                    .map_err(|source| Error::IconRead { source })?;
+                    if icon.len() as u64 > ICON_SIZE_LIMIT {
+                        return Err(Error::IconTooLarge);
+                    }
+                    return Ok(Some(icon));
                 }
-                Ok(Some(icon))
+                reqwest::StatusCode::NOT_FOUND => return Ok(None),
+                status if status.is_redirection() => {
+                    let next = res
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|location| location.to_str().ok())
+                        .and_then(|location| url.join(location).ok());
+                    match next {
+                        Some(next)
+                            if next.origin() == server
+                                || icon_redirect_allowed(&next) =>
+                        {
+                            url = next;
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                status => {
+                    return Err(Error::RequestFailed {
+                        status: status.as_u16(),
+                    })
+                }
             }
-            reqwest::StatusCode::NOT_FOUND => Ok(None),
-            status => Err(Error::RequestFailed {
-                status: status.as_u16(),
-            }),
         }
+        Ok(None)
     }
 
     pub fn folders(
@@ -2320,6 +2373,44 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
     Error::RequestFailed { status: code }
 }
 
+// Whether an icon may come from this address outside the server: an https
+// one whose host isn't this computer or an address of a private network.
+// A name can still resolve to such an address, but the server chose to send
+// it there.
+fn icon_redirect_allowed(url: &url::Url) -> bool {
+    let public_v4 = |ip: std::net::Ipv4Addr| {
+        let [a, b, ..] = ip.octets();
+        !(ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_documentation()
+            // shared address space, which carrier-grade NAT and Tailscale use
+            || (a == 100 && (64..128).contains(&b)))
+    };
+    url.scheme() == "https"
+        && match url.host() {
+            Some(url::Host::Domain(domain)) => {
+                let domain = domain.trim_end_matches('.').to_lowercase();
+                domain != "localhost" && !domain.ends_with(".localhost")
+            }
+            Some(url::Host::Ipv4(ip)) => public_v4(ip),
+            Some(url::Host::Ipv6(ip)) => ip.to_ipv4_mapped().map_or_else(
+                || {
+                    let first = ip.segments()[0];
+                    !(ip.is_loopback()
+                        || ip.is_unspecified()
+                        // unique local and link-local addresses
+                        || (first & 0xfe00) == 0xfc00
+                        || (first & 0xffc0) == 0xfe80)
+                },
+                public_v4,
+            ),
+            None => false,
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2393,6 +2484,114 @@ mod tests {
         // the headers rbw needs are still there
         assert!(head.contains("\r\nbitwarden-client-name: cli\r\n"));
         assert!(head.contains("\r\ndevice-type: 8\r\n"));
+    }
+
+    // An icon server: answers each path with a status, a Location and a
+    // body, and hands over the head of each request it gets.
+    fn mock_icons(
+        answers: Vec<(&'static str, u16, String, &'static [u8])>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (head_tx, head_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&request).to_string();
+                let path = head.split(' ').nth(1).unwrap_or_default();
+                let (_, status, location, body) = answers
+                    .iter()
+                    .find(|(known, ..)| *known == path)
+                    .unwrap();
+                let location = if location.is_empty() {
+                    String::new()
+                } else {
+                    format!("Location: {location}\r\n")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n{location}\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+                let _ = head_tx.send(head);
+            }
+        });
+        (url, head_rx)
+    }
+
+    #[test]
+    fn icons_follow_redirects_on_the_server_with_its_headers() {
+        let (url, heads) = mock_icons(vec![
+            ("/icons/a.example/icon.png", 302, "/cache/a.png".into(), b""),
+            ("/cache/a.png", 200, String::new(), b"\x89PNG"),
+        ]);
+        let client =
+            Client::new(&url, &url, &url, None, cloudflare_headers());
+        assert_eq!(
+            client.icon(&format!("{url}/icons"), "a.example").unwrap(),
+            Some(b"\x89PNG".to_vec())
+        );
+        for _ in 0..2 {
+            let head = heads.recv().unwrap().to_lowercase();
+            assert!(head.contains("\r\ncf-access-client-secret: secret\r\n"));
+        }
+    }
+
+    #[test]
+    fn icons_dont_follow_redirects_to_the_local_network() {
+        let (elsewhere, elsewhere_heads) =
+            mock_icons(vec![("/a.png", 200, String::new(), b"\x89PNG")]);
+        let (url, _) = mock_icons(vec![(
+            "/icons/a.example/icon.png",
+            307,
+            format!("{elsewhere}/a.png"),
+            b"",
+        )]);
+        let client =
+            Client::new(&url, &url, &url, None, axum::http::HeaderMap::new());
+        assert_eq!(
+            client.icon(&format!("{url}/icons"), "a.example").unwrap(),
+            None
+        );
+        assert!(elsewhere_heads.try_recv().is_err());
+    }
+
+    #[test]
+    fn icons_come_from_public_https_addresses_only() {
+        for (url, allowed) in [
+            ("https://icons.duckduckgo.com/ip3/a.example.ico", true),
+            ("https://www.google.com/s2/favicons?domain=a.example", true),
+            ("https://8.8.8.8/a.png", true),
+            ("https://[2606:4700::1111]/a.png", true),
+            ("http://icons.example/a.png", false),
+            ("https://localhost/a.png", false),
+            ("https://icons.localhost./a.png", false),
+            ("https://127.0.0.1/a.png", false),
+            ("https://10.0.0.1/a.png", false),
+            ("https://192.168.1.1/a.png", false),
+            ("https://169.254.169.254/latest/meta-data", false),
+            ("https://100.100.100.100/a.png", false),
+            ("https://[::1]/a.png", false),
+            ("https://[fd00::1]/a.png", false),
+            ("https://[fe80::1]/a.png", false),
+            ("https://[::ffff:127.0.0.1]/a.png", false),
+        ] {
+            let url = url::Url::parse(url).unwrap();
+            assert_eq!(icon_redirect_allowed(&url), allowed, "{url}");
+        }
     }
 
     #[test]

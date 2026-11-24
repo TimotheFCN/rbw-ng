@@ -312,10 +312,13 @@ bitwarden.eu, and `/icons` on a self-hosted server. It needs no login. The
 image is what the service sends, usually a PNG or an ICO of a few kilobytes,
 at most 1 MiB. The request carries the host name and nothing about the
 account: no token and no Bitwarden headers, only the extra headers and client
-certificate that reaching the server takes. It fails with `not_found` when
-the service has no icon, and with `invalid_input` for anything but a host
-name, and for `.onion` and `.i2p` sites, whose names the official clients
-never send to the icon service.
+certificate that reaching the server takes. A Vaultwarden server with an
+external icon service redirects to it: `rbw` follows such a redirect only to
+an `https` address that isn't on this computer or a private network, without
+the extra headers and the certificate. It fails with `not_found` when the
+service has no icon, or redirects anywhere else, and with `invalid_input`
+for anything but a host name, and for `.onion` and `.i2p` sites, whose names
+the official clients never send to the icon service.
 
 The official clients show the icon of a login's first website, when it is
 an `http` or `https` address or a bare host name with a dot. Cache the icons:
