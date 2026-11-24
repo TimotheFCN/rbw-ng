@@ -110,15 +110,17 @@ fn item_json(
             exp_month,
             exp_year,
             code,
-        } if secrets => {
-            item["card"] = json!({
-                "cardholderName": open(entry, cardholder_name.as_deref()),
-                "brand": open(entry, brand.as_deref()),
-                "number": open(entry, number.as_deref()),
-                "expMonth": open(entry, exp_month.as_deref()),
-                "expYear": open(entry, exp_year.as_deref()),
-                "code": open(entry, code.as_deref()),
-            });
+        } => {
+            let mut card = json!({ "brand": open(entry, brand.as_deref()) });
+            if secrets {
+                card["cardholderName"] =
+                    json!(open(entry, cardholder_name.as_deref()));
+                card["number"] = json!(open(entry, number.as_deref()));
+                card["expMonth"] = json!(open(entry, exp_month.as_deref()));
+                card["expYear"] = json!(open(entry, exp_year.as_deref()));
+                card["code"] = json!(open(entry, code.as_deref()));
+            }
+            item["card"] = card;
         }
         rbw::db::EntryData::Identity {
             title,
@@ -138,39 +140,49 @@ fn item_json(
             license_number,
             passport_number,
             username,
-        } if secrets => {
-            item["identity"] = json!({
+        } => {
+            let mut identity = json!({
                 "title": open(entry, title.as_deref()),
                 "firstName": open(entry, first_name.as_deref()),
                 "middleName": open(entry, middle_name.as_deref()),
                 "lastName": open(entry, last_name.as_deref()),
-                "address1": open(entry, address1.as_deref()),
-                "address2": open(entry, address2.as_deref()),
-                "address3": open(entry, address3.as_deref()),
-                "city": open(entry, city.as_deref()),
-                "state": open(entry, state.as_deref()),
-                "postalCode": open(entry, postal_code.as_deref()),
-                "country": open(entry, country.as_deref()),
-                "phone": open(entry, phone.as_deref()),
-                "email": open(entry, email.as_deref()),
-                "ssn": open(entry, ssn.as_deref()),
-                "licenseNumber": open(entry, license_number.as_deref()),
-                "passportNumber": open(entry, passport_number.as_deref()),
-                "username": open(entry, username.as_deref()),
             });
+            if secrets {
+                for (key, value) in [
+                    ("address1", address1),
+                    ("address2", address2),
+                    ("address3", address3),
+                    ("city", city),
+                    ("state", state),
+                    ("postalCode", postal_code),
+                    ("country", country),
+                    ("phone", phone),
+                    ("email", email),
+                    ("ssn", ssn),
+                    ("licenseNumber", license_number),
+                    ("passportNumber", passport_number),
+                    ("username", username),
+                ] {
+                    identity[key] = json!(open(entry, value.as_deref()));
+                }
+            }
+            item["identity"] = identity;
         }
         rbw::db::EntryData::SshKey {
             private_key,
             public_key,
             fingerprint,
-        } if secrets => {
-            item["sshKey"] = json!({
-                "privateKey": open(entry, private_key.as_deref()),
+        } => {
+            let mut key = json!({
                 "publicKey": open(entry, public_key.as_deref()),
                 "keyFingerprint": open(entry, fingerprint.as_deref()),
             });
+            if secrets {
+                key["privateKey"] =
+                    json!(open(entry, private_key.as_deref()));
+            }
+            item["sshKey"] = key;
         }
-        _ => {}
     }
     item
 }
@@ -310,6 +322,9 @@ struct ItemIn {
     folder_id: Option<String>,
     organization_id: Option<String>,
     login: Option<LoginIn>,
+    card: Option<CardIn>,
+    identity: Option<IdentityIn>,
+    ssh_key: Option<SshKeyIn>,
     #[serde(default)]
     fields: Option<Vec<FieldIn>>,
 }
@@ -322,6 +337,47 @@ struct LoginIn {
     totp: Option<String>,
     uris: Option<Vec<UriIn>>,
     fido2_credentials: Option<Vec<Value>>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct CardIn {
+    cardholder_name: Option<String>,
+    brand: Option<String>,
+    number: Option<String>,
+    exp_month: Option<String>,
+    exp_year: Option<String>,
+    code: Option<String>,
+}
+
+#[derive(serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct IdentityIn {
+    title: Option<String>,
+    first_name: Option<String>,
+    middle_name: Option<String>,
+    last_name: Option<String>,
+    address1: Option<String>,
+    address2: Option<String>,
+    address3: Option<String>,
+    city: Option<String>,
+    state: Option<String>,
+    postal_code: Option<String>,
+    country: Option<String>,
+    phone: Option<String>,
+    email: Option<String>,
+    ssn: Option<String>,
+    license_number: Option<String>,
+    passport_number: Option<String>,
+    username: Option<String>,
+}
+
+// Only the private key counts: the public key and the fingerprint are
+// taken from it.
+#[derive(serde::Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+struct SshKeyIn {
+    private_key: Option<String>,
 }
 
 #[derive(serde::Deserialize, Debug)]
@@ -373,10 +429,10 @@ fn read_item(input: &str) -> anyhow::Result<ItemIn> {
         ));
     }
     match item.ty {
-        LOGIN | SECURE_NOTE => Ok(item),
-        _ => Err(coded(
-            ErrorCode::Unsupported,
-            "only logins and secure notes can be saved",
+        LOGIN | SECURE_NOTE | CARD | IDENTITY | SSH_KEY => Ok(item),
+        ty => Err(coded(
+            ErrorCode::InvalidInput,
+            format!("unknown item type {ty}"),
         )),
     }
 }
@@ -446,6 +502,141 @@ fn encrypt_uris(
         .collect()
 }
 
+// The type's part of an item, encrypted for the entry it replaces, if any.
+// A new password goes into the history.
+fn encrypt_data(
+    item: &ItemIn,
+    entry: Option<&rbw::db::Entry>,
+    history: &mut Vec<rbw::db::HistoryEntry>,
+) -> anyhow::Result<rbw::db::EntryData> {
+    let value = |value: Option<&str>| encrypt(value, entry);
+    Ok(match item.ty {
+        LOGIN => {
+            let default = LoginIn::default();
+            let login = item.login.as_ref().unwrap_or(&default);
+            let password = match entry.map(|entry| (entry, &entry.data)) {
+                Some((
+                    entry,
+                    rbw::db::EntryData::Login {
+                        password: old_password,
+                        ..
+                    },
+                )) => {
+                    let current = old_password
+                        .as_deref()
+                        .map(|cipherstring| decrypt(entry, cipherstring))
+                        .transpose()?
+                        .flatten();
+                    crate::commands::edit_password(
+                        entry,
+                        old_password.as_deref(),
+                        current.as_deref(),
+                        login.password.as_deref(),
+                        history,
+                    )?
+                }
+                _ => value(login.password.as_deref())?,
+            };
+            rbw::db::EntryData::Login {
+                username: value(login.username.as_deref())?,
+                password,
+                totp: value(login.totp.as_deref())?,
+                uris: encrypt_uris(login, entry)?,
+            }
+        }
+        CARD => {
+            let default = CardIn::default();
+            let card = item.card.as_ref().unwrap_or(&default);
+            rbw::db::EntryData::Card {
+                cardholder_name: value(card.cardholder_name.as_deref())?,
+                number: value(card.number.as_deref())?,
+                brand: value(card.brand.as_deref())?,
+                exp_month: value(card.exp_month.as_deref())?,
+                exp_year: value(card.exp_year.as_deref())?,
+                code: value(card.code.as_deref())?,
+            }
+        }
+        IDENTITY => {
+            let default = IdentityIn::default();
+            let identity = item.identity.as_ref().unwrap_or(&default);
+            rbw::db::EntryData::Identity {
+                title: value(identity.title.as_deref())?,
+                first_name: value(identity.first_name.as_deref())?,
+                middle_name: value(identity.middle_name.as_deref())?,
+                last_name: value(identity.last_name.as_deref())?,
+                address1: value(identity.address1.as_deref())?,
+                address2: value(identity.address2.as_deref())?,
+                address3: value(identity.address3.as_deref())?,
+                city: value(identity.city.as_deref())?,
+                state: value(identity.state.as_deref())?,
+                postal_code: value(identity.postal_code.as_deref())?,
+                country: value(identity.country.as_deref())?,
+                phone: value(identity.phone.as_deref())?,
+                email: value(identity.email.as_deref())?,
+                ssn: value(identity.ssn.as_deref())?,
+                license_number: value(identity.license_number.as_deref())?,
+                passport_number: value(identity.passport_number.as_deref())?,
+                username: value(identity.username.as_deref())?,
+            }
+        }
+        SSH_KEY => {
+            let private_key = item
+                .ssh_key
+                .as_ref()
+                .and_then(|key| key.private_key.as_deref())
+                .unwrap_or_default();
+            let (public_key, fingerprint) = ssh_public_key(private_key)?;
+            rbw::db::EntryData::SshKey {
+                private_key: value(Some(private_key))?,
+                public_key: value(Some(&public_key))?,
+                fingerprint: value(Some(&fingerprint))?,
+            }
+        }
+        _ => rbw::db::EntryData::SecureNote,
+    })
+}
+
+fn decrypt(
+    entry: &rbw::db::Entry,
+    cipherstring: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(
+        crate::actions::decrypt_many(vec![rbw::protocol::DecryptItem {
+            cipherstring: cipherstring.to_string(),
+            entry_key: entry.key.clone(),
+            org_id: entry.org_id.clone(),
+        }])?
+        .remove(0)
+        .ok(),
+    )
+}
+
+// The public key and SHA-256 fingerprint of an OpenSSH private key, as the
+// official clients store them.
+fn ssh_public_key(private_key: &str) -> anyhow::Result<(String, String)> {
+    let invalid = |message: &str| coded(ErrorCode::InvalidInput, message);
+    if private_key.trim().is_empty() {
+        return Err(invalid("an SSH key needs its private key"));
+    }
+    let key = ssh_agent_lib::ssh_key::PrivateKey::from_openssh(private_key)
+        .map_err(|_| {
+        invalid("the private key isn't an OpenSSH private key")
+    })?;
+    if key.is_encrypted() {
+        return Err(invalid(
+            "the private key has a passphrase; the SSH agent needs it without",
+        ));
+    }
+    let public = key.public_key();
+    let public_key = public.to_openssh().map_err(|_| {
+        invalid("the private key's public key can't be written")
+    })?;
+    let fingerprint = public
+        .fingerprint(ssh_agent_lib::ssh_key::HashAlg::Sha256)
+        .to_string();
+    Ok((public_key, fingerprint))
+}
+
 // After a change: the item as the server saved it, from a fresh sync,
 // without its secrets.
 fn print_saved(id: &str) -> anyhow::Result<()> {
@@ -479,17 +670,7 @@ pub fn create() -> anyhow::Result<()> {
     let name = crate::actions::encrypt(&item.name, None, None)?;
     let notes = encrypt(item.notes.as_deref(), None)?;
     let fields = encrypt_fields(item.fields.as_deref().unwrap_or(&[]), None)?;
-    let data = if item.ty == LOGIN {
-        let login = item.login.unwrap_or_default();
-        rbw::db::EntryData::Login {
-            username: encrypt(login.username.as_deref(), None)?,
-            password: encrypt(login.password.as_deref(), None)?,
-            totp: encrypt(login.totp.as_deref(), None)?,
-            uris: encrypt_uris(&login, None)?,
-        }
-    } else {
-        rbw::db::EntryData::SecureNote
-    };
+    let data = encrypt_data(&item, None, &mut vec![])?;
     let (_, saved) = rbw::actions::add(
         &access_token,
         &refresh_token,
@@ -536,41 +717,7 @@ pub fn edit(id: &str) -> anyhow::Result<()> {
     let fields =
         encrypt_fields(item.fields.as_deref().unwrap_or(&[]), Some(entry))?;
     let mut history = entry.history.clone();
-    let data = match &entry.data {
-        rbw::db::EntryData::Login {
-            password: old_password,
-            ..
-        } => {
-            let login = item.login.unwrap_or_default();
-            let current = old_password
-                .as_deref()
-                .map(|cipherstring| {
-                    crate::actions::decrypt_many(vec![
-                        rbw::protocol::DecryptItem {
-                            cipherstring: cipherstring.to_string(),
-                            entry_key: entry.key.clone(),
-                            org_id: entry.org_id.clone(),
-                        },
-                    ])
-                    .map(|mut plaintexts| plaintexts.remove(0).ok())
-                })
-                .transpose()?
-                .flatten();
-            rbw::db::EntryData::Login {
-                username: encrypt(login.username.as_deref(), Some(entry))?,
-                password: crate::commands::edit_password(
-                    entry,
-                    old_password.as_deref(),
-                    current.as_deref(),
-                    login.password.as_deref(),
-                    &mut history,
-                )?,
-                totp: encrypt(login.totp.as_deref(), Some(entry))?,
-                uris: encrypt_uris(&login, Some(entry))?,
-            }
-        }
-        _ => rbw::db::EntryData::SecureNote,
-    };
+    let data = encrypt_data(&item, Some(entry), &mut history)?;
     rbw::actions::edit(
         &access_token,
         &refresh_token,
@@ -606,7 +753,7 @@ mod test {
     #[test]
     fn refuses_what_it_cant_save() {
         for item in [
-            r#"{"type":3,"name":"Card"}"#,
+            r#"{"type":9,"name":"Unknown"}"#,
             r#"{"type":1,"name":"x","organizationId":"org"}"#,
             r#"{"type":1,"name":"x","login":{"fido2Credentials":[{}]}}"#,
         ] {
@@ -616,5 +763,38 @@ mod test {
             r#"{"type":1,"name":"x","login":{"fido2Credentials":[]}}"#
         )
         .is_ok());
+        for ty in [CARD, IDENTITY, SSH_KEY] {
+            let item = format!(r#"{{"type":{ty},"name":"x"}}"#);
+            assert!(read_item(&item).is_ok(), "{item}");
+        }
+    }
+
+    #[test]
+    fn ssh_keys_get_their_public_key_from_the_private_key() {
+        let private_key = "-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACC4DOVa+kn8HZu7XPoSipFq+oUfoZbqOgcTIHmhNyxV9gAAAJAVDmEWFQ5h
+FgAAAAtzc2gtZWQyNTUxOQAAACC4DOVa+kn8HZu7XPoSipFq+oUfoZbqOgcTIHmhNyxV9g
+AAAEDPhuqJUm+QNatlbazPhiaEyM0VmpB6TVIsEBBU6Xijx7gM5Vr6Sfwdm7tc+hKKkWr6
+hR+hluo6BxMgeaE3LFX2AAAACHRlc3RAcmJ3AQIDBAU=
+-----END OPENSSH PRIVATE KEY-----
+";
+        let (public_key, fingerprint) = ssh_public_key(private_key).unwrap();
+        assert_eq!(
+            public_key,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILgM5Vr6Sfwdm7tc+hKKkWr6hR+hluo6BxMgeaE3LFX2 test@rbw"
+        );
+        assert_eq!(
+            fingerprint,
+            "SHA256:82tRvuz0hLHtR5dkHl65L2UtySKaBT2BHA254wi5bkc"
+        );
+        for invalid in [
+            "",
+            "ssh-ed25519 AAAA",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+        ] {
+            let error = ssh_public_key(invalid).unwrap_err();
+            assert_eq!(rbw::error::code(&error), ErrorCode::InvalidInput);
+        }
     }
 }

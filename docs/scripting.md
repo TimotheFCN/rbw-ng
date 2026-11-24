@@ -149,10 +149,12 @@ never by name.
 | `rbw item create` | adds the entry on stdin and prints it as saved |
 | `rbw item edit ID` | replaces the entry with the one on stdin and prints it as saved |
 
-Without secrets, an entry has no `login.password`, `login.totp`, `notes`,
-`fields` or `passwordHistory`. `login.hasTotp`, which isn't part of
-Bitwarden's format, says whether the login has a code. Listing without secrets
-is also faster, since only names, usernames and addresses are decrypted.
+Without secrets, an entry has no `notes`, `fields` or `passwordHistory`. A
+login has its username and addresses, and `login.hasTotp`, which isn't part
+of Bitwarden's format, says whether it has a code. A card has only its
+`brand`, an identity its `title` and names, and an SSH key its `publicKey`
+and `keyFingerprint`. Listing without secrets is also faster, since only
+these values are decrypted.
 
 Archived entries are left out of `rbw item list`. An unknown id, or a field
 the entry doesn't have, fails with `not_found`.
@@ -160,9 +162,13 @@ the entry doesn't have, fails with `not_found`.
 `create` and `edit` take JSON or base64 JSON (what `bw encode` makes) on stdin.
 They print the entry as the server saved it, without secrets. They save:
 
-* logins and secure notes;
+* logins, secure notes, cards, identities and SSH keys;
 * the name, notes and folder;
-* the username, password, TOTP secret and addresses with their match types;
+* a login's username, password, TOTP secret and addresses with their match
+  types;
+* every value of a card and of an identity;
+* an SSH key's private key, in OpenSSH format and without a passphrase. The
+  public key and the fingerprint are taken from it;
 * custom fields.
 
 Other keys, such as `id`, `object` or `collectionIds`, are ignored. `edit`
@@ -175,5 +181,4 @@ server in the meantime, the edit fails instead of overwriting the change.
 These aren't supported yet:
 
 * entries in organizations;
-* saving passkeys (`login.fido2Credentials`);
-* saving cards, identities and SSH keys.
+* saving passkeys (`login.fido2Credentials`).

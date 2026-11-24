@@ -731,7 +731,11 @@ struct CipherSshKey {
     private_key: Option<String>,
     #[serde(rename = "PublicKey", alias = "publicKey")]
     public_key: Option<String>,
-    #[serde(rename = "Fingerprint", alias = "keyFingerprint")]
+    #[serde(
+        rename = "KeyFingerprint",
+        alias = "keyFingerprint",
+        alias = "Fingerprint"
+    )]
     fingerprint: Option<String>,
 }
 
@@ -827,7 +831,7 @@ fn cipher_type(data: &crate::db::EntryData) -> u32 {
         crate::db::EntryData::SecureNote => 2,
         crate::db::EntryData::Card { .. } => 3,
         crate::db::EntryData::Identity { .. } => 4,
-        crate::db::EntryData::SshKey { .. } => unreachable!(),
+        crate::db::EntryData::SshKey { .. } => 5,
     }
 }
 
@@ -870,14 +874,16 @@ fn cipher_fields(fields: &[crate::db::Field]) -> Vec<CipherField> {
 }
 
 // the type-specific part of a cipher request, of which exactly one is set
-fn cipher_req_data(
-    data: &crate::db::EntryData,
-) -> (
-    Option<CipherLogin>,
-    Option<CipherCard>,
-    Option<CipherIdentity>,
-    Option<CipherSecureNote>,
-) {
+#[derive(Default)]
+struct CipherReqData {
+    login: Option<CipherLogin>,
+    card: Option<CipherCard>,
+    identity: Option<CipherIdentity>,
+    secure_note: Option<CipherSecureNote>,
+    ssh_key: Option<CipherSshKey>,
+}
+
+fn cipher_req_data(data: &crate::db::EntryData) -> CipherReqData {
     match data {
         crate::db::EntryData::Login {
             username,
@@ -904,7 +910,10 @@ fn cipher_req_data(
                 totp: totp.clone(),
                 uris,
             };
-            (Some(login), None, None, None)
+            CipherReqData {
+                login: Some(login),
+                ..CipherReqData::default()
+            }
         }
         crate::db::EntryData::Card {
             cardholder_name,
@@ -922,7 +931,10 @@ fn cipher_req_data(
                 exp_year: exp_year.clone(),
                 code: code.clone(),
             };
-            (None, Some(card), None, None)
+            CipherReqData {
+                card: Some(card),
+                ..CipherReqData::default()
+            }
         }
         crate::db::EntryData::Identity {
             title,
@@ -962,12 +974,27 @@ fn cipher_req_data(
                 passport_number: passport_number.clone(),
                 username: username.clone(),
             };
-            (None, None, Some(identity), None)
+            CipherReqData {
+                identity: Some(identity),
+                ..CipherReqData::default()
+            }
         }
-        crate::db::EntryData::SecureNote => {
-            (None, None, None, Some(CipherSecureNote { ty: Some(0) }))
-        }
-        crate::db::EntryData::SshKey { .. } => unreachable!(),
+        crate::db::EntryData::SecureNote => CipherReqData {
+            secure_note: Some(CipherSecureNote { ty: Some(0) }),
+            ..CipherReqData::default()
+        },
+        crate::db::EntryData::SshKey {
+            private_key,
+            public_key,
+            fingerprint,
+        } => CipherReqData {
+            ssh_key: Some(CipherSshKey {
+                private_key: private_key.clone(),
+                public_key: public_key.clone(),
+                fingerprint: fingerprint.clone(),
+            }),
+            ..CipherReqData::default()
+        },
     }
 }
 
@@ -979,16 +1006,17 @@ fn ciphers_post_req(
     notes: Option<&str>,
     folder_id: Option<&str>,
 ) -> CiphersPostReq {
-    let (login, card, identity, secure_note) = cipher_req_data(data);
+    let data_req = cipher_req_data(data);
     CiphersPostReq {
         ty: cipher_type(data),
         folder_id: folder_id.map(std::string::ToString::to_string),
         name: name.to_string(),
         notes: notes.map(std::string::ToString::to_string),
-        login,
-        card,
-        identity,
-        secure_note,
+        login: data_req.login,
+        card: data_req.card,
+        identity: data_req.identity,
+        secure_note: data_req.secure_note,
+        ssh_key: data_req.ssh_key,
         encrypted_for: user_id.to_string(),
         fields: cipher_fields(fields),
     }
@@ -1044,7 +1072,7 @@ fn keep_server_data(
         }
     }
 
-    for ty in ["login", "card", "identity", "secureNote"] {
+    for ty in ["login", "card", "identity", "secureNote", "sshKey"] {
         let Some(server_data) = get_ignore_case(server, ty)
             .and_then(serde_json::Value::as_object)
         else {
@@ -1139,6 +1167,8 @@ struct CiphersPostReq {
     identity: Option<CipherIdentity>,
     #[serde(rename = "secureNote")]
     secure_note: Option<CipherSecureNote>,
+    #[serde(rename = "sshKey")]
+    ssh_key: Option<CipherSshKey>,
     #[serde(rename = "encryptedFor")]
     encrypted_for: String,
     fields: Vec<CipherField>,
@@ -1160,6 +1190,8 @@ struct CiphersPutReq {
     fields: Vec<CipherField>,
     #[serde(rename = "secureNote")]
     secure_note: Option<CipherSecureNote>,
+    #[serde(rename = "sshKey")]
+    ssh_key: Option<CipherSshKey>,
     #[serde(rename = "passwordHistory")]
     password_history: Vec<CiphersPutReqHistory>,
     key: Option<String>,
@@ -1717,17 +1749,18 @@ impl Client {
         key: Option<&str>,
         last_known_revision_date: Option<&str>,
     ) -> Result<SavedCipher> {
-        let (login, card, identity, secure_note) = cipher_req_data(data);
+        let data_req = cipher_req_data(data);
         let req = CiphersPutReq {
             ty: cipher_type(data),
             folder_id: folder_uuid.map(std::string::ToString::to_string),
             organization_id: org_id.map(std::string::ToString::to_string),
             name: name.to_string(),
             notes: notes.map(std::string::ToString::to_string),
-            login,
-            card,
-            identity,
-            secure_note,
+            login: data_req.login,
+            card: data_req.card,
+            identity: data_req.identity,
+            secure_note: data_req.secure_note,
+            ssh_key: data_req.ssh_key,
             fields: cipher_fields(fields),
             password_history: history
                 .iter()
@@ -2526,6 +2559,7 @@ mod tests {
                 "card": null,
                 "identity": null,
                 "secureNote": { "type": 0 },
+                "sshKey": null,
                 "encryptedFor": "user-id",
                 "fields": [{
                     "Type": 1,

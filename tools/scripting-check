@@ -95,6 +95,59 @@ def register(server, email, password):
     })
 
 
+# an unencrypted ed25519 key, made for this check
+SSH_PRIVATE_KEY = """-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACC4DOVa+kn8HZu7XPoSipFq+oUfoZbqOgcTIHmhNyxV9gAAAJAVDmEWFQ5h
+FgAAAAtzc2gtZWQyNTUxOQAAACC4DOVa+kn8HZu7XPoSipFq+oUfoZbqOgcTIHmhNyxV9g
+AAAEDPhuqJUm+QNatlbazPhiaEyM0VmpB6TVIsEBBU6Xijx7gM5Vr6Sfwdm7tc+hKKkWr6
+hR+hluo6BxMgeaE3LFX2AAAACHRlc3RAcmJ3AQIDBAU=
+-----END OPENSSH PRIVATE KEY-----
+"""
+SSH_FINGERPRINT = "SHA256:82tRvuz0hLHtR5dkHl65L2UtySKaBT2BHA254wi5bkc"
+
+
+def kinds(rbw, quiet):
+    """Cards, identities and SSH keys, saved and read back."""
+    card = rbw.json("item", "create", env=quiet, stdin=json.dumps({
+        "type": 3, "name": "Visa", "card": {
+            "cardholderName": "Alex Martin", "brand": "Visa",
+            "number": "4111111111111111", "expMonth": "09", "expYear": "2029",
+            "code": "123"}}))
+    check("create saves a card",
+          card["type"] == 3 and card["card"] == {"brand": "Visa"}, str(card))
+    full = rbw.json("item", "get", card["id"], env=quiet)
+    check("get shows the card", full["card"]["number"] == "4111111111111111"
+          and full["card"]["code"] == "123")
+    full["card"]["code"] = "456"
+    rbw.run("item", "edit", card["id"], env=quiet, stdin=json.dumps(full))
+    check("edit changes a card",
+          rbw.json("item", "get", card["id"], env=quiet)["card"]["code"] == "456")
+
+    identity = rbw.json("item", "create", env=quiet, stdin=json.dumps({
+        "type": 4, "name": "Me", "identity": {
+            "firstName": "Alex", "lastName": "Martin", "city": "Lyon",
+            "passportNumber": "19AB12345"}}))
+    check("create saves an identity, listed by its names",
+          identity["identity"]["firstName"] == "Alex"
+          and "passportNumber" not in identity["identity"], str(identity))
+    full = rbw.json("item", "get", identity["id"], env=quiet)
+    check("get shows the identity", full["identity"]["passportNumber"] == "19AB12345"
+          and full["identity"]["city"] == "Lyon")
+
+    key = rbw.json("item", "create", env=quiet, stdin=json.dumps({
+        "type": 5, "name": "Laptop", "sshKey": {"privateKey": SSH_PRIVATE_KEY}}))
+    check("create saves an SSH key with its public key and fingerprint",
+          key["sshKey"]["keyFingerprint"] == SSH_FINGERPRINT
+          and key["sshKey"]["publicKey"].startswith("ssh-ed25519 ")
+          and "privateKey" not in key["sshKey"], str(key))
+    full = rbw.json("item", "get", key["id"], env=quiet)
+    check("get shows the private key", full["sshKey"]["privateKey"] == SSH_PRIVATE_KEY)
+    error = rbw.error("item", "create", stdin=json.dumps({
+        "type": 5, "name": "Broken", "sshKey": {"privateKey": "not a key"}}))
+    check("a broken SSH key is refused", error["code"] == "invalid_input", str(error))
+
+
 def totp(secret_b32, at=None):
     """An RFC 6238 code (SHA-1, 6 digits, 30 s)."""
     import hashlib
@@ -268,6 +321,8 @@ def scenario(server, password):
         }).encode()).decode()
         mail = rbw.json("item", "create", env=quiet, stdin=encoded)
         check("create takes base64 JSON", mail["login"]["uris"][0]["match"] == 3)
+
+        kinds(rbw, quiet)
 
         listed = rbw.json("item", "list", env=quiet)
         by_id = {item["id"]: item for item in listed}
