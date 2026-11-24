@@ -3,6 +3,7 @@ use signature::{RandomizedSigner as _, SignatureEncoding as _, Signer as _};
 const SSH_AGENT_RSA_SHA2_256: u32 = 2;
 const SSH_AGENT_RSA_SHA2_512: u32 = 4;
 
+#[derive(Clone)]
 pub struct SshAgent {
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 }
@@ -14,13 +15,35 @@ impl SshAgent {
         Self { state }
     }
 
-    pub async fn run(self) -> anyhow::Result<()> {
-        let socket = rbw::dirs::ssh_agent_socket_file();
+    // Serves the sockets the service manager passed, and the usual socket
+    // unless one of those is already at its path: systemd's socket unit
+    // opens it there, while launchd's socket has a path of its own.
+    pub async fn run(
+        self,
+        activated: Vec<std::os::unix::net::UnixListener>,
+    ) -> anyhow::Result<()> {
+        let path = rbw::dirs::ssh_agent_socket_file();
+        let has_usual_path = activated.iter().any(|listener| {
+            listener
+                .local_addr()
+                .ok()
+                .and_then(|addr| addr.as_pathname().map(|p| p == path))
+                .unwrap_or(false)
+        });
 
-        let _ = std::fs::remove_file(&socket); // Ignore error if it doesn't exist
+        let mut listeners = activated
+            .into_iter()
+            .map(tokio::net::UnixListener::from_std)
+            .collect::<Result<Vec<_>, _>>()?;
+        if !has_usual_path {
+            let _ = std::fs::remove_file(&path); // Ignore error if it doesn't exist
+            listeners.push(tokio::net::UnixListener::bind(&path)?);
+        }
 
-        let listener = tokio::net::UnixListener::bind(socket)?;
-        ssh_agent_lib::agent::listen(listener, self).await?;
+        futures::future::try_join_all(listeners.into_iter().map(
+            |listener| ssh_agent_lib::agent::listen(listener, self.clone()),
+        ))
+        .await?;
 
         Ok(())
     }

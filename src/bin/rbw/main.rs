@@ -5,6 +5,7 @@ use clap::{CommandFactory as _, Parser as _};
 
 mod actions;
 mod commands;
+mod service;
 mod sock;
 
 #[derive(Debug, clap::Args)]
@@ -278,6 +279,16 @@ enum Opt {
     StopAgent,
 
     #[command(
+        name = "ssh-agent",
+        about = "Run the agent as a login service that serves SSH keys to \
+            every program"
+    )]
+    SshAgent {
+        #[command(subcommand)]
+        cmd: SshAgent,
+    },
+
+    #[command(
         name = "gen-completions",
         about = "Generate completion script for the given shell"
     )]
@@ -307,8 +318,41 @@ impl Opt {
             Self::Lock => "lock".to_string(),
             Self::Purge => "purge".to_string(),
             Self::StopAgent => "stop-agent".to_string(),
+            Self::SshAgent { cmd } => {
+                format!("ssh-agent {}", cmd.subcommand_name())
+            }
             Self::GenCompletions { .. } => "gen-completions".to_string(),
         }
+    }
+}
+
+#[derive(Debug, clap::Parser)]
+enum SshAgent {
+    #[command(
+        about = "Start the agent with the system's service manager (launchd \
+            or systemd) and make it the SSH agent of the login session"
+    )]
+    Install,
+    #[command(about = "Undo `rbw ssh-agent install`")]
+    Uninstall,
+    #[command(
+        about = "Show whether the agent runs as a service and serves the \
+            session's SSH_AUTH_SOCK"
+    )]
+    Status,
+    #[command(about = "Print the path of the agent's SSH socket")]
+    Socket,
+}
+
+impl SshAgent {
+    fn subcommand_name(&self) -> String {
+        match self {
+            Self::Install => "install",
+            Self::Uninstall => "uninstall",
+            Self::Status => "status",
+            Self::Socket => "socket",
+        }
+        .to_string()
     }
 }
 
@@ -523,6 +567,15 @@ fn main() {
         Opt::Lock => commands::lock(),
         Opt::Purge => commands::purge(),
         Opt::StopAgent => commands::stop_agent(),
+        Opt::SshAgent { cmd } => match cmd {
+            SshAgent::Install => commands::ssh_agent_install(),
+            SshAgent::Uninstall => service::uninstall(),
+            SshAgent::Status => service::status(),
+            SshAgent::Socket => {
+                service::socket();
+                Ok(())
+            }
+        },
         Opt::GenCompletions { shell } => {
             match shell {
                 CompletionShell::Bash => {

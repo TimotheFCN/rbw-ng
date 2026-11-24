@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 
 mod actions;
+mod activation;
 mod agent;
 #[cfg(target_os = "macos")]
 mod biometric;
@@ -17,8 +18,12 @@ mod timeout;
 
 async fn tokio_main(
     startup_ack: Option<crate::daemon::StartupAck>,
+    sockets: crate::activation::Sockets,
 ) -> anyhow::Result<()> {
-    let listener = crate::sock::listen()?;
+    let listener = match sockets.control {
+        Some(listener) => tokio::net::UnixListener::from_std(listener)?,
+        None => crate::sock::listen()?,
+    };
 
     if let Some(startup_ack) = startup_ack {
         startup_ack.ack()?;
@@ -66,7 +71,7 @@ async fn tokio_main(
 
     let ssh_agent = crate::ssh_agent::SshAgent::new(state.clone());
 
-    tokio::try_join!(agent.run(listener), ssh_agent.run())?;
+    tokio::try_join!(agent.run(listener), ssh_agent.run(sockets.ssh))?;
 
     Ok(())
 }
@@ -95,14 +100,27 @@ fn real_main() -> anyhow::Result<()> {
     )
     .init();
 
-    let no_daemonize = std::env::args()
-        .nth(1)
-        .is_some_and(|arg| arg == "--no-daemonize");
+    let mode = daemon::Mode::from_args();
+    // before any thread starts
+    let sockets = if mode == daemon::Mode::Service {
+        crate::activation::take()?
+    } else {
+        crate::activation::Sockets::default()
+    };
+
+    if mode != daemon::Mode::Service && crate::sock::answers() {
+        // the code rbw takes for an agent that already runs
+        eprintln!(
+            "an agent already answers on {}",
+            rbw::dirs::socket_file().display()
+        );
+        std::process::exit(23);
+    }
 
     rbw::dirs::make_all()?;
 
     let startup_ack =
-        daemon::daemonize(no_daemonize).context("failed to daemonize")?;
+        daemon::daemonize(mode).context("failed to daemonize")?;
 
     if let Err(e) = debugger::disable_tracing() {
         log::warn!("{e}");
@@ -114,7 +132,7 @@ fn real_main() -> anyhow::Result<()> {
     // unwrap is fine here because there's no good reason that this should
     // ever fail
     tokio::runtime::Runtime::new().unwrap().block_on(async {
-        if let Err(e) = tokio_main(startup_ack).await {
+        if let Err(e) = tokio_main(startup_ack, sockets).await {
             // this unwrap is fine because it's the only real option here
             w.send(e).unwrap();
         }

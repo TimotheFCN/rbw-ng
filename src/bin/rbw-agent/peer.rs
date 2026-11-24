@@ -33,6 +33,11 @@ fn describe_pid(pid: libc::pid_t) -> String {
     )
 }
 
+// The name of a running process, as the kernel has it.
+pub fn process_name(pid: libc::pid_t) -> Option<String> {
+    process_info(pid).map(|(name, _)| name)
+}
+
 // Text from outside rbw (a process or entry name) made safe to show in a
 // prompt: control characters, and the Unicode characters that reorder or
 // hide text, become '?', and text over max_chars characters is cut and ends

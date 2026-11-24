@@ -62,6 +62,40 @@ fn quote_start(line: &str) -> std::borrow::Cow<'_, str> {
     format!("{}... ({} bytes)", &line[..end], line.len()).into()
 }
 
+// Whether an agent answers on rbw's socket: one that runs, or the one that
+// systemd starts for its socket unit. Binding the socket again would cut it
+// off from rbw.
+pub fn answers() -> bool {
+    use std::io::{BufRead as _, Write as _};
+
+    let Ok(mut sock) =
+        std::os::unix::net::UnixStream::connect(rbw::dirs::socket_file())
+    else {
+        return false;
+    };
+    let timeout = Some(std::time::Duration::from_secs(5));
+    if sock.set_read_timeout(timeout).is_err()
+        || sock.set_write_timeout(timeout).is_err()
+    {
+        return false;
+    }
+    let request = rbw::protocol::Request::new(
+        rbw::protocol::Environment::from_process(),
+        rbw::protocol::Action::Version,
+    );
+    let Ok(mut line) = serde_json::to_string(&request) else {
+        return false;
+    };
+    line.push('\n');
+    if sock.write_all(line.as_bytes()).is_err() {
+        return false;
+    }
+    let mut reply = String::new();
+    std::io::BufReader::new(sock)
+        .read_line(&mut reply)
+        .is_ok_and(|len| len > 0)
+}
+
 pub fn listen() -> anyhow::Result<tokio::net::UnixListener> {
     let path = rbw::dirs::socket_file();
     // if the socket already doesn't exist, that's fine
