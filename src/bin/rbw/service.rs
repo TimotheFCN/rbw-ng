@@ -112,12 +112,34 @@ pub fn status() -> anyhow::Result<()> {
 
     let socket = ssh_socket(&name);
     println!("ssh socket:    {}", socket.display());
-    let ssh_config = if ssh_config_uses(&socket) {
-        "an IdentityAgent in ~/.ssh/config points to it"
-    } else {
-        "no IdentityAgent in ~/.ssh/config points to it"
+    let is_rbw = |path: &std::path::Path| {
+        path == socket || path == rbw::dirs::ssh_agent_socket_file()
     };
-    println!("ssh config:    {ssh_config}");
+    let agent_at = |path: &std::path::Path| {
+        if is_rbw(path) {
+            "rbw-agent".to_string()
+        } else {
+            format!("another agent, at {}", path.display())
+        }
+    };
+    let ssh = match ssh_default_agent() {
+        Ok(SshAgent::Configured(path)) => {
+            format!("{} (IdentityAgent in ~/.ssh/config)", agent_at(&path))
+        }
+        Ok(SshAgent::Variable { name, .. }) => std::env::var_os(&name)
+            .map_or_else(
+                || format!("no agent ({name} is not set)"),
+                |path| {
+                    format!(
+                        "{} (through {name})",
+                        agent_at(std::path::Path::new(&path))
+                    )
+                },
+            ),
+        Ok(SshAgent::Disabled) => "no agent (IdentityAgent none)".to_string(),
+        Err(e) => format!("unknown: {e:#}"),
+    };
+    println!("ssh default:   {ssh}");
 
     let auth_sock = std::env::var_os("SSH_AUTH_SOCK").map_or_else(
         || "not set".to_string(),
@@ -220,43 +242,77 @@ fn tilde(path: &std::path::Path) -> String {
         )
 }
 
-// Whether ~/.ssh/config has an IdentityAgent line for the socket. It doesn't
-// follow Include, nor tell which hosts the line applies to.
-fn ssh_config_uses(socket: &std::path::Path) -> bool {
-    let Some(home) = home_dir() else {
-        return false;
-    };
-    let Ok(config) = std::fs::read_to_string(home.join(".ssh/config")) else {
-        return false;
-    };
-    config
-        .lines()
-        .filter_map(|line| identity_agent(line, &home))
-        .any(|path| path == socket)
+// The agent SSH uses for a host without settings of its own.
+// (macOS reads all of it, to tell how to point SSH at rbw-agent)
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+enum SshAgent {
+    // IdentityAgent with a socket path
+    Configured(std::path::PathBuf),
+    // the socket in an environment variable: SSH_AUTH_SOCK without an
+    // IdentityAgent (explicit: false), or IdentityAgent SSH_AUTH_SOCK or
+    // $NAME
+    Variable { name: String, explicit: bool },
+    // IdentityAgent none
+    Disabled,
 }
 
-// The path in an "IdentityAgent <path>" or "IdentityAgent=<path>" line.
-fn identity_agent(
-    line: &str,
-    home: &std::path::Path,
-) -> Option<std::path::PathBuf> {
-    let (keyword, value) = line
-        .trim()
-        .split_once(|c: char| c.is_whitespace() || c == '=')?;
-    if !keyword.eq_ignore_ascii_case("IdentityAgent") {
-        return None;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+impl SshAgent {
+    fn describe(&self) -> String {
+        match self {
+            Self::Configured(path) => path.display().to_string(),
+            Self::Variable { name, .. } => name.clone(),
+            Self::Disabled => "none".to_string(),
+        }
     }
-    let value = value
-        .trim_start_matches(|c: char| c.is_whitespace() || c == '=')
-        .trim_end();
-    let value = value
-        .strip_prefix('"')
-        .and_then(|value| value.strip_suffix('"'))
-        .unwrap_or(value);
-    Some(value.strip_prefix("~/").map_or_else(
-        || std::path::PathBuf::from(value),
-        |rest| home.join(rest),
-    ))
+}
+
+// Asks ssh, without connecting, what it would use for a host that no Host or
+// Match entry names, so that Include, Match and the order of the entries
+// count as they do for ssh. Like every ssh run, this runs the commands of
+// Match exec entries.
+fn ssh_default_agent() -> anyhow::Result<SshAgent> {
+    let output = std::process::Command::new("ssh")
+        .args(["-G", "rbw-ssh-agent-check.invalid"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .context("failed to run ssh")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "ssh can't read its configuration: {}",
+            stderr.lines().next().unwrap_or_default().trim()
+        );
+    }
+    Ok(parse_ssh_agent(&String::from_utf8_lossy(&output.stdout)))
+}
+
+// From the "identityagent <value>" line of `ssh -G`, which has no such line
+// without an IdentityAgent.
+fn parse_ssh_agent(output: &str) -> SshAgent {
+    let value = output
+        .lines()
+        .find_map(|line| line.strip_prefix("identityagent "));
+    match value {
+        None => SshAgent::Variable {
+            name: "SSH_AUTH_SOCK".to_string(),
+            explicit: false,
+        },
+        Some("none") => SshAgent::Disabled,
+        Some("SSH_AUTH_SOCK") => SshAgent::Variable {
+            name: "SSH_AUTH_SOCK".to_string(),
+            explicit: true,
+        },
+        Some(value) if value.starts_with('$') => SshAgent::Variable {
+            name: value
+                .trim_start_matches('$')
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .to_string(),
+            explicit: true,
+        },
+        Some(value) => SshAgent::Configured(value.into()),
+    }
 }
 
 // Asks the service to start the agent and waits until it answers, when the
@@ -513,18 +569,30 @@ mod tests {
     }
 
     #[test]
-    fn identity_agent_lines_are_read() {
-        let home = std::path::Path::new("/home/me");
-        let read = |line| super::identity_agent(line, home);
-        assert_eq!(
-            read("    IdentityAgent \"~/Library/Application Support/s\""),
-            Some("/home/me/Library/Application Support/s".into())
-        );
-        assert_eq!(read("identityagent=/run/s"), Some("/run/s".into()));
-        assert_eq!(read("IdentityAgent = /run/s  "), Some("/run/s".into()));
-        assert_eq!(read("IdentityFile ~/.ssh/id"), None);
-        assert_eq!(read("# IdentityAgent /run/s"), None);
-        assert_eq!(read(""), None);
+    fn ssh_agent_settings_are_read() {
+        use super::{parse_ssh_agent, SshAgent};
+
+        let output = "user me\nidentityagent /Users/me/a b/s\nport 22\n";
+        assert!(matches!(
+            parse_ssh_agent(output),
+            SshAgent::Configured(path) if path == std::path::Path::new("/Users/me/a b/s")
+        ));
+        assert!(matches!(
+            parse_ssh_agent("user me\n"),
+            SshAgent::Variable { name, explicit: false } if name == "SSH_AUTH_SOCK"
+        ));
+        assert!(matches!(
+            parse_ssh_agent("identityagent SSH_AUTH_SOCK\n"),
+            SshAgent::Variable { name, explicit: true } if name == "SSH_AUTH_SOCK"
+        ));
+        assert!(matches!(
+            parse_ssh_agent("identityagent ${MY_SOCK}\n"),
+            SshAgent::Variable { name, explicit: true } if name == "MY_SOCK"
+        ));
+        assert!(matches!(
+            parse_ssh_agent("identityagent none\n"),
+            SshAgent::Disabled
+        ));
     }
 
     #[test]

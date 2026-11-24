@@ -73,22 +73,41 @@ pub fn install(service: &super::Service) -> anyhow::Result<()> {
 }
 
 pub fn next_steps(socket: &std::path::Path) -> Vec<super::Step> {
-    if super::ssh_config_uses(socket) {
-        return vec![];
-    }
-    let line = format!("    IdentityAgent \"{}\"", super::tilde(socket));
-    vec![super::Step {
-        text: "Paste this so that SSH uses it for every host:".to_string(),
-        command: Some(format!(
-            "mkdir -p ~/.ssh && printf '\\nHost *\\n%s\\n' {} >> ~/.ssh/config",
-            super::shell_quote(&line)
-        )),
-        note: Some(
-            "For some hosts only, put that IdentityAgent line under their \
-            Host entries instead."
+    let line = format!("IdentityAgent \"{}\"", super::tilde(socket));
+    match super::ssh_default_agent() {
+        Ok(super::SshAgent::Configured(path)) if path == socket => vec![],
+        // an IdentityAgent for every host comes first, and SSH keeps the
+        // first one it finds
+        Ok(
+            agent @ (super::SshAgent::Configured(_)
+            | super::SshAgent::Disabled
+            | super::SshAgent::Variable { explicit: true, .. }),
+        ) => vec![super::Step {
+            text: format!(
+                "~/.ssh/config already sets an agent for every host ({}), \
+                and SSH uses the first one it finds. To use rbw-agent \
+                instead, replace that IdentityAgent line with:",
+                agent.describe()
+            ),
+            command: Some(line),
+            note: None,
+        }],
+        // no agent set, or ssh couldn't tell
+        _ => vec![super::Step {
+            text: "Paste this so that SSH uses it for every host:"
                 .to_string(),
-        ),
-    }]
+            command: Some(format!(
+                "mkdir -p ~/.ssh && printf '\\nHost *\\n%s\\n' {} >> \
+                ~/.ssh/config",
+                super::shell_quote(&format!("    {line}"))
+            )),
+            note: Some(
+                "For some hosts only, put that IdentityAgent line under \
+                their Host entries instead."
+                    .to_string(),
+            ),
+        }],
+    }
 }
 
 pub fn uninstall(name: &str) -> anyhow::Result<bool> {
@@ -102,11 +121,11 @@ pub fn uninstall(name: &str) -> anyhow::Result<bool> {
 }
 
 pub fn uninstall_notes() -> Vec<String> {
-    if super::ssh_config_uses(&rbw::dirs::service_ssh_agent_socket_file()) {
-        vec!["Remove its IdentityAgent line from ~/.ssh/config.".to_string()]
-    } else {
-        vec![]
-    }
+    vec![
+        "Remove rbw-agent's IdentityAgent lines from ~/.ssh/config, if you \
+        added any."
+            .to_string(),
+    ]
 }
 
 pub fn log(_name: &str) -> String {
