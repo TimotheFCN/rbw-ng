@@ -334,6 +334,9 @@ pub enum ErrorCode {
     InvalidInput,
     // the server can't be reached
     Network,
+    // the server's address leads to something that isn't a Bitwarden
+    // server, such as a web site or a wrong path
+    WrongServer,
     // the server answered with an error
     Server { status: Option<u16> },
     // rbw-agent can't be started or reached

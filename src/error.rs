@@ -295,6 +295,9 @@ pub enum Error {
 
     #[error("invalid url")]
     InvalidUrl { source: url::ParseError },
+
+    #[error("the server's address doesn't lead to a Bitwarden server")]
+    WrongServer,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -316,6 +319,7 @@ impl Error {
             Self::RegistrationRequired => ErrorCode::RegistrationRequired,
             Self::CipherOutOfDate => ErrorCode::Conflict,
             Self::InvalidProfile { .. } => ErrorCode::InvalidInput,
+            Self::WrongServer => ErrorCode::WrongServer,
             Self::IconTooLarge => ErrorCode::Server { status: None },
             Self::IconRead { .. } => ErrorCode::Network,
             Self::RequestFailed { status: 403 } => ErrorCode::Forbidden,

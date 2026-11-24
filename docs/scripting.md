@@ -54,6 +54,7 @@ The message is for people and can change. Some codes carry more:
 | `unsupported` | `rbw` can't do this yet |
 | `invalid_input` | the input or the arguments are wrong |
 | `network` | the server can't be reached |
+| `wrong_server` | the server's address leads to something that isn't a Bitwarden server, such as a web site or a wrong path |
 | `server` | the server answered with an error; `status` is its HTTP status, if any |
 | `agent` | `rbw-agent` can't be started or reached |
 | `other` | anything else |

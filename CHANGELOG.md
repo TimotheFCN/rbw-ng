@@ -108,6 +108,9 @@ service.
     logins.
 * `rbw register` with a wrong API key on Vaultwarden says the key is
   incorrect instead of reporting a server error.
+* Logging in or registering with a server address that leads to no Bitwarden
+  server says so, instead of failing to parse JSON or, with
+  `RBW_ERROR_FORMAT=json`, reporting `not_found`.
 * An agent started while another one answers on rbw's socket now leaves it
   alone instead of taking over its path.
 * `rbw` and `rbw-agent` refuse an `RBW_PROFILE` that contains `/` or isn't

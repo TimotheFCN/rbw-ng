@@ -1413,7 +1413,18 @@ impl Client {
             .send()
             .await
             .map_err(|source| Error::Reqwest { source })?;
-        let prelogin_res: PreloginRes = res.json_with_path().await?;
+        match res.status() {
+            status if not_identity(status) => return Err(Error::WrongServer),
+            status if !status.is_success() => {
+                return Err(Error::RequestFailed {
+                    status: status.as_u16(),
+                })
+            }
+            _ => {}
+        }
+        // a web page instead of JSON: some other site
+        let prelogin_res: PreloginRes =
+            res.json_with_path().await.map_err(|_| Error::WrongServer)?;
         Ok((
             prelogin_res.kdf,
             prelogin_res.kdf_iterations,
@@ -1460,6 +1471,8 @@ impl Client {
             .map_err(|source| Error::Reqwest { source })?;
         if res.status() == reqwest::StatusCode::OK {
             Ok(())
+        } else if not_identity(res.status()) {
+            Err(Error::WrongServer)
         } else {
             let code = res.status().as_u16();
             match res.text().await {
@@ -1557,6 +1570,8 @@ impl Client {
                 connect_res.refresh_token,
                 connect_res.key,
             ))
+        } else if not_identity(res.status()) {
+            Err(Error::WrongServer)
         } else {
             let code = res.status().as_u16();
             match res.text().await {
@@ -2252,6 +2267,16 @@ fn sso_query_code(
     Ok(sso_code.clone())
 }
 
+// Whether the identity server's answer says that there is none at its
+// address: the path doesn't exist, or doesn't take a POST.
+fn not_identity(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    )
+}
+
 /// Classify a failed response from the `refresh_token` grant.
 ///
 /// `invalid_grant` is unambiguous here in a way it is not during login: no
@@ -2262,6 +2287,9 @@ fn classify_refresh_error_res(
     code: u16,
     body: std::result::Result<String, reqwest::Error>,
 ) -> Error {
+    if reqwest::StatusCode::from_u16(code).is_ok_and(not_identity) {
+        return Error::WrongServer;
+    }
     let Ok(body) = body else {
         return Error::RequestFailed { status: code };
     };
@@ -2592,6 +2620,34 @@ mod tests {
             let url = url::Url::parse(url).unwrap();
             assert_eq!(icon_redirect_allowed(&url), allowed, "{url}");
         }
+    }
+
+    #[test]
+    fn a_refresh_from_an_address_without_a_server_names_it() {
+        let not_found = mock_identity(404, "");
+        assert!(matches!(
+            not_found.exchange_refresh_token("old"),
+            Err(Error::WrongServer)
+        ));
+        let error = anyhow::Error::new(Error::WrongServer);
+        assert_eq!(
+            crate::error::code(&error),
+            crate::protocol::ErrorCode::WrongServer
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_isnt_a_bitwarden_server_is_named() {
+        let web_page = mock_identity(200, "<!doctype html><html></html>");
+        assert!(matches!(
+            web_page.prelogin("me@example.com").await,
+            Err(Error::WrongServer)
+        ));
+        let static_site = mock_identity(405, "Method Not Allowed");
+        assert!(matches!(
+            static_site.prelogin("me@example.com").await,
+            Err(Error::WrongServer)
+        ));
     }
 
     #[test]

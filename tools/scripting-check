@@ -850,6 +850,21 @@ def registering(server, password):
         shutil.rmtree(home, ignore_errors=True)
 
 
+def wrong_server(server, password):
+    """A server address that leads to no Bitwarden server."""
+    home = tempfile.mkdtemp(prefix="rbw-scripting-")
+    rbw = Rbw(home, server.rstrip("/") + "/nothing-here", "nobody@example.com")
+    try:
+        check("login names a wrong server address",
+              rbw.error("login", "--password-stdin", stdin=password)["code"] == "wrong_server")
+        error = rbw.error("register", "--api-key-env",
+                          env={"RBW_CLIENT_ID": "user.x", "RBW_CLIENT_SECRET": "x"})
+        check("and so does register", error["code"] == "wrong_server", str(error))
+    finally:
+        rbw.stop()
+        shutil.rmtree(home, ignore_errors=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--server", required=True)
@@ -859,6 +874,7 @@ def main():
         scenario(args.server, args.password)
         two_step(args.server, args.password)
         registering(args.server, args.password)
+        wrong_server(args.server, args.password)
     except AssertionError as e:
         print(f"FAIL {e}")
         sys.exit(1)
