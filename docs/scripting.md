@@ -131,6 +131,14 @@ A session ends when:
 
 After that, a command with the old key fails with `session_invalid`.
 
+## Settings
+
+`rbw config show` prints the profile's settings as JSON, and
+`rbw config set KEY VALUE` changes one. A change to `lock_timeout` (in
+seconds), `sync_interval`, `pinentry`, `pinentry_timeout`, `touch_id_unlock`
+or `ssh_confirm` applies to a running agent at once, without locking the
+vault; any other change stops the agent.
+
 ## Status
 
 ```sh

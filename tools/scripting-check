@@ -521,6 +521,13 @@ def scenario(server, password):
                   needle="the session key is invalid")
         check("a new session replaces the old one", True)
         rbw.run("unlock", "--password-stdin", env=quiet, stdin=password)
+        rbw.run("config", "set", "lock_timeout", "2")
+        check("a new lock timeout doesn't lock",
+              rbw.json("status", "--json")["status"] == "unlocked")
+        time.sleep(3)
+        check("the agent locks after the new timeout",
+              rbw.json("status", "--json")["status"] == "locked")
+        rbw.run("unlock", "--password-stdin", env=quiet, stdin=password)
         rbw.run("purge")
         check("purge signs out", rbw.json("status", "--json")["status"] == "unauthenticated")
         check("purge removes the session",

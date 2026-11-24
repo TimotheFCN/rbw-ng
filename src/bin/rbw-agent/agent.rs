@@ -272,6 +272,10 @@ async fn handle_request(
             crate::actions::unlock_touch_id(sock, state.clone()).await?;
             true
         }
+        rbw::protocol::Action::ReloadConfig => {
+            crate::actions::reload_config(sock, state.clone()).await?;
+            false
+        }
         rbw::protocol::Action::Status => {
             crate::actions::status(sock, state.clone()).await?;
             false

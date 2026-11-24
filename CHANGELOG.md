@@ -54,6 +54,13 @@
   foreground, with the sockets the service manager passes, and replacing an
   agent that `rbw` started before.
 
+### Changed
+
+* `rbw config set` and `unset` no longer stop the agent, and lock the vault,
+  for settings that change only what the agent does: `lock_timeout`,
+  `sync_interval`, `pinentry`, `pinentry_timeout`, `touch_id_unlock` and
+  `ssh_confirm`. A running agent takes them over at once.
+
 ### Fixed
 
 * An agent started while another one answers on rbw's socket now leaves it

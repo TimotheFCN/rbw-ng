@@ -13,10 +13,10 @@ pub struct State {
     pub master_password_reprompt_initialized: bool,
     pub unlock_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     #[cfg(target_os = "macos")]
-    // Configuration changes stop the agent, so this startup snapshot avoids
-    // rereading config on every successful password unlock.
+    // Read at startup and when `rbw config` changes it, so that a password
+    // unlock doesn't reread the config.
     pub touch_id_unlock: bool,
-    // Ask before every SSH signature, also a startup snapshot.
+    // Ask before every SSH signature, kept the same way.
     pub ssh_confirm: bool,
     #[cfg(target_os = "macos")]
     pub biometric_unlock: Option<std::sync::Arc<crate::biometric::Session>>,

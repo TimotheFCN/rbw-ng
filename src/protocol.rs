@@ -250,6 +250,9 @@ pub enum Action {
     UnlockTouchId,
     // Answered with Response::Status
     Status,
+    // Take over the settings that change only what the agent does, such as
+    // the lock timeout, without locking
+    ReloadConfig,
     Quit,
     Version,
 }

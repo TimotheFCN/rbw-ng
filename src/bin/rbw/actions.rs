@@ -220,6 +220,10 @@ pub fn unlock_with(
     session_action(rbw::protocol::Action::UnlockWith { password, session })
 }
 
+pub fn reload_config() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::ReloadConfig)
+}
+
 pub fn unlock_touch_id() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::UnlockTouchId)
 }

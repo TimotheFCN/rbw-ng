@@ -687,6 +687,36 @@ pub async fn unlock_touch_id(
     respond_ack(sock).await
 }
 
+pub async fn reload_config(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let config = rbw::config::Config::load_async().await?;
+    let mut state = state.lock().await;
+    state.timeout_duration =
+        std::time::Duration::from_secs(config.lock_timeout);
+    if !state.needs_unlock() {
+        state.set_timeout();
+    }
+    state.sync_timeout_duration =
+        std::time::Duration::from_secs(config.sync_interval);
+    if state.sync_timeout_duration > std::time::Duration::ZERO {
+        state.set_sync_timeout();
+    } else {
+        state.sync_timeout.clear();
+    }
+    state.ssh_confirm = config.confirms_ssh_signatures();
+    #[cfg(target_os = "macos")]
+    {
+        state.touch_id_unlock = config.touch_id_unlock;
+        if !config.touch_id_unlock {
+            state.biometric_unlock = None;
+        }
+    }
+    drop(state);
+    respond_ack(sock).await
+}
+
 pub async fn status(
     sock: &mut crate::sock::Sock,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,

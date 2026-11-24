@@ -1244,15 +1244,33 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
         }
     }
     config.save()?;
+    apply_config(key)
+}
 
+// Settings that change only what the agent does: a running agent takes them
+// over without locking.
+const AGENT_SETTINGS: &[&str] = &[
+    "lock_timeout",
+    "sync_interval",
+    "pinentry",
+    "pinentry_timeout",
+    "touch_id_unlock",
+    "ssh_confirm",
+    "touch_id_ssh",
+];
+
+fn apply_config(key: &str) -> anyhow::Result<()> {
+    if AGENT_SETTINGS.contains(&key)
+        && crate::actions::reload_config().is_ok()
+    {
+        return Ok(());
+    }
     // drop in-memory keys, since they will be different if the email or url
     // changed. not using lock() because we don't want to require the agent to
     // be running (since this may be the user running `rbw config set
     // base_url` as the first operation), and stop_agent() already handles the
     // agent not running case gracefully.
-    stop_agent()?;
-
-    Ok(())
+    stop_agent()
 }
 
 pub fn config_unset(key: &str) -> anyhow::Result<()> {
@@ -1284,15 +1302,7 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         }
     }
     config.save()?;
-
-    // drop in-memory keys, since they will be different if the email or url
-    // changed. not using lock() because we don't want to require the agent to
-    // be running (since this may be the user running `rbw config set
-    // base_url` as the first operation), and stop_agent() already handles the
-    // agent not running case gracefully.
-    stop_agent()?;
-
-    Ok(())
+    apply_config(key)
 }
 
 // `rbw config set extra_headers.NAME VALUE` sets one header.
