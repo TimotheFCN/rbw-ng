@@ -480,7 +480,7 @@ def icons(rbw):
           (result.returncode == 0 and result.stdout)
           or json.loads(result.stderr.decode().splitlines()[-1])["code"] == "not_found",
           result.stderr.decode())
-    for host in ("not a host", "github.com/login", "hidden.onion"):
+    for host in ("not a host", "github.com/login", "hidden.onion", "hidden.onion."):
         check(f"icon refuses {host!r}", rbw.error("icon", host)["code"] == "invalid_input")
 
 

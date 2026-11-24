@@ -214,7 +214,22 @@ pub fn status(json: bool) -> anyhow::Result<()> {
 // image the service sends. The official clients send it the host name of
 // a login's website, never of a .onion or .i2p site.
 pub fn icon(host: &str) -> anyhow::Result<()> {
+    let host = icon_host(host)?;
+    let Some(icon) = rbw::actions::icon(&host)? else {
+        return Err(coded(
+            ErrorCode::NotFound,
+            format!("the server has no icon for {host}"),
+        ));
+    };
+    std::io::Write::write_all(&mut std::io::stdout(), &icon)
+        .context("failed to write the icon")
+}
+
+// The host name to send to the icon service, without the final dot that
+// a fully qualified name may end with.
+fn icon_host(host: &str) -> anyhow::Result<String> {
     let host = host.to_lowercase();
+    let host = host.trim_end_matches('.');
     let valid = host.contains('.')
         && !host.starts_with('.')
         && host
@@ -232,12 +247,29 @@ pub fn icon(host: &str) -> anyhow::Result<()> {
             "the icons of .onion and .i2p sites aren't fetched",
         ));
     }
-    let Some(icon) = rbw::actions::icon(&host)? else {
-        return Err(coded(
-            ErrorCode::NotFound,
-            format!("the server has no icon for {host}"),
-        ));
-    };
-    std::io::Write::write_all(&mut std::io::stdout(), &icon)
-        .context("failed to write the icon")
+    Ok(host.to_string())
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn icons_are_fetched_for_host_names_but_hidden_sites() {
+        assert_eq!(icon_host("GitHub.com").unwrap(), "github.com");
+        assert_eq!(icon_host("github.com.").unwrap(), "github.com");
+        for refused in [
+            "hidden.onion",
+            "hidden.onion.",
+            "site.i2p..",
+            "localhost",
+            ".com",
+            "github.com/login",
+            "",
+            ".",
+        ] {
+            let error = icon_host(refused).unwrap_err();
+            assert_eq!(rbw::error::code(&error), ErrorCode::InvalidInput);
+        }
+    }
 }
