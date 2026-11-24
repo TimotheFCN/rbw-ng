@@ -426,6 +426,17 @@ enum Item {
     #[command(about = "Move an entry to the trash")]
     Delete { id: String },
     #[command(
+        about = "Open an entry that asks for the master password again",
+        long_about = "Open an entry that asks for the master password again\n\n\
+            Its secrets can then be read without the master password until \
+            it goes unread for two minutes, or the vault locks."
+    )]
+    Unlock {
+        id: String,
+        #[arg(long, help = "Read the master password from stdin")]
+        password_stdin: bool,
+    },
+    #[command(
         about = "Mark or unmark an entry as a favorite, without its secrets"
     )]
     Favorite {
@@ -465,6 +476,7 @@ impl Item {
             Self::Create => "create",
             Self::Edit { .. } => "edit",
             Self::Delete { .. } => "delete",
+            Self::Unlock { .. } => "unlock",
             Self::Favorite { .. } => "favorite",
             Self::Move { .. } => "move",
         }
@@ -643,6 +655,9 @@ fn main() {
             Item::Create => items::create(),
             Item::Edit { id } => items::edit(&id),
             Item::Delete { id } => items::delete(&id),
+            Item::Unlock { id, password_stdin } => {
+                items::unlock(&id, password_stdin)
+            }
             Item::Favorite { id, favorite } => items::favorite(&id, favorite),
             Item::Move { id, folder } => {
                 items::move_to(&id, folder.as_deref())

@@ -268,6 +268,17 @@ async fn handle_request(
                 .await?;
             true
         }
+        rbw::protocol::Action::UnlockEntry { id, password } => {
+            crate::actions::unlock_entry(
+                sock,
+                state.clone(),
+                &environment,
+                id,
+                password.as_deref(),
+            )
+            .await?;
+            true
+        }
         rbw::protocol::Action::UnlockTouchId => {
             crate::actions::unlock_touch_id(sock, state.clone()).await?;
             true

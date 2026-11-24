@@ -213,8 +213,8 @@ def favorites(rbw, quiet):
 
 
 def share_login(server, email, password, public_der):
-    """Creates an organization with a login in its collection, as its
-    owner; returns the login's id."""
+    """Creates an organization with two logins in its collection, as its
+    owner, the second with master password reprompt; returns their ids."""
     from cryptography.hazmat.primitives import hashes, serialization
     from cryptography.hazmat.primitives.asymmetric import padding
 
@@ -232,13 +232,21 @@ def share_login(server, email, password, public_der):
                  "encryptedPrivateKey": encrypt(org_key[:32], org_key[32:], org_private)},
     })
     collections = call(f"/api/organizations/{org['id']}/collections")["data"]
+    user_id = call("/api/accounts/profile")["id"]
     cipher = call("/api/ciphers/create", {
         "cipher": {"type": 1, "name": seal("Family router"), "organizationId": org["id"],
-                   "encryptedFor": call("/api/accounts/profile")["id"],
+                   "encryptedFor": user_id,
                    "login": {"username": seal("admin"), "password": seal("router-password")}},
         "collectionIds": [collections[0]["id"]],
     })
-    return cipher["id"]
+    protected = call("/api/ciphers/create", {
+        "cipher": {"type": 1, "name": seal("Bank"), "organizationId": org["id"],
+                   "encryptedFor": user_id, "reprompt": 1,
+                   "login": {"username": seal("me"), "password": seal("bank-password"),
+                             "totp": seal("JBSWY3DPEHPK3PXP")}},
+        "collectionIds": [collections[0]["id"]],
+    })
+    return cipher["id"], protected["id"]
 
 
 def organizations(rbw, quiet, shared_id):
@@ -262,6 +270,41 @@ def organizations(rbw, quiet, shared_id):
     rbw.run("item", "delete", shared_id, env=quiet)
     check("delete moves it to the trash",
           all(i["id"] != shared_id for i in rbw.json("item", "list", env=quiet)))
+
+
+def reprompt(rbw, quiet, password, protected_id):
+    """An entry that asks for the master password again."""
+    listed = next(i for i in rbw.json("item", "list", env=quiet) if i["id"] == protected_id)
+    check("list says the entry asks for the password again", listed["reprompt"] == 1)
+    error = rbw.error("item", "get", protected_id)
+    check("get needs the entry unlocked", error["code"] == "reprompt_required", str(error))
+    in_list = next(i for i in rbw.json("item", "list", "--secrets", env=quiet)
+                   if i["id"] == protected_id)
+    check("list --secrets lists it without its secrets",
+          "password" not in in_list["login"] and in_list["login"]["username"] == "me",
+          str(in_list))
+    check("code needs it too",
+          rbw.error("item", "code", protected_id)["code"] == "reprompt_required")
+    check("the password alone is no secret",
+          rbw.run("item", "get", protected_id, "--field", "username", env=quiet).stdout == "me\n")
+    error = rbw.error("item", "unlock", protected_id, "--password-stdin", stdin="wrong")
+    check("unlock refuses a wrong password", error["code"] == "incorrect_password", str(error))
+    rbw.fails("item", "edit", protected_id, env=quiet, stdin=json.dumps(in_list),
+              needle="asks for the master password again")
+    check("edit needs it unlocked", True)
+    rbw.run("item", "unlock", protected_id, "--password-stdin", stdin=password, env=quiet)
+    full = rbw.json("item", "get", protected_id, env=quiet)
+    check("unlock opens it", full["login"]["password"] == "bank-password", str(full["login"]))
+    check("code works while it is open", len(rbw.json("item", "code", protected_id, env=quiet)["code"]) == 6)
+    full["notes"] = "edited"
+    rbw.run("item", "edit", protected_id, env=quiet, stdin=json.dumps(full))
+    again = rbw.json("item", "get", protected_id, env=quiet)
+    check("edit works while it is open, without a new history entry",
+          again["notes"] == "edited" and again["passwordHistory"] == [], str(again))
+    rbw.run("lock")
+    rbw.run("unlock", "--password-stdin", stdin=password, env=quiet)
+    check("locking closes it",
+          rbw.error("item", "get", protected_id)["code"] == "reprompt_required")
 
 
 def totp(secret_b32, at=None):
@@ -406,7 +449,7 @@ def check(name, condition, detail=""):
 def scenario(server, password):
     email = f"scripting-{secrets.token_hex(4)}@example.com"
     public_der = register(server, email, password)
-    shared_id = share_login(server, email, password, public_der)
+    shared_id, protected_id = share_login(server, email, password, public_der)
     home = tempfile.mkdtemp(prefix="rbw-scripting-")
     rbw = Rbw(home, server, email)
     quiet = {"RBW_NONINTERACTIVE": "1"}
@@ -543,7 +586,9 @@ def scenario(server, password):
         time.sleep(3)
         check("the agent locks after the new timeout",
               rbw.json("status", "--json")["status"] == "locked")
+        rbw.run("config", "set", "lock_timeout", "3600")
         rbw.run("unlock", "--password-stdin", env=quiet, stdin=password)
+        reprompt(rbw, quiet, password, protected_id)
         rbw.run("purge")
         check("purge signs out", rbw.json("status", "--json")["status"] == "unauthenticated")
         check("purge removes the session",

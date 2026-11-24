@@ -189,11 +189,12 @@ fn item_json(
     item
 }
 
-// The JSON of each entry, decrypted with one request to the agent.
-fn items_json(
+// The JSON of each entry, or why it couldn't be decrypted, with one request
+// to the agent.
+fn each_item_json(
     entries: &[&rbw::db::Entry],
     secrets: bool,
-) -> anyhow::Result<Vec<Value>> {
+) -> anyhow::Result<Vec<anyhow::Result<Value>>> {
     let mut wanted = vec![];
     for entry in entries {
         item_json(entry, secrets, &mut |entry, cipherstring| {
@@ -208,28 +209,36 @@ fn items_json(
         });
     }
     let mut plaintexts = crate::actions::decrypt_many(wanted)?.into_iter();
-    let mut failed = None;
-    let items = entries
+    Ok(entries
         .iter()
         .map(|entry| {
-            item_json(entry, secrets, &mut |entry, cipherstring| {
-                cipherstring?;
-                match plaintexts.next()? {
-                    Ok(plaintext) => Some(plaintext),
-                    Err(error) => {
-                        failed.get_or_insert_with(|| {
-                            format!("failed to decrypt {}: {error}", entry.id)
-                        });
-                        None
+            let mut failed = None;
+            let item =
+                item_json(entry, secrets, &mut |entry, cipherstring| {
+                    cipherstring?;
+                    match plaintexts.next()? {
+                        Ok(plaintext) => Some(plaintext),
+                        Err(error) => {
+                            failed.get_or_insert_with(|| {
+                                error.into_error().context(format!(
+                                    "failed to decrypt {}",
+                                    entry.id
+                                ))
+                            });
+                            None
+                        }
                     }
-                }
-            })
+                });
+            failed.map_or(Ok(item), Err)
         })
-        .collect();
-    if let Some(failed) = failed {
-        anyhow::bail!(failed);
-    }
-    Ok(items)
+        .collect())
+}
+
+fn items_json(
+    entries: &[&rbw::db::Entry],
+    secrets: bool,
+) -> anyhow::Result<Vec<Value>> {
+    each_item_json(entries, secrets)?.into_iter().collect()
 }
 
 fn print_json(value: &Value) -> anyhow::Result<()> {
@@ -255,7 +264,29 @@ pub fn list(secrets: bool) -> anyhow::Result<()> {
     // archived entries stay out of lists, as in the official clients
     let entries: Vec<_> =
         db.entries.iter().filter(|entry| !entry.archived).collect();
-    print_json(&Value::Array(items_json(&entries, secrets)?))
+    let mut items = each_item_json(&entries, secrets)?;
+    // entries that ask for the master password again and aren't open are
+    // listed without their secrets
+    let closed: Vec<_> = items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| {
+            item.as_ref().is_err_and(|error| {
+                rbw::error::code(error) == ErrorCode::RepromptRequired
+            })
+        })
+        .map(|(i, _)| i)
+        .collect();
+    if !closed.is_empty() {
+        let without: Vec<_> = closed.iter().map(|&i| entries[i]).collect();
+        for (i, item) in closed.into_iter().zip(items_json(&without, false)?)
+        {
+            items[i] = Ok(item);
+        }
+    }
+    print_json(&Value::Array(
+        items.into_iter().collect::<anyhow::Result<_>>()?,
+    ))
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -303,7 +334,7 @@ pub fn get(id: &str, field: Option<Field>) -> anyhow::Result<()> {
             org_id: entry.org_id.clone(),
         }])?
         .remove(0)
-        .map_err(|error| anyhow::anyhow!("failed to decrypt: {error}"))?;
+        .map_err(|error| error.into_error().context("failed to decrypt"))?;
     if matches!(field, Field::Totp) {
         value = rbw::totp::current(&value)?.code;
     }
@@ -330,7 +361,7 @@ pub fn code(id: &str) -> anyhow::Result<()> {
             org_id: entry.org_id.clone(),
         }])?
         .remove(0)
-        .map_err(|error| anyhow::anyhow!("failed to decrypt: {error}"))?;
+        .map_err(|error| error.into_error().context("failed to decrypt"))?;
     let code = rbw::totp::current(&secret)?;
     print_json(&json!({
         "code": code.code,
@@ -622,19 +653,26 @@ fn encrypt_data(
     })
 }
 
+// The current value, or none when it can't be decrypted. An entry with
+// master password reprompt must be open: without its password, an edit
+// couldn't tell whether the password changed.
 fn decrypt(
     entry: &rbw::db::Entry,
     cipherstring: &str,
 ) -> anyhow::Result<Option<String>> {
-    Ok(
-        crate::actions::decrypt_many(vec![rbw::protocol::DecryptItem {
-            cipherstring: cipherstring.to_string(),
-            entry_key: entry.key.clone(),
-            org_id: entry.org_id.clone(),
-        }])?
-        .remove(0)
-        .ok(),
-    )
+    match crate::actions::decrypt_many(vec![rbw::protocol::DecryptItem {
+        cipherstring: cipherstring.to_string(),
+        entry_key: entry.key.clone(),
+        org_id: entry.org_id.clone(),
+    }])?
+    .remove(0)
+    {
+        Ok(plaintext) => Ok(Some(plaintext)),
+        Err(error) if error.code == Some(ErrorCode::RepromptRequired) => {
+            Err(error.into_error())
+        }
+        Err(_) => Ok(None),
+    }
 }
 
 // The public key and SHA-256 fingerprint of an OpenSSH private key, as the
@@ -855,6 +893,18 @@ pub fn move_to(id: &str, folder: Option<&str>) -> anyhow::Result<()> {
     )
 }
 
+// Opens an entry that asks for the master password again, so that its
+// secrets can be read for a while.
+pub fn unlock(id: &str, password_stdin: bool) -> anyhow::Result<()> {
+    let password = password_stdin
+        .then(crate::scripting::password_from_stdin)
+        .transpose()?;
+    crate::commands::unlock()?;
+    let db = crate::commands::load_db()?;
+    let entry = find(&db, id)?;
+    crate::actions::unlock_entry(entry.id.clone(), password)
+}
+
 pub fn folder_list() -> anyhow::Result<()> {
     crate::commands::unlock()?;
     let db = crate::commands::load_db()?;
@@ -874,7 +924,9 @@ pub fn folder_list() -> anyhow::Result<()> {
         .zip(names)
         .map(|(folder, name)| {
             let name = name.map_err(|error| {
-                anyhow::anyhow!("failed to decrypt {}: {error}", folder.id)
+                error
+                    .into_error()
+                    .context(format!("failed to decrypt {}", folder.id))
             })?;
             Ok(folder_json(&folder.id, &name))
         })

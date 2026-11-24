@@ -2797,7 +2797,7 @@ impl EntryDecryptor for RecordingDecryptor {
 struct ReplayingDecryptor(
     std::collections::HashMap<
         rbw::protocol::DecryptItem,
-        Result<String, String>,
+        Result<String, rbw::protocol::DecryptError>,
     >,
 );
 
@@ -2821,7 +2821,7 @@ impl EntryDecryptor for ReplayingDecryptor {
                 )
             })?
             .clone()
-            .map_err(|e| anyhow::anyhow!("failed to decrypt: {e}"))
+            .map_err(|e| e.into_error().context("failed to decrypt"))
     }
 }
 
@@ -2842,7 +2842,7 @@ fn replay_batch<T>(
     entries: &[rbw::db::Entry],
     each: &impl Fn(&rbw::db::Entry, &dyn EntryDecryptor) -> anyhow::Result<T>,
     items: Vec<rbw::protocol::DecryptItem>,
-    results: Vec<Result<String, String>>,
+    results: Vec<Result<String, rbw::protocol::DecryptError>>,
 ) -> anyhow::Result<Vec<T>> {
     if items.len() != results.len() {
         return Err(anyhow::anyhow!(
@@ -2893,7 +2893,7 @@ fn decrypt_folder_names(
         .zip(names)
         .map(|((id, _), name)| {
             name.map(|name| (id, name))
-                .map_err(|e| anyhow::anyhow!("failed to decrypt: {e}"))
+                .map_err(|e| e.into_error().context("failed to decrypt"))
         })
         .collect()
 }
@@ -5087,12 +5087,18 @@ mod test {
     fn fake_agent(
         items: &[rbw::protocol::DecryptItem],
         fail: impl Fn(&str) -> bool,
-    ) -> Vec<Result<String, String>> {
+    ) -> Vec<Result<String, rbw::protocol::DecryptError>> {
         items
             .iter()
             .map(|item| {
                 if fail(&item.cipherstring) {
-                    Err(format!("cannot decrypt {}", item.cipherstring))
+                    Err(rbw::protocol::DecryptError {
+                        error: format!(
+                            "cannot decrypt {}",
+                            item.cipherstring
+                        ),
+                        code: None,
+                    })
                 } else {
                     Ok(format!("plain {}", item.cipherstring))
                 }

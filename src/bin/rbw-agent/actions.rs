@@ -932,6 +932,42 @@ async fn decrypt_cipher_in_request(
         let db = load_db().await?;
         state.set_master_password_reprompt(&db.entries);
     }
+    if state.needs_unlock() {
+        return Err(anyhow::anyhow!(
+            "failed to find decryption keys in in-memory state"
+        ));
+    }
+
+    let mut sha256 = sha2::Sha256::new();
+    sha256.update(cipherstring);
+    let master_password_reprompt: [u8; 32] = sha256.finalize().into();
+    if let Some(entry_id) = state
+        .reprompt_entry(&master_password_reprompt)
+        .map(str::to_string)
+    {
+        if !state.use_unlocked_entry(&entry_id) {
+            if environment.is_noninteractive() {
+                return Err(rbw::error::coded(
+                    rbw::protocol::ErrorCode::RepromptRequired,
+                    format!(
+                        "the entry {entry_id} asks for the master password \
+                         again; open it with rbw item unlock"
+                    ),
+                ));
+            }
+            if *reprompt_declined {
+                return Err(anyhow::anyhow!(
+                    "master password reprompt was declined earlier in this \
+                     request"
+                ));
+            }
+            if let Err(e) = confirm_master_password(environment).await {
+                *reprompt_declined = true;
+                return Err(e);
+            }
+        }
+    }
+
     let Some(keys) = state.key(org_id) else {
         return Err(anyhow::anyhow!(
             "failed to find decryption keys in in-memory state"
@@ -950,24 +986,6 @@ async fn decrypt_cipher_in_request(
         None
     };
 
-    let mut sha256 = sha2::Sha256::new();
-    sha256.update(cipherstring);
-    let master_password_reprompt: [u8; 32] = sha256.finalize().into();
-    if state
-        .master_password_reprompt
-        .contains(&master_password_reprompt)
-    {
-        if *reprompt_declined {
-            return Err(anyhow::anyhow!(
-                "master password reprompt was declined earlier in this request"
-            ));
-        }
-        if let Err(e) = confirm_master_password(environment).await {
-            *reprompt_declined = true;
-            return Err(e);
-        }
-    }
-
     let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
         .context("failed to parse encrypted secret")?;
     let plaintext = String::from_utf8(
@@ -980,38 +998,117 @@ async fn decrypt_cipher_in_request(
     Ok(plaintext)
 }
 
+// The account's unlock material, to check a master password against.
+struct PasswordCheck {
+    db: rbw::db::Db,
+    email: String,
+    kdf: rbw::api::KdfType,
+    iterations: u32,
+    protected_key: String,
+    protected_private_key: String,
+}
+
+impl PasswordCheck {
+    async fn load() -> anyhow::Result<Self> {
+        let db = load_db().await?;
+        let Some(kdf) = db.kdf else {
+            return Err(anyhow::anyhow!("failed to find kdf type in db"));
+        };
+        let Some(iterations) = db.iterations else {
+            return Err(anyhow::anyhow!(
+                "failed to find number of iterations in db"
+            ));
+        };
+        let Some(protected_key) = db.protected_key.clone() else {
+            return Err(anyhow::anyhow!(
+                "failed to find protected key in db"
+            ));
+        };
+        let Some(protected_private_key) = db.protected_private_key.clone()
+        else {
+            return Err(anyhow::anyhow!(
+                "failed to find protected private key in db"
+            ));
+        };
+        let email = config_email().await?;
+        Ok(Self {
+            db,
+            email,
+            kdf,
+            iterations,
+            protected_key,
+            protected_private_key,
+        })
+    }
+
+    fn check(
+        &self,
+        password: &rbw::locked::Password,
+    ) -> rbw::error::Result<()> {
+        rbw::actions::unlock(
+            &self.email,
+            password,
+            self.kdf,
+            self.iterations,
+            self.db.memory,
+            self.db.parallelism,
+            &self.protected_key,
+            &self.protected_private_key,
+            &self.db.protected_org_keys,
+        )
+        .map(drop)
+    }
+}
+
+// Opens an entry with master password reprompt for a while, once the master
+// password checks out: the one given, or else the one pinentry asks for.
+pub async fn unlock_entry(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    id: &str,
+    password: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut state = state.lock().await;
+    if state.needs_unlock() {
+        return Err(rbw::error::coded(
+            rbw::protocol::ErrorCode::Locked,
+            "the vault is locked",
+        ));
+    }
+    match password {
+        Some(password) => {
+            let mut bytes = rbw::locked::Vec::new();
+            bytes.extend(password.as_bytes().iter().copied());
+            match PasswordCheck::load()
+                .await?
+                .check(&rbw::locked::Password::new(bytes))
+            {
+                Ok(()) => {}
+                Err(rbw::error::Error::IncorrectPassword { message }) => {
+                    return Err(rbw::error::coded(
+                        rbw::protocol::ErrorCode::IncorrectPassword,
+                        format!("incorrect master password: {message}"),
+                    ));
+                }
+                Err(e) => {
+                    return Err(e).context("failed to check the password")
+                }
+            }
+        }
+        None => confirm_master_password(environment).await?,
+    }
+    state.unlock_entry(id);
+    respond_ack(sock).await
+}
+
 // Asks for the master password before revealing a value from an entry with
 // master password reprompt enabled. The caller holds the state lock for the
 // whole prompt, so other requests wait until it is answered.
 async fn confirm_master_password(
     environment: &rbw::protocol::Environment,
 ) -> anyhow::Result<()> {
-    let db = load_db().await?;
-
-    let Some(kdf) = db.kdf else {
-        return Err(anyhow::anyhow!("failed to find kdf type in db"));
-    };
-
-    let Some(iterations) = db.iterations else {
-        return Err(anyhow::anyhow!(
-            "failed to find number of iterations in db"
-        ));
-    };
-
-    let memory = db.memory;
-    let parallelism = db.parallelism;
-
-    let Some(protected_key) = db.protected_key else {
-        return Err(anyhow::anyhow!("failed to find protected key in db"));
-    };
-    let Some(protected_private_key) = db.protected_private_key else {
-        return Err(anyhow::anyhow!(
-            "failed to find protected private key in db"
-        ));
-    };
-
-    let email = config_email().await?;
-
+    let account = PasswordCheck::load().await?;
     let mut err_msg = None;
     for i in 1_u8..=3 {
         let err = if i > 1 {
@@ -1031,18 +1128,8 @@ async fn confirm_master_password(
         )
         .await
         .context("failed to read password from pinentry")?;
-        match rbw::actions::unlock(
-            &email,
-            &password,
-            kdf,
-            iterations,
-            memory,
-            parallelism,
-            &protected_key,
-            &protected_private_key,
-            &db.protected_org_keys,
-        ) {
-            Ok(_) => {
+        match account.check(&password) {
+            Ok(()) => {
                 break;
             }
             Err(rbw::error::Error::IncorrectPassword { message }) => {
@@ -1099,7 +1186,10 @@ pub async fn decrypt_many(
                 &mut reprompt_declined,
             )
             .await
-            .map_err(|e| format!("{e:#}")),
+            .map_err(|e| rbw::protocol::DecryptError {
+                error: format!("{e:#}"),
+                code: Some(rbw::error::code(&e)),
+            }),
         );
     }
     sock.send(&rbw::protocol::Response::DecryptMany { plaintexts })

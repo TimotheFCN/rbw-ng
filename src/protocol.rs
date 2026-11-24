@@ -248,6 +248,13 @@ pub enum Action {
     // Unlock with Touch ID only, failing instead of asking for the master
     // password
     UnlockTouchId,
+    // Let the protected values of an entry with master password reprompt
+    // be decrypted for a while, once the master password checks out: the
+    // one given, or the one pinentry asks for without it
+    UnlockEntry {
+        id: String,
+        password: Option<String>,
+    },
     // Answered with Response::Status
     Status,
     // Take over the settings that change only what the agent does, such as
@@ -255,6 +262,19 @@ pub enum Action {
     ReloadConfig,
     Quit,
     Version,
+}
+
+// Why one value of a DecryptMany failed.
+#[derive(serde::Serialize, serde::Deserialize, Debug, Clone)]
+pub struct DecryptError {
+    pub error: String,
+    pub code: Option<ErrorCode>,
+}
+
+impl DecryptError {
+    pub fn into_error(self) -> anyhow::Error {
+        crate::error::coded(self.code.unwrap_or(ErrorCode::Other), self.error)
+    }
 }
 
 #[derive(
@@ -297,6 +317,9 @@ pub enum ErrorCode {
     SessionInvalid,
     TouchIdCanceled,
     TouchIdUnavailable,
+    // the entry asks for the master password again before its secrets are
+    // shown, and wasn't unlocked with rbw item unlock
+    RepromptRequired,
     // no such entry, folder or field
     NotFound,
     // the entry changed on the server since the last sync
@@ -328,7 +351,7 @@ pub enum Response {
         plaintext: String,
     },
     DecryptMany {
-        plaintexts: Vec<Result<String, String>>,
+        plaintexts: Vec<Result<String, DecryptError>>,
     },
     Encrypt {
         cipherstring: String,

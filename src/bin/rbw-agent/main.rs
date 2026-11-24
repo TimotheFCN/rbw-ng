@@ -51,8 +51,9 @@ async fn tokio_main(
             sync_timeout,
             sync_timeout_duration,
             notifications_handler,
-            master_password_reprompt: std::collections::HashSet::new(),
+            master_password_reprompt: std::collections::HashMap::new(),
             master_password_reprompt_initialized: false,
+            unlocked_entries: std::collections::HashMap::new(),
             unlock_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(target_os = "macos")]
             touch_id_unlock: config.touch_id_unlock,

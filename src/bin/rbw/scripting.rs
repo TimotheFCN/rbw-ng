@@ -26,7 +26,7 @@ fn env_secret(name: &str) -> Option<String> {
 
 // The master password, from stdin: everything up to the end, without the
 // final line break.
-fn password_from_stdin() -> anyhow::Result<String> {
+pub fn password_from_stdin() -> anyhow::Result<String> {
     let mut password = String::new();
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut password)
         .context("failed to read the master password from stdin")?;

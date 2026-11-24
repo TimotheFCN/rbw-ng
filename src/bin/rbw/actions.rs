@@ -82,7 +82,7 @@ pub fn quit() -> anyhow::Result<()> {
 // item succeeds or fails individually
 pub fn decrypt_many(
     items: Vec<rbw::protocol::DecryptItem>,
-) -> anyhow::Result<Vec<Result<String, String>>> {
+) -> anyhow::Result<Vec<Result<String, rbw::protocol::DecryptError>>> {
     if items.is_empty() {
         return Ok(vec![]);
     }
@@ -124,7 +124,7 @@ pub fn decrypt_many(
 // inner Err, matching one item of decrypt_many.
 fn decrypt_one(
     item: &rbw::protocol::DecryptItem,
-) -> anyhow::Result<Result<String, String>> {
+) -> anyhow::Result<Result<String, rbw::protocol::DecryptError>> {
     let mut sock = connect()?;
     sock.send(&rbw::protocol::Request::new(
         get_environment(),
@@ -138,7 +138,9 @@ fn decrypt_one(
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::Decrypt { plaintext } => Ok(Ok(plaintext)),
-        rbw::protocol::Response::Error { error, .. } => Ok(Err(error)),
+        rbw::protocol::Response::Error { error, code } => {
+            Ok(Err(rbw::protocol::DecryptError { error, code }))
+        }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
 }
@@ -218,6 +220,13 @@ pub fn unlock_with(
     session: bool,
 ) -> anyhow::Result<Option<String>> {
     session_action(rbw::protocol::Action::UnlockWith { password, session })
+}
+
+pub fn unlock_entry(
+    id: String,
+    password: Option<String>,
+) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::UnlockEntry { id, password })
 }
 
 pub fn reload_config() -> anyhow::Result<()> {

@@ -1,5 +1,38 @@
 use sha2::Digest as _;
 
+// How long an entry with master password reprompt stays open after it was
+// unlocked or last read. The official clients ask again each time such an
+// entry is opened and keep it open while it is shown; a program that shows
+// one keeps reading it, at least to refresh its code every period.
+const ENTRY_UNLOCK_IDLE: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+// A use measured on both clocks, so that neither a sleep (which the
+// monotonic clock skips) nor a clock change (which the wall clock follows)
+// keeps an entry open longer.
+#[derive(Clone, Copy)]
+pub struct LastUse {
+    instant: std::time::Instant,
+    time: std::time::SystemTime,
+}
+
+impl LastUse {
+    fn now() -> Self {
+        Self {
+            instant: std::time::Instant::now(),
+            time: std::time::SystemTime::now(),
+        }
+    }
+
+    fn expired(self) -> bool {
+        self.instant.elapsed() >= ENTRY_UNLOCK_IDLE
+            || self
+                .time
+                .elapsed()
+                .map_or(true, |elapsed| elapsed >= ENTRY_UNLOCK_IDLE)
+    }
+}
+
 pub struct State {
     pub priv_key: Option<rbw::locked::Keys>,
     pub org_keys:
@@ -9,8 +42,12 @@ pub struct State {
     pub sync_timeout: crate::timeout::Timeout,
     pub sync_timeout_duration: std::time::Duration,
     pub notifications_handler: crate::notifications::Handler,
-    pub master_password_reprompt: std::collections::HashSet<[u8; 32]>,
+    // the protected values' hashes, with the id of their entry
+    pub master_password_reprompt: std::collections::HashMap<[u8; 32], String>,
     pub master_password_reprompt_initialized: bool,
+    // entries that rbw item unlock opened, by id, with when they were
+    // last read
+    pub unlocked_entries: std::collections::HashMap<String, LastUse>,
     pub unlock_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
     #[cfg(target_os = "macos")]
     // Read at startup and when `rbw config` changes it, so that a password
@@ -63,7 +100,36 @@ impl State {
     pub fn clear(&mut self) {
         self.priv_key = None;
         self.org_keys = None;
+        self.unlocked_entries.clear();
         self.timeout.clear();
+    }
+
+    // The entry a value belongs to, if the value needs the master password
+    // again.
+    pub fn reprompt_entry(&self, hash: &[u8; 32]) -> Option<&str> {
+        self.master_password_reprompt.get(hash).map(String::as_str)
+    }
+
+    pub fn unlock_entry(&mut self, id: &str) {
+        self.unlocked_entries
+            .insert(id.to_ascii_lowercase(), LastUse::now());
+    }
+
+    // Whether rbw item unlock opened the entry and it is still open; reading
+    // it keeps it open.
+    pub fn use_unlocked_entry(&mut self, id: &str) -> bool {
+        let id = id.to_ascii_lowercase();
+        match self.unlocked_entries.get(&id) {
+            Some(last_use) if !last_use.expired() => {
+                self.unlocked_entries.insert(id, LastUse::now());
+                true
+            }
+            Some(_) => {
+                self.unlocked_entries.remove(&id);
+                false
+            }
+            None => false,
+        }
     }
 
     pub fn clear_all(&mut self) {
@@ -98,7 +164,8 @@ impl State {
     // a sync, so it can't be bypassed by editing the on-disk file directly.
     // if the agent gets a request for any of those cipherstrings that it saw
     // marked as master password reprompt during the most recent sync, it
-    // forces a reprompt.
+    // forces a reprompt. each cipherstring maps to its entry's id, so that
+    // rbw item unlock can open one entry for a while.
     pub fn set_master_password_reprompt(
         &mut self,
         entries: &[rbw::db::Entry],
@@ -106,20 +173,21 @@ impl State {
         self.master_password_reprompt.clear();
 
         let mut hasher = sha2::Sha256::new();
-        let mut insert = |s: Option<&str>| {
-            if let Some(s) = s {
-                if !s.is_empty() {
-                    hasher.update(s);
-                    self.master_password_reprompt
-                        .insert(hasher.finalize_reset().into());
-                }
-            }
-        };
-
         for entry in entries {
             if !entry.master_password_reprompt() {
                 continue;
             }
+            let mut insert = |s: Option<&str>| {
+                if let Some(s) = s {
+                    if !s.is_empty() {
+                        hasher.update(s);
+                        self.master_password_reprompt.insert(
+                            hasher.finalize_reset().into(),
+                            entry.id.clone(),
+                        );
+                    }
+                }
+            };
 
             match &entry.data {
                 rbw::db::EntryData::Login { password, totp, .. } => {
@@ -167,5 +235,29 @@ impl State {
         environment: rbw::protocol::Environment,
     ) {
         self.last_environment = environment;
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn an_unlocked_entry_closes_once_unread_on_either_clock() {
+        assert!(!LastUse::now().expired());
+        let now = LastUse::now();
+        let slept = LastUse {
+            time: now.time - ENTRY_UNLOCK_IDLE,
+            ..now
+        };
+        assert!(slept.expired());
+        let clock_set_back = LastUse {
+            time: now.time + ENTRY_UNLOCK_IDLE,
+            ..now
+        };
+        assert!(clock_set_back.expired());
+        if let Some(instant) = now.instant.checked_sub(ENTRY_UNLOCK_IDLE) {
+            assert!(LastUse { instant, ..now }.expired());
+        }
     }
 }

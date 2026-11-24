@@ -36,6 +36,11 @@
   * `rbw item edit` and `rbw item delete` work on entries shared through
     an organization, and items say with `edit` whether the account may
     change them.
+  * `rbw item unlock` opens an entry that asks for the master password
+    again, with the password on stdin, for two minutes from its last read.
+    Without it, reading the entry's secrets fails with `reprompt_required`
+    when `RBW_NONINTERACTIVE` is set, and `rbw item list --secrets` lists
+    it without them.
   * `rbw item code` prints a login's current code with its period and when
     it expires, so a program can count it down.
   * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such

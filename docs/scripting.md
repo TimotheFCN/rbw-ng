@@ -46,6 +46,7 @@ The message is for people and can change. Some codes carry more:
 | `session_invalid` | `RBW_SESSION` no longer unlocks the vault |
 | `touch_id_canceled` | the person canceled Touch ID |
 | `touch_id_unavailable` | Touch ID can't unlock the vault now |
+| `reprompt_required` | the entry asks for the master password again; open it with `rbw item unlock` |
 | `not_found` | no entry or folder with this id, or the entry has no such field |
 | `conflict` | the entry changed on the server since the last sync |
 | `forbidden` | the server refused, for example an entry in a read-only collection |
@@ -174,6 +175,7 @@ never by name.
 | `rbw item get ID` | one entry, with its secrets |
 | `rbw item get ID --field username\|password\|totp\|notes` | one value; for `totp`, the current code |
 | `rbw item code ID` | the current code as `{"code":"123456","period":30,"expiresAt":1795000000}`, with `expiresAt` in Unix seconds |
+| `rbw item unlock ID [--password-stdin]` | opens an entry that asks for the master password again (see below) |
 | `rbw item create` | adds the entry on stdin and prints it as saved |
 | `rbw item edit ID` | replaces the entry with the one on stdin and prints it as saved |
 | `rbw item delete ID` | moves the entry to the trash, where the official clients can restore it |
@@ -226,6 +228,30 @@ yet:
 
 * creating an entry in an organization, or moving one into or out of it;
 * saving passkeys (`login.fido2Credentials`).
+
+### Entries that ask for the master password again
+
+An entry with Bitwarden's master password re-prompt has `"reprompt": 1`.
+Its secrets (password, code, card number and security code, social security
+and passport numbers, private key and hidden fields) stay closed while the
+vault is unlocked. With `RBW_NONINTERACTIVE`, reading one fails with
+`reprompt_required`, and `rbw item list --secrets` lists the entry without
+them; in a terminal, pinentry asks for the master password each time. Its
+other values read as usual.
+
+Ask the person for the master password and pass it to
+`rbw item unlock ID --password-stdin`. The agent checks it against the
+account's keys, as an unlock does, and fails with `incorrect_password` if it
+is wrong. The entry is then open: its secrets read, and it can be edited,
+until it goes unread for two minutes or the vault locks. Each read keeps it
+open, so a program that shows the entry and refreshes its code every period
+keeps it open while it is shown. This follows the official clients, which
+ask again each time such an entry is opened and not while it stays open.
+Without `--password-stdin`, `rbw item unlock` asks through pinentry.
+
+Editing an entry that asks for the master password again needs it open too:
+otherwise `edit` fails with `reprompt_required`, since it couldn't tell
+whether the password changed.
 
 ## Folders
 
