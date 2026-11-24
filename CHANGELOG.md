@@ -74,6 +74,17 @@ service.
 * `rbw-agent --service`, the mode the service runs the agent in: in the
   foreground, with the sockets the service manager passes, and replacing an
   agent that `rbw` started before.
+* `rbw generate` options, as in Bitwarden's generator (see
+  [docs/scripting.md](docs/scripting.md#passwords)):
+  * `--no-uppercase`, `--no-lowercase` and `--no-numbers` leave a class of
+    characters out, as `--no-symbols` does, and combine with it, so that a
+    password can be letters only, or letters and symbols.
+  * `--each-class` makes a password hold at least one character of each of
+    its classes. The password is drawn uniformly from all the passwords that
+    do, so it loses no more randomness than the requirement takes.
+  * `--separator`, `--capitalize` and `--include-number` choose what goes
+    between the words of a `--diceware` passphrase, begin each word with an
+    upper-case letter, and put a digit after one of them.
 
 ### Changed
 

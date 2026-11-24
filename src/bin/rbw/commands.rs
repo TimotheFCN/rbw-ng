@@ -1733,10 +1733,9 @@ pub fn generate(
     username: Option<&str>,
     uris: &[(String, Option<rbw::api::UriMatchType>)],
     folder: Option<&str>,
-    len: usize,
-    ty: rbw::pwgen::Type,
+    options: &rbw::pwgen::Options,
 ) -> anyhow::Result<()> {
-    let password = rbw::pwgen::pwgen(ty, len);
+    let password = rbw::pwgen::pwgen(options)?;
     println!("{password}");
 
     if let Some(name) = name {

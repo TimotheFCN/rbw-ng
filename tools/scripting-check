@@ -509,6 +509,39 @@ def icons(rbw):
         check(f"icon refuses {host!r}", rbw.error("icon", host)["code"] == "invalid_input")
 
 
+def generator(rbw):
+    """Passwords and passphrases, without logging in."""
+    def generate(*args):
+        return rbw.run("generate", *args).stdout.rstrip("\n")
+
+    classes = (str.isupper, str.islower, str.isdigit,
+               lambda c: c.isascii() and c.isprintable() and not c.isalnum() and c != " ")
+    password = generate("24")
+    check("generate draws from printable ASCII",
+          len(password) == 24 and all(any(is_class(c) for is_class in classes)
+                                      for c in password), password)
+    letters = generate("40", "--no-numbers", "--no-symbols")
+    check("generate makes letters only", len(letters) == 40 and letters.isalpha(), letters)
+    no_digits = [generate("40", "--no-numbers") for _ in range(5)]
+    check("generate leaves digits out",
+          not any(c.isdigit() for password in no_digits for c in password))
+    each = [generate("4", "--each-class") for _ in range(20)]
+    check("generate --each-class holds every class",
+          all(all(any(is_class(c) for c in password) for is_class in classes)
+              for password in each), str(each))
+    phrase = generate("5", "--diceware", "--separator", "-", "--capitalize",
+                      "--include-number")
+    words = phrase.split("-")
+    check("passphrases take a separator, capitals and a number",
+          len(words) == 5 and all(word[0].isupper() for word in words)
+          and sum(c.isdigit() for c in phrase) == 1, phrase)
+    check("generate refuses a password too short for its classes",
+          rbw.error("generate", "3", "--each-class")["code"] == "invalid_input")
+    check("generate refuses a password without characters",
+          rbw.error("generate", "8", "--no-uppercase", "--no-lowercase", "--no-numbers",
+                    "--no-symbols")["code"] == "invalid_input")
+
+
 def totp(secret_b32, at=None):
     """An RFC 6238 code (SHA-1, 6 digits, 30 s)."""
     import hashlib
@@ -666,6 +699,7 @@ def scenario(server, password):
     try:
         check("signed out", rbw.json("status", "--json")["status"] == "unauthenticated")
         icons(rbw)
+        generator(rbw)
         rbw.fails("item", "list", env=quiet, needle="not logged in")
         check("errors have codes", rbw.error("item", "list") == {
             "code": "not_logged_in", "message": "rbw item list: not logged in"})

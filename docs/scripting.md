@@ -327,6 +327,48 @@ The official clients show the icon of a login's first website, when it is
 an `http` or `https` address or a bare host name with a dot. Cache the icons:
 the service may fetch each one from the website.
 
+## Passwords
+
+`rbw generate LENGTH` prints a new password and needs no login. Each
+character is drawn uniformly at random from upper-case letters, lower-case
+letters, digits and the 32 ASCII symbols, unless options leave some of these
+classes out:
+
+| Option | Leaves out |
+| --- | --- |
+| `--no-uppercase` | upper-case letters |
+| `--no-lowercase` | lower-case letters |
+| `--no-numbers` | digits |
+| `--no-symbols` | symbols |
+
+`--only-numbers` keeps digits alone, and `--nonconfusables` keeps the 24
+digits and lower-case letters that can't be mistaken for each other.
+
+With `--each-class`, the password holds at least one character of each class
+it is made of. `rbw` draws whole passwords until one does, so the password is
+drawn uniformly from all the passwords of that length that hold every class:
+none is likelier than another, and none is left out. Its randomness is the
+logarithm of their count; with `n` characters in all, of which `n_i` in
+class `i`, the count for a length `L` is, by inclusion-exclusion over the
+classes left out:
+
+```
+sum over every set S of classes: (-1)^|S| * (n - sum of n_i for i in S)^L
+```
+
+For 20 characters of all four classes, that is 130.9 bits, 0.2 less than
+without `--each-class`. A password shorter than its number of classes, or
+without any class, fails with `invalid_input`.
+
+`rbw generate WORDS --diceware` makes a passphrase of words drawn from the
+EFF's long list of 7776 words, separated by spaces. `--separator TEXT` puts
+`TEXT` between them instead, also nothing, `--capitalize` begins each word
+with an upper-case letter, and `--include-number` puts a digit after one
+word, which adds the choice of the word and of the digit:
+`log2(10 * WORDS)` bits. No word of the list begins another, so a passphrase
+reads back into its words whatever the separator, and holds all of that
+randomness.
+
 ## SSH agent
 
 `rbw ssh-agent install` and `rbw ssh-agent uninstall` need no terminal.

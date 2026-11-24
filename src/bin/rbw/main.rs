@@ -272,14 +272,23 @@ enum Opt {
         about = "Generate a new password",
         long_about = "Generate a new password\n\n\
             If given a password entry name, also save the generated \
-            password to the database.",
+            password to the database.\n\n\
+            A password is drawn from upper-case letters, lower-case \
+            letters, digits and symbols, each character uniformly at \
+            random, unless options leave some out. With --each-class, it \
+            is drawn uniformly from the passwords that hold a character of \
+            each of these classes.",
         visible_alias = "gen",
-        group = clap::ArgGroup::new("password-type").args(&[
-            "no_symbols",
-            "only_numbers",
-            "nonconfusables",
-            "diceware",
-        ])
+        group = clap::ArgGroup::new("classes")
+            .args(["no_uppercase", "no_lowercase", "no_numbers", "no_symbols"])
+            .multiple(true),
+        group = clap::ArgGroup::new("password-type")
+            .args(["only_numbers", "nonconfusables", "diceware"])
+            .conflicts_with("classes"),
+        group = clap::ArgGroup::new("passphrase")
+            .args(["separator", "capitalize", "include_number"])
+            .multiple(true)
+            .requires("diceware"),
     )]
     Generate {
         #[arg(help = "Length of the password to generate")]
@@ -296,6 +305,21 @@ enum Opt {
         uri: Vec<String>,
         #[arg(long, help = "Folder for the password entry")]
         folder: Option<String>,
+        #[arg(
+            long = "no-uppercase",
+            help = "Generate a password without upper-case letters"
+        )]
+        no_uppercase: bool,
+        #[arg(
+            long = "no-lowercase",
+            help = "Generate a password without lower-case letters"
+        )]
+        no_lowercase: bool,
+        #[arg(
+            long = "no-numbers",
+            help = "Generate a password without digits"
+        )]
+        no_numbers: bool,
         #[arg(
             long = "no-symbols",
             help = "Generate a password with no special characters"
@@ -314,6 +338,15 @@ enum Opt {
         )]
         nonconfusables: bool,
         #[arg(
+            long = "each-class",
+            conflicts_with = "diceware",
+            help = "Generate a password with at least one character of \
+                each class it is made of: upper-case letters, lower-case \
+                letters, digits and symbols (or, with --nonconfusables, \
+                digits and letters)"
+        )]
+        each_class: bool,
+        #[arg(
             long,
             help = "Generate a password of multiple dictionary \
                 words chosen from the EFF word list. The len \
@@ -321,6 +354,24 @@ enum Opt {
                 of words to generate, rather than characters."
         )]
         diceware: bool,
+        #[arg(
+            long,
+            value_name = "TEXT",
+            help = "With --diceware, put this between the words instead \
+                of a space"
+        )]
+        separator: Option<String>,
+        #[arg(
+            long,
+            help = "With --diceware, begin each word with an upper-case \
+                letter"
+        )]
+        capitalize: bool,
+        #[arg(
+            long = "include-number",
+            help = "With --diceware, put a digit after one of the words"
+        )]
+        include_number: bool,
     },
 
     #[command(
@@ -786,21 +837,41 @@ fn run(opt: Opt) -> anyhow::Result<()> {
             user,
             uri,
             folder,
+            no_uppercase,
+            no_lowercase,
+            no_numbers,
             no_symbols,
             only_numbers,
             nonconfusables,
+            each_class,
             diceware,
+            separator,
+            capitalize,
+            include_number,
         } => {
-            let ty = if no_symbols {
-                rbw::pwgen::Type::NoSymbols
-            } else if only_numbers {
-                rbw::pwgen::Type::Numbers
-            } else if nonconfusables {
-                rbw::pwgen::Type::NonConfusables
-            } else if diceware {
-                rbw::pwgen::Type::Diceware
+            let options = if diceware {
+                rbw::pwgen::Options::Passphrase(rbw::pwgen::Passphrase {
+                    words: len,
+                    separator: separator.unwrap_or_else(|| " ".to_string()),
+                    capitalize,
+                    number: include_number,
+                })
             } else {
-                rbw::pwgen::Type::AllChars
+                let characters = if nonconfusables {
+                    rbw::pwgen::Characters::NonConfusables
+                } else {
+                    rbw::pwgen::Characters::Classes {
+                        uppercase: !no_uppercase && !only_numbers,
+                        lowercase: !no_lowercase && !only_numbers,
+                        numbers: !no_numbers,
+                        symbols: !no_symbols && !only_numbers,
+                    }
+                };
+                rbw::pwgen::Options::Password(rbw::pwgen::Password {
+                    length: len,
+                    characters,
+                    each_class,
+                })
             };
             commands::generate(
                 name.as_deref(),
@@ -811,8 +882,7 @@ fn run(opt: Opt) -> anyhow::Result<()> {
                     .map(|uri| (uri.clone(), None))
                     .collect::<Vec<_>>(),
                 folder.as_deref(),
-                len,
-                ty,
+                &options,
             )
         }
         Opt::Edit {
@@ -992,6 +1062,40 @@ mod test {
             &["rbw", "add", "entry", "user", "--secure-note"][..],
             &["rbw", "add", "entry", "--secure-note", "--uri", "x"][..],
             &["rbw", "add", "entry", "--field", "novalue"][..],
+        ] {
+            assert!(Opt::try_parse_from(args).is_err(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn generate_options_combine_where_they_make_sense() {
+        for args in [
+            &["rbw", "generate", "12", "--no-numbers", "--no-symbols"][..],
+            &["rbw", "generate", "12", "--no-uppercase", "--each-class"][..],
+            &["rbw", "generate", "12", "--nonconfusables", "--each-class"][..],
+            &["rbw", "generate", "12", "--only-numbers"][..],
+            &[
+                "rbw",
+                "generate",
+                "5",
+                "--diceware",
+                "--separator",
+                "-",
+                "--capitalize",
+                "--include-number",
+            ][..],
+        ] {
+            assert!(Opt::try_parse_from(args).is_ok(), "{args:?}");
+        }
+        for args in [
+            &["rbw", "generate", "12", "--only-numbers", "--no-symbols"][..],
+            &["rbw", "generate", "12", "--nonconfusables", "--no-numbers"][..],
+            &["rbw", "generate", "12", "--diceware", "--no-symbols"][..],
+            &["rbw", "generate", "12", "--diceware", "--each-class"][..],
+            &["rbw", "generate", "12", "--diceware", "--only-numbers"][..],
+            &["rbw", "generate", "12", "--separator", "-"][..],
+            &["rbw", "generate", "12", "--capitalize"][..],
+            &["rbw", "generate", "12", "--include-number"][..],
         ] {
             assert!(Opt::try_parse_from(args).is_err(), "{args:?}");
         }

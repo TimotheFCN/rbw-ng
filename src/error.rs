@@ -293,6 +293,9 @@ pub enum Error {
     #[error("invalid profile: {reason}")]
     InvalidProfile { reason: String },
 
+    #[error("{message}")]
+    InvalidGeneratorOptions { message: String },
+
     #[error("invalid url")]
     InvalidUrl { source: url::ParseError },
 
@@ -318,7 +321,8 @@ impl Error {
             }
             Self::RegistrationRequired => ErrorCode::RegistrationRequired,
             Self::CipherOutOfDate => ErrorCode::Conflict,
-            Self::InvalidProfile { .. } => ErrorCode::InvalidInput,
+            Self::InvalidProfile { .. }
+            | Self::InvalidGeneratorOptions { .. } => ErrorCode::InvalidInput,
             Self::WrongServer => ErrorCode::WrongServer,
             Self::IconTooLarge => ErrorCode::Server { status: None },
             Self::IconRead { .. } => ErrorCode::Network,
