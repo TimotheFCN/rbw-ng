@@ -728,6 +728,7 @@ pub async fn sync(
             protected_private_key,
             protected_org_keys,
             entries,
+            folders,
             user_id,
         ),
     ) = rbw::actions::sync(&access_token, &refresh_token)
@@ -751,6 +752,7 @@ pub async fn sync(
     db.protected_org_keys = protected_org_keys;
     db.user_id = Some(user_id);
     db.entries = entries;
+    db.folders = folders;
     save_db(&db).await?;
     #[cfg(target_os = "macos")]
     if protected_key_changed {

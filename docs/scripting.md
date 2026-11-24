@@ -177,10 +177,20 @@ replaces each of the values above, so send the whole entry: a missing password
 removes it, except for `favorite`, which stays as it is when it is left out.
 An edit that changes the password moves the old one into the history, as the
 official clients do. It keeps what `rbw` doesn't save, such as passkeys and
-attachments. If the entry changed on the
-server in the meantime, the edit fails instead of overwriting the change.
+attachments. If the entry changed on the server in the meantime, the edit
+fails instead of overwriting the change.
 
 These aren't supported yet:
 
 * entries in organizations;
 * saving passkeys (`login.fido2Credentials`).
+
+## Folders
+
+| Command | Prints |
+| --- | --- |
+| `rbw folder list` | every folder, also the empty ones |
+| `rbw folder create NAME` | adds a folder and prints it |
+
+A folder is `{"object":"folder","id":"...","name":"..."}`, as in Bitwarden's
+format. An entry's `folderId` puts it in a folder.

@@ -1639,6 +1639,7 @@ impl Client {
         String,
         std::collections::HashMap<String, String>,
         Vec<crate::db::Entry>,
+        Vec<crate::db::Folder>,
         String,
     )> {
         let client = self.reqwest_client().await?;
@@ -1670,6 +1671,13 @@ impl Client {
                     sync_res.profile.private_key,
                     org_keys,
                     ciphers,
+                    folders
+                        .into_iter()
+                        .map(|folder| crate::db::Folder {
+                            id: folder.id,
+                            name: folder.name,
+                        })
+                        .collect(),
                     sync_res.profile.id,
                 ))
             }

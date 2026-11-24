@@ -25,6 +25,8 @@
   * `rbw item create` and `rbw item edit` set the favorite flag.
   * `rbw item delete` moves an entry to the trash, as the official clients
     do, instead of deleting it for good like `rbw remove`.
+  * `rbw folder list|create` list and add folders as JSON. The local copy
+    of the vault now keeps every folder, also the empty ones.
   * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such
     as `locked` or `two_step_required`, so that programs don't depend on
     the wording of messages.

@@ -148,6 +148,7 @@ pub async fn sync(
         String,
         std::collections::HashMap<String, String>,
         Vec<crate::db::Entry>,
+        Vec<crate::db::Folder>,
         String,
     ),
 )> {
@@ -169,6 +170,7 @@ async fn sync_once(
     String,
     std::collections::HashMap<String, String>,
     Vec<crate::db::Entry>,
+    Vec<crate::db::Folder>,
     String,
 )> {
     let (client, _) = api_client_async().await?;

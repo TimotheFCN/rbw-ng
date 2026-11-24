@@ -1,6 +1,7 @@
-// rbw item: entries as JSON in Bitwarden's item format, the format of the
-// official CLI and of Bitwarden's JSON export, for programs that drive rbw.
-// Entries are found by id only, never by name. See docs/scripting.md.
+// rbw item and rbw folder: entries and folders as JSON in Bitwarden's
+// format, the format of the official CLI and of Bitwarden's JSON export, for
+// programs that drive rbw. They are found by id only, never by name. See
+// docs/scripting.md.
 
 use anyhow::Context as _;
 use rbw::error::coded;
@@ -747,6 +748,54 @@ pub fn delete(id: &str) -> anyhow::Result<()> {
     let (access_token, refresh_token) = tokens(&db)?;
     rbw::actions::trash(&access_token, &refresh_token, &entry.id)?;
     crate::actions::sync()
+}
+
+pub fn folder_list() -> anyhow::Result<()> {
+    crate::commands::unlock()?;
+    let db = crate::commands::load_db()?;
+    let names = crate::actions::decrypt_many(
+        db.folders
+            .iter()
+            .map(|folder| rbw::protocol::DecryptItem {
+                cipherstring: folder.name.clone(),
+                entry_key: None,
+                org_id: None,
+            })
+            .collect(),
+    )?;
+    let folders = db
+        .folders
+        .iter()
+        .zip(names)
+        .map(|(folder, name)| {
+            let name = name.map_err(|error| {
+                anyhow::anyhow!("failed to decrypt {}: {error}", folder.id)
+            })?;
+            Ok(folder_json(&folder.id, &name))
+        })
+        .collect::<anyhow::Result<_>>()?;
+    print_json(&Value::Array(folders))
+}
+
+pub fn folder_create(name: &str) -> anyhow::Result<()> {
+    if name.trim().is_empty() {
+        return Err(coded(ErrorCode::InvalidInput, "a folder needs a name"));
+    }
+    crate::commands::unlock()?;
+    let db = crate::commands::load_db()?;
+    let (access_token, refresh_token) = tokens(&db)?;
+    let encrypted = crate::actions::encrypt(name, None, None)?;
+    let (_, id) = rbw::actions::create_folder(
+        &access_token,
+        &refresh_token,
+        &encrypted,
+    )?;
+    crate::actions::sync()?;
+    print_json(&folder_json(&id, name))
+}
+
+fn folder_json(id: &str, name: &str) -> Value {
+    json!({ "object": "folder", "id": id, "name": name })
 }
 
 #[cfg(test)]

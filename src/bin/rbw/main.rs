@@ -111,6 +111,17 @@ enum Opt {
         item: Item,
     },
 
+    #[command(
+        about = "List and create folders as JSON, for other programs",
+        long_about = "List and create folders as JSON, for other programs\n\n\
+            Folders are in Bitwarden's format, the format of the official \
+            CLI."
+    )]
+    Folder {
+        #[command(subcommand)]
+        folder: Folder,
+    },
+
     #[command(about = "Check if the local Bitwarden database is unlocked")]
     Unlocked,
 
@@ -385,6 +396,23 @@ enum Item {
     Delete { id: String },
 }
 
+#[derive(Debug, clap::Subcommand)]
+enum Folder {
+    #[command(about = "List every folder")]
+    List,
+    #[command(about = "Add a folder and print it")]
+    Create { name: String },
+}
+
+impl Folder {
+    const fn subcommand_name(&self) -> &'static str {
+        match self {
+            Self::List => "list",
+            Self::Create { .. } => "create",
+        }
+    }
+}
+
 impl Item {
     const fn subcommand_name(&self) -> &'static str {
         match self {
@@ -408,6 +436,9 @@ impl Opt {
             Self::Unlock { .. } => "unlock".to_string(),
             Self::Status { .. } => "status".to_string(),
             Self::Item { item } => format!("item {}", item.subcommand_name()),
+            Self::Folder { folder } => {
+                format!("folder {}", folder.subcommand_name())
+            }
             Self::Unlocked => "unlocked".to_string(),
             Self::Sync => "sync".to_string(),
             Self::List { .. } => "list".to_string(),
@@ -560,6 +591,10 @@ fn main() {
             Item::Create => items::create(),
             Item::Edit { id } => items::edit(&id),
             Item::Delete { id } => items::delete(&id),
+        },
+        Opt::Folder { folder } => match folder {
+            Folder::List => items::folder_list(),
+            Folder::Create { name } => items::folder_create(&name),
         },
         Opt::Unlocked => commands::unlocked(),
         Opt::Sync => commands::sync(),

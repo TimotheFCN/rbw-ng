@@ -204,6 +204,15 @@ pub struct Field {
 #[derive(
     serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
 )]
+pub struct Folder {
+    pub id: String,
+    // encrypted
+    pub name: String,
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
+)]
 pub struct HistoryEntry {
     pub last_used_date: String,
     pub password: String,
@@ -225,6 +234,10 @@ pub struct Db {
     pub user_id: Option<String>,
 
     pub entries: Vec<Entry>,
+    // every folder, also the empty ones. dbs from before rbw-ng 1.19 don't
+    // have them until the next sync.
+    #[serde(default)]
+    pub folders: Vec<Folder>,
 }
 
 // A temporary file in the same directory as the db, so that renaming it over

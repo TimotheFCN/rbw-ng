@@ -148,6 +148,18 @@ def kinds(rbw, quiet):
     check("a broken SSH key is refused", error["code"] == "invalid_input", str(error))
 
 
+def folders(rbw, quiet):
+    """Folders, also empty ones, and entries in them."""
+    folder = rbw.json("folder", "create", "Travel", env=quiet)
+    check("folder create prints the folder",
+          folder["object"] == "folder" and folder["name"] == "Travel" and folder["id"])
+    check("folder list has the empty folder",
+          folder in rbw.json("folder", "list", env=quiet))
+    note = rbw.json("item", "create", env=quiet, stdin=json.dumps({
+        "type": 2, "name": "Passport scan", "folderId": folder["id"]}))
+    check("an entry goes into the folder", note["folderId"] == folder["id"])
+
+
 def favorites(rbw, quiet):
     """The favorite flag, set by create and edit, kept when left out."""
     note = rbw.json("item", "create", env=quiet, stdin=json.dumps({
@@ -344,6 +356,7 @@ def scenario(server, password):
         check("create takes base64 JSON", mail["login"]["uris"][0]["match"] == 3)
 
         kinds(rbw, quiet)
+        folders(rbw, quiet)
         favorites(rbw, quiet)
 
         listed = rbw.json("item", "list", env=quiet)
