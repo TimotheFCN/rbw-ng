@@ -472,8 +472,15 @@ fn read_item(input: &str) -> anyhow::Result<ItemIn> {
         )
         .context("the item on stdin isn't UTF-8")?
     };
-    let item: ItemIn = serde_json::from_str(&json)
-        .context("the item on stdin isn't a Bitwarden item")?;
+    // serde's message can quote a value, such as a password given as a
+    // number, so only say where the item went wrong
+    let item: ItemIn = serde_json::from_str(&json).map_err(|e| {
+        anyhow::anyhow!(
+            "the item on stdin isn't a Bitwarden item: line {}, column {}",
+            e.line(),
+            e.column()
+        )
+    })?;
     if item
         .login
         .as_ref()
@@ -980,6 +987,19 @@ mod test {
         let encoded = rbw::base64::encode(item.as_bytes());
         assert_eq!(read_item(&encoded).unwrap().name, "GitHub");
         assert!(read_item("not json").is_err());
+    }
+
+    #[test]
+    fn errors_quote_no_value_of_the_item() {
+        for item in [
+            r#"{"type":"hunter2","name":"x"}"#,
+            r#"{"type":1,"name":"x","login":{"password":["hunter2"]}}"#,
+            r#"{"type":1,"name":"x","fields":[{"type":"hunter2"}]}"#,
+        ] {
+            let error = format!("{:#}", read_item(item).unwrap_err());
+            assert!(!error.contains("hunter2"), "{error}");
+            assert!(error.contains("line 1, column"), "{error}");
+        }
     }
 
     #[test]
