@@ -14,8 +14,9 @@ service.
   manager (see [docs/scripting.md](docs/scripting.md)):
   * `rbw login --password-stdin` and `rbw unlock --password-stdin` take the
     master password on stdin. `--method` and `--code` finish a two-step or
-    new device login, and `rbw register --api-key-env` reads the API key from
-    the environment.
+    new device login, with `--code-env` reading the code from `RBW_CODE`,
+    out of sight of other users, and `rbw register --api-key-env` reads the
+    API key from the environment.
   * `--session` prints a session key that unlocks the vault again through
     `RBW_SESSION`, even after the agent restarted. The agent keeps only the
     vault key encrypted with it.

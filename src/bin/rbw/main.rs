@@ -68,6 +68,13 @@ enum Opt {
         code: Option<String>,
         #[arg(
             long,
+            conflicts_with = "code",
+            help = "Read the code of --code from RBW_CODE instead, out of \
+                sight of other users of this computer"
+        )]
+        code_env: bool,
+        #[arg(
+            long,
             help = "Print a session key that unlocks the vault again \
                 through RBW_SESSION"
         )]
@@ -671,8 +678,11 @@ fn run(opt: Opt) -> anyhow::Result<()> {
             password_stdin,
             method,
             code,
+            code_env,
             session,
-        } => scripting::login(password_stdin, method, code, session),
+        } => {
+            scripting::login(password_stdin, method, code, code_env, session)
+        }
         Opt::Unlock {
             password_stdin,
             session,

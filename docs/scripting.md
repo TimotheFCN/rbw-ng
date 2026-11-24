@@ -90,15 +90,17 @@ When the server asks for more, the login fails with one of these errors:
 
 | Code | Next step |
 | --- | --- |
-| `two_step_required` | ask for a code from one of the `methods`, then run `rbw login --password-stdin --method ID --code CODE` |
+| `two_step_required` | ask for a code from one of the `methods`, then run `rbw login --password-stdin --method ID --code-env` with the code in `RBW_CODE` |
 | `two_step_code_sent` | the answer to `--method 1 --code ""`: Bitwarden emailed the code |
-| `new_device_code_required` | run `--code CODE` without `--method`, with the code Bitwarden emailed |
+| `new_device_code_required` | run `--code-env` without `--method`, with the code Bitwarden emailed in `RBW_CODE` |
 | `registration_required` | run `rbw register --api-key-env` (see below), then log in again |
 | `incorrect_password` | ask again |
 | `incorrect_code` | ask for a new code |
 
 The method ids are Bitwarden's: `0` authenticator app, `1` email, `3` YubiKey
-OTP. A login that succeeds also unlocks.
+OTP. A login that succeeds also unlocks. `--code CODE` works too, but every
+user of the computer can see a program's arguments, and only the same user
+its environment.
 
 Bitwarden servers from before mid-2025 may refuse a password login from a
 device they don't know by asking for a captcha, which `rbw` can't show: the

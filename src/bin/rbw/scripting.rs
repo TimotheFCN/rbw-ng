@@ -14,6 +14,9 @@ const NONINTERACTIVE: &str = "RBW_NONINTERACTIVE";
 const SESSION: &str = "RBW_SESSION";
 const CLIENT_ID: &str = "RBW_CLIENT_ID";
 const CLIENT_SECRET: &str = "RBW_CLIENT_SECRET";
+// The code of rbw login --code-env, which an argument would show to every
+// user in the process list.
+const CODE: &str = "RBW_CODE";
 
 pub fn noninteractive() -> bool {
     std::env::var_os(NONINTERACTIVE)
@@ -88,19 +91,30 @@ pub fn login(
     password_stdin: bool,
     method: Option<u8>,
     code: Option<String>,
+    code_env: bool,
     session: bool,
 ) -> anyhow::Result<()> {
     if !password_stdin {
-        if method.is_some() || code.is_some() || session {
+        if method.is_some() || code.is_some() || code_env || session {
             anyhow::bail!(
-                "--method, --code and --session need --password-stdin"
+                "--method, --code, --code-env and --session need \
+                 --password-stdin"
             );
         }
         crate::commands::login()?;
         return Ok(());
     }
+    let code = if code_env {
+        // empty asks the server to email a code, as --code "" does
+        Some(
+            std::env::var(CODE)
+                .map_err(|_| anyhow::anyhow!("--code-env needs {CODE}"))?,
+        )
+    } else {
+        code
+    };
     if method.is_some() && code.is_none() {
-        anyhow::bail!("--method needs --code");
+        anyhow::bail!("--method needs --code or --code-env");
     }
     let password = password_from_stdin()?;
     crate::commands::ensure_agent()?;

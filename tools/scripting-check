@@ -815,11 +815,14 @@ def two_step(server, password):
               str(error))
         rbw.fails("login", "--password-stdin", "--method", "2", "--code", "1",
                   stdin=password, env=quiet, needle="isn't supported")
+        rbw.fails("login", "--password-stdin", "--method", "0", "--code-env",
+                  stdin=password, env=quiet, needle="--code-env needs RBW_CODE")
         # the server refuses a code twice, and enabling used this one
         time.sleep(30 - time.time() % 30 + 1)
-        rbw.run("login", "--password-stdin", "--method", "0", "--code", totp(secret),
-                stdin=password, env=quiet)
-        check("login with the code", rbw.json("status", "--json")["status"] == "unlocked")
+        rbw.run("login", "--password-stdin", "--method", "0", "--code-env",
+                stdin=password, env={**quiet, "RBW_CODE": totp(secret)})
+        check("login with the code in RBW_CODE",
+              rbw.json("status", "--json")["status"] == "unlocked")
     finally:
         rbw.stop()
         shutil.rmtree(home, ignore_errors=True)
