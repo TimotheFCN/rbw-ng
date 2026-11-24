@@ -118,6 +118,9 @@ pub fn status() -> anyhow::Result<()> {
     let agent_at = |path: &std::path::Path| {
         if is_rbw(path) {
             "rbw-agent".to_string()
+        } else if path == rbw::dirs::service_ssh_agent_socket_file() {
+            "nothing: rbw-agent's socket, but its service isn't installed"
+                .to_string()
         } else {
             format!("another agent, at {}", path.display())
         }
