@@ -7,6 +7,8 @@
 // through IdentityAgent in ~/.ssh/config, for all hosts or for some, and
 // tools that only read SSH_AUTH_SOCK through the shell profile.
 
+pub const MANAGER: &str = "launchd";
+
 const LAUNCHCTL: &str = "/bin/launchctl";
 const LABEL_PREFIX: &str = "io.github.timothefcn.rbw-ng.";
 
@@ -70,24 +72,23 @@ pub fn install(service: &super::Service) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn install_notes() -> Vec<String> {
-    let socket = super::tilde(&rbw::dirs::service_ssh_agent_socket_file());
-    vec![
-        "Apple's ssh-agent keeps SSH_AUTH_SOCK. To use the vault's keys, \
-        point SSH at rbw-agent in ~/.ssh/config, for all hosts:"
-            .to_string(),
-        String::new(),
-        "  Host *".to_string(),
-        format!("      IdentityAgent \"{socket}\""),
-        String::new(),
-        "or only in the Host entries that need them; SSH uses the first \
-        IdentityAgent that matches. Tools that only read SSH_AUTH_SOCK, such \
-        as ssh-add and git's SSH commit signing, use it from a shell with \
-        this in its profile:"
-            .to_string(),
-        String::new(),
-        "  export SSH_AUTH_SOCK=\"$(rbw ssh-agent socket)\"".to_string(),
-    ]
+pub fn next_steps(socket: &std::path::Path) -> Vec<super::Step> {
+    if super::ssh_config_uses(socket) {
+        return vec![];
+    }
+    let line = format!("    IdentityAgent \"{}\"", super::tilde(socket));
+    vec![super::Step {
+        text: "Paste this so that SSH uses it for every host:".to_string(),
+        command: Some(format!(
+            "mkdir -p ~/.ssh && printf '\\nHost *\\n%s\\n' {} >> ~/.ssh/config",
+            super::shell_quote(&line)
+        )),
+        note: Some(
+            "For some hosts only, put that IdentityAgent line under their \
+            Host entries instead."
+                .to_string(),
+        ),
+    }]
 }
 
 pub fn uninstall(name: &str) -> anyhow::Result<bool> {
@@ -101,11 +102,11 @@ pub fn uninstall(name: &str) -> anyhow::Result<bool> {
 }
 
 pub fn uninstall_notes() -> Vec<String> {
-    vec![
-        "Remove rbw-agent's IdentityAgent from ~/.ssh/config, and its \
-        SSH_AUTH_SOCK from the shell profile, if you added them."
-            .to_string(),
-    ]
+    if super::ssh_config_uses(&rbw::dirs::service_ssh_agent_socket_file()) {
+        vec!["Remove its IdentityAgent line from ~/.ssh/config.".to_string()]
+    } else {
+        vec![]
+    }
 }
 
 pub fn log(_name: &str) -> String {

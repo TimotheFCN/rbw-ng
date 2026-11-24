@@ -3,6 +3,8 @@
 // the same signatures as the service managers' modules
 #![allow(clippy::unnecessary_wraps)]
 
+pub const MANAGER: &str = "system";
+
 pub fn check_supported() -> anyhow::Result<()> {
     anyhow::bail!(
         "rbw ssh-agent install needs launchd (macOS) or systemd (Linux); \
@@ -35,7 +37,7 @@ pub fn install(_service: &super::Service) -> anyhow::Result<()> {
     check_supported()
 }
 
-pub fn install_notes() -> Vec<String> {
+pub fn next_steps(_socket: &std::path::Path) -> Vec<super::Step> {
     vec![]
 }
 

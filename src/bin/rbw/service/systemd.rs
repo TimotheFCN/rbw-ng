@@ -3,6 +3,8 @@
 // program connects. An environment.d file sets SSH_AUTH_SOCK for the
 // programs that the user's systemd and graphical session start.
 
+pub const MANAGER: &str = "systemd";
+
 const SYSTEMCTL: &str = "systemctl";
 
 pub fn check_supported() -> anyhow::Result<()> {
@@ -108,28 +110,71 @@ pub fn install(service: &super::Service) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn install_notes() -> Vec<String> {
-    let mut notes = vec![
-        "Graphical sessions get SSH_AUTH_SOCK from the next login on, through \
-        environment.d."
-            .to_string(),
-        "Logins that don't read environment.d, such as SSH and the console, \
-        need this in the shell profile:"
-            .to_string(),
-        "  export SSH_AUTH_SOCK=\"$(rbw ssh-agent socket)\"".to_string(),
-    ];
-    if let Some(current) = std::env::var_os("SSH_AUTH_SOCK") {
-        let ssh = rbw::dirs::ssh_agent_socket_file();
-        if std::path::Path::new(&current) != ssh {
-            notes.push(format!(
-                "SSH_AUTH_SOCK is {} in this shell: if another agent sets it \
-                at login, such as GNOME Keyring's, `rbw ssh-agent status` \
-                will show it after you log in again.",
-                std::path::Path::new(&current).display()
-            ));
-        }
+pub fn next_steps(socket: &std::path::Path) -> Vec<super::Step> {
+    let mut steps = vec![];
+    if std::env::var_os("SSH_AUTH_SOCK").as_deref()
+        != Some(socket.as_os_str())
+    {
+        steps.push(super::Step {
+            text:
+                "Log out and back in, so that your desktop session uses it."
+                    .to_string(),
+            command: None,
+            note: None,
+        });
     }
-    notes
+    steps.extend(shell_profile_step());
+    steps
+}
+
+// environment.d doesn't reach SSH and console logins, but the shell's
+// startup file does.
+fn shell_profile_step() -> Option<super::Step> {
+    let Some((file, line)) = shell_profile() else {
+        return Some(super::Step {
+            text:
+                "For SSH and console logins, also add this to your shell's \
+                startup file:"
+                    .to_string(),
+            command: Some(EXPORT.to_string()),
+            note: None,
+        });
+    };
+    if profile_sets_socket(file) {
+        return None;
+    }
+    Some(super::Step {
+        text: "For SSH and console logins, also paste this:".to_string(),
+        command: Some(format!(
+            "echo {} >> ~/{file}",
+            super::shell_quote(line)
+        )),
+        note: None,
+    })
+}
+
+const EXPORT: &str = "export SSH_AUTH_SOCK=\"$(rbw ssh-agent socket)\"";
+
+// The startup file of the user's shell, in the home folder, and the line
+// that sets SSH_AUTH_SOCK there.
+fn shell_profile() -> Option<(&'static str, &'static str)> {
+    let shell = std::env::var_os("SHELL")?;
+    match std::path::Path::new(&shell).file_name()?.to_str()? {
+        "bash" => Some((".bashrc", EXPORT)),
+        "zsh" => Some((".zshrc", EXPORT)),
+        "fish" => Some((
+            ".config/fish/config.fish",
+            "set -gx SSH_AUTH_SOCK (rbw ssh-agent socket)",
+        )),
+        _ => None,
+    }
+}
+
+fn profile_sets_socket(file: &str) -> bool {
+    super::home_dir().is_some_and(|home| {
+        std::fs::read_to_string(home.join(file))
+            .is_ok_and(|text| text.contains("rbw ssh-agent socket"))
+    })
 }
 
 pub fn uninstall(name: &str) -> anyhow::Result<bool> {
@@ -152,10 +197,18 @@ pub fn uninstall(name: &str) -> anyhow::Result<bool> {
 }
 
 pub fn uninstall_notes() -> Vec<String> {
-    vec![
+    let mut notes = vec![
         "Log out and back in so that SSH_AUTH_SOCK goes back to what it was."
             .to_string(),
-    ]
+    ];
+    if let Some((file, _)) =
+        shell_profile().filter(|(file, _)| profile_sets_socket(file))
+    {
+        notes.push(format!(
+            "Remove the `rbw ssh-agent socket` line from ~/{file}."
+        ));
+    }
+    notes
 }
 
 pub fn log(name: &str) -> String {

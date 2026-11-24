@@ -33,6 +33,14 @@ pub struct Service {
     pub path: std::ffi::OsString,
 }
 
+// Something the user should do after installing.
+pub struct Step {
+    pub text: String,
+    // a command to paste, on a line of its own
+    pub command: Option<String>,
+    pub note: Option<String>,
+}
+
 // How long rbw waits for the service's agent to answer.
 const START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
@@ -59,12 +67,13 @@ pub fn install() -> anyhow::Result<()> {
     platform::install(&service)?;
 
     println!(
-        "rbw-agent now runs as {}.",
-        platform::describe(&service.name)
+        "rbw-agent is installed as a {} service: it starts whenever SSH or \
+        rbw needs it.",
+        platform::MANAGER
     );
-    for line in platform::install_notes() {
-        println!("{line}");
-    }
+    print_steps(&platform::next_steps(&ssh_socket(&service.name)));
+    println!();
+    println!("Check the setup with: rbw ssh-agent status");
     Ok(())
 }
 
@@ -76,8 +85,8 @@ pub fn uninstall() -> anyhow::Result<()> {
         return Ok(());
     }
     println!(
-        "Removed {}. rbw starts the agent itself again.",
-        platform::describe(&name)
+        "rbw-agent is no longer a {} service: rbw starts it itself again.",
+        platform::MANAGER
     );
     for line in platform::uninstall_notes() {
         println!("{line}");
@@ -134,6 +143,53 @@ pub fn socket() {
         |name| ssh_socket(&name),
     );
     println!("{}", socket.display());
+}
+
+fn print_steps(steps: &[Step]) {
+    let numbered = steps.len() > 1;
+    for (i, step) in steps.iter().enumerate() {
+        // a step after a pasted command stands apart from it
+        if i == 0
+            || steps[i - 1].command.is_some()
+            || steps[i - 1].note.is_some()
+        {
+            println!();
+        }
+        let indent = if numbered {
+            if i == 0 {
+                println!("Next:");
+            }
+            print!("  {}. ", i + 1);
+            "     "
+        } else {
+            print!("Next: ");
+            "  "
+        };
+        let mut text = step.text.chars();
+        let first = text.next().map(|first| {
+            if numbered {
+                first
+            } else {
+                first.to_ascii_lowercase()
+            }
+        });
+        println!("{}{}", first.unwrap_or_default(), text.as_str());
+        if let Some(command) = &step.command {
+            println!();
+            println!("{indent}  {command}");
+            if step.note.is_some() {
+                println!();
+            }
+        }
+        if let Some(note) = &step.note {
+            println!("{indent}{note}");
+        }
+    }
+}
+
+// Quotes text for a POSIX shell (and fish).
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 // The SSH socket to point programs at: the service's when it has one of its
@@ -450,6 +506,12 @@ fn run(program: &str, args: &[&str]) -> anyhow::Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_quoting_survives_quotes() {
+        assert_eq!(super::shell_quote("a b"), "'a b'");
+        assert_eq!(super::shell_quote("it's"), "'it'\\''s'");
+    }
+
     #[test]
     fn identity_agent_lines_are_read() {
         let home = std::path::Path::new("/home/me");
