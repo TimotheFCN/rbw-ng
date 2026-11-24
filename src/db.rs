@@ -28,6 +28,9 @@ pub struct Entry {
     pub favorite: bool,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub archived: bool,
+    // in a collection this account can only read
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 impl Entry {

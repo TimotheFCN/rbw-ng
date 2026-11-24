@@ -157,6 +157,10 @@ of Bitwarden's format, says whether it has a code. A card has only its
 and `keyFingerprint`. Listing without secrets is also faster, since only
 these values are decrypted.
 
+`edit`, from Bitwarden's sync data, is `false` for an entry in a collection
+that the account can only read: editing or deleting it fails with
+`forbidden`.
+
 Archived entries are left out of `rbw item list`. An unknown id, or a field
 the entry doesn't have, fails with `not_found`.
 
@@ -180,9 +184,11 @@ official clients do. It keeps what `rbw` doesn't save, such as passkeys and
 attachments. If the entry changed on the server in the meantime, the edit
 fails instead of overwriting the change.
 
-These aren't supported yet:
+Entries shared through an organization are read, edited and deleted like the
+others; an edit keeps the entry's `organizationId`. These aren't supported
+yet:
 
-* entries in organizations;
+* creating an entry in an organization, or moving one into or out of it;
 * saving passkeys (`login.fido2Credentials`).
 
 ## Folders

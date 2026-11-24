@@ -5012,6 +5012,7 @@ mod test {
             revision_date: None,
             favorite: false,
             archived: false,
+            read_only: false,
         }
     }
 
@@ -5311,6 +5312,7 @@ mod test {
                 revision_date: None,
                 favorite: false,
                 archived: false,
+                read_only: false,
             },
             DecryptedSearchCipher {
                 id: id.to_string(),

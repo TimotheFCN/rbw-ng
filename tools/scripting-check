@@ -28,11 +28,46 @@ import urllib.request
 
 BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "target", "debug")
 
-def register(server, email, password):
-    """Creates a Bitwarden account the way the official clients do."""
-    from cryptography.hazmat.primitives import hashes, hmac, padding, serialization
-    from cryptography.hazmat.primitives.asymmetric import rsa
+def b64(data):
+    return base64.b64encode(data).decode()
+
+
+def encrypt(enc_key, mac_key, plaintext):
+    """A type 2 cipherstring: AES-256-CBC with HMAC-SHA256."""
+    from cryptography.hazmat.primitives import hashes, hmac, padding
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    iv = secrets.token_bytes(16)
+    padder = padding.PKCS7(128).padder()
+    padded = padder.update(plaintext) + padder.finalize()
+    encryptor = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).encryptor()
+    ciphertext = encryptor.update(padded) + encryptor.finalize()
+    mac = hmac.HMAC(mac_key, hashes.SHA256())
+    mac.update(iv + ciphertext)
+    return f"2.{b64(iv)}|{b64(ciphertext)}|{b64(mac.finalize())}"
+
+
+def rsa_keys():
+    """A new RSA key pair, as DER: the public key and the private key."""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    public_der = private_key.public_key().public_bytes(
+        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
+    )
+    private_der = private_key.private_bytes(
+        serialization.Encoding.DER,
+        serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption(),
+    )
+    return public_der, private_der
+
+
+def register(server, email, password):
+    """Creates a Bitwarden account the way the official clients do; returns
+    its public key."""
+    from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
     from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
@@ -46,27 +81,9 @@ def register(server, email, password):
     stretched_enc = HKDFExpand(hashes.SHA256(), 32, b"enc").derive(master_key)
     stretched_mac = HKDFExpand(hashes.SHA256(), 32, b"mac").derive(master_key)
 
-    def encrypt(enc_key, mac_key, plaintext):
-        iv = secrets.token_bytes(16)
-        padder = padding.PKCS7(128).padder()
-        padded = padder.update(plaintext) + padder.finalize()
-        encryptor = Cipher(algorithms.AES(enc_key), modes.CBC(iv)).encryptor()
-        ciphertext = encryptor.update(padded) + encryptor.finalize()
-        mac = hmac.HMAC(mac_key, hashes.SHA256())
-        mac.update(iv + ciphertext)
-        b64 = lambda b: base64.b64encode(b).decode()
-        return f"2.{b64(iv)}|{b64(ciphertext)}|{b64(mac.finalize())}"
-
     user_key = secrets.token_bytes(64)
-    private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    public_der = private_key.public_key().public_bytes(
-        serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo
-    )
-    private_der = private_key.private_bytes(
-        serialization.Encoding.DER,
-        serialization.PrivateFormat.PKCS8,
-        serialization.NoEncryption(),
-    )
+    public_der, private_der = rsa_keys()
+
     def post(path, body):
         request = urllib.request.Request(
             server.rstrip("/") + path,
@@ -93,6 +110,7 @@ def register(server, email, password):
         "kdf": 0,
         "kdfIterations": iterations,
     })
+    return public_der
 
 
 # an unencrypted ed25519 key, made for this check
@@ -181,6 +199,55 @@ def favorites(rbw, quiet):
           rbw.error("item", "get", note["id"])["code"] == "not_found")
 
 
+def share_login(server, email, password, public_der):
+    """Creates an organization with a login in its collection, as its
+    owner; returns the login's id."""
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import padding
+
+    call, _ = api(server, email, password)
+    org_key = secrets.token_bytes(64)
+    seal = lambda text: encrypt(org_key[:32], org_key[32:], text.encode())
+    wrapped = serialization.load_der_public_key(public_der).encrypt(
+        org_key, padding.OAEP(mgf=padding.MGF1(hashes.SHA1()),
+                              algorithm=hashes.SHA1(), label=None))
+    org_public, org_private = rsa_keys()
+    org = call("/api/organizations", {
+        "name": "Family", "billingEmail": email, "planType": 0,
+        "collectionName": seal("Shared"), "key": f"4.{b64(wrapped)}",
+        "keys": {"publicKey": b64(org_public),
+                 "encryptedPrivateKey": encrypt(org_key[:32], org_key[32:], org_private)},
+    })
+    collections = call(f"/api/organizations/{org['id']}/collections")["data"]
+    cipher = call("/api/ciphers/create", {
+        "cipher": {"type": 1, "name": seal("Family router"), "organizationId": org["id"],
+                   "encryptedFor": call("/api/accounts/profile")["id"],
+                   "login": {"username": seal("admin"), "password": seal("router-password")}},
+        "collectionIds": [collections[0]["id"]],
+    })
+    return cipher["id"]
+
+
+def organizations(rbw, quiet, shared_id):
+    """An entry shared through an organization: read, edited, deleted."""
+    shared = next(i for i in rbw.json("item", "list", env=quiet) if i["id"] == shared_id)
+    check("list has the organization's entry",
+          shared["organizationId"] and shared["name"] == "Family router"
+          and shared["edit"] is True, str(shared))
+    full = rbw.json("item", "get", shared_id, env=quiet)
+    check("get decrypts it with the organization's key",
+          full["login"]["password"] == "router-password")
+    full["login"]["password"] = "new-router-password"
+    rbw.run("item", "edit", shared_id, env=quiet, stdin=json.dumps(full))
+    check("edit changes it", rbw.run("item", "get", shared_id, "--field", "password",
+                                     env=quiet).stdout == "new-router-password\n")
+    error = rbw.error("item", "create", stdin=json.dumps({**full, "id": None}))
+    check("create refuses an organization", error["code"] == "unsupported", str(error))
+    rbw.run("item", "delete", shared_id, env=quiet)
+    check("delete moves it to the trash",
+          all(i["id"] != shared_id for i in rbw.json("item", "list", env=quiet)))
+
+
 def totp(secret_b32, at=None):
     """An RFC 6238 code (SHA-1, 6 digits, 30 s)."""
     import hashlib
@@ -195,8 +262,9 @@ def totp(secret_b32, at=None):
     return f"{value % 1_000_000:06d}"
 
 
-def enable_authenticator(server, email, password):
-    """Turns on authenticator-app two-step login; returns its secret."""
+def api(server, email, password):
+    """Logs in to the server's API; returns a function that calls it, and
+    the master password hash."""
     import urllib.parse
     import uuid
 
@@ -218,14 +286,21 @@ def enable_authenticator(server, email, password):
     with urllib.request.urlopen(request) as response:
         access_token = json.loads(response.read())["access_token"]
 
-    def post(path, body):
+    def call(path, body=None):
         request = urllib.request.Request(
-            server.rstrip("/") + path, data=json.dumps(body).encode(),
+            server.rstrip("/") + path,
+            data=None if body is None else json.dumps(body).encode(),
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {access_token}"})
         with urllib.request.urlopen(request) as response:
             return json.loads(response.read())
 
+    return call, master_hash
+
+
+def enable_authenticator(server, email, password):
+    """Turns on authenticator-app two-step login; returns its secret."""
+    post, master_hash = api(server, email, password)
     answer = post("/api/two-factor/get-authenticator",
                   {"masterPasswordHash": master_hash})
     # newer servers nest the key and add a token proving the password check
@@ -314,7 +389,8 @@ def check(name, condition, detail=""):
 
 def scenario(server, password):
     email = f"scripting-{secrets.token_hex(4)}@example.com"
-    register(server, email, password)
+    public_der = register(server, email, password)
+    shared_id = share_login(server, email, password, public_der)
     home = tempfile.mkdtemp(prefix="rbw-scripting-")
     rbw = Rbw(home, server, email)
     quiet = {"RBW_NONINTERACTIVE": "1"}
@@ -356,6 +432,7 @@ def scenario(server, password):
         check("create takes base64 JSON", mail["login"]["uris"][0]["match"] == 3)
 
         kinds(rbw, quiet)
+        organizations(rbw, quiet, shared_id)
         folders(rbw, quiet)
         favorites(rbw, quiet)
 

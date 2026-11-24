@@ -46,6 +46,7 @@ fn item_json(
         "reprompt": u8::from(entry.master_password_reprompt()),
         "name": open(entry, Some(&entry.name)),
         "favorite": entry.favorite,
+        "edit": !entry.read_only,
         "revisionDate": entry.revision_date,
         "deletedDate": null,
     });
@@ -414,12 +415,6 @@ fn read_item(input: &str) -> anyhow::Result<ItemIn> {
     };
     let item: ItemIn = serde_json::from_str(&json)
         .context("the item on stdin isn't a Bitwarden item")?;
-    if item.organization_id.is_some() {
-        return Err(coded(
-            ErrorCode::Unsupported,
-            "items in organizations aren't supported yet",
-        ));
-    }
     if item
         .login
         .as_ref()
@@ -658,8 +653,31 @@ fn tokens(db: &rbw::db::Db) -> anyhow::Result<(String, String)> {
     Ok((access_token, refresh_token))
 }
 
+fn check_writable(entry: &rbw::db::Entry) -> anyhow::Result<()> {
+    if entry.read_only {
+        return Err(coded(
+            ErrorCode::Forbidden,
+            "the entry is in a collection this account can only read",
+        ));
+    }
+    Ok(())
+}
+
+fn same_id(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        (a, b) => a == b,
+    }
+}
+
 pub fn create() -> anyhow::Result<()> {
     let item = read_stdin_item()?;
+    if item.organization_id.is_some() {
+        return Err(coded(
+            ErrorCode::Unsupported,
+            "creating entries in organizations isn't supported yet",
+        ));
+    }
     crate::commands::unlock()?;
     let mut db = crate::commands::load_db()?;
     if db.user_id.is_none() {
@@ -703,6 +721,13 @@ pub fn edit(id: &str) -> anyhow::Result<()> {
     crate::commands::unlock()?;
     let db = crate::commands::load_db()?;
     let entry = find(&db, id)?;
+    check_writable(entry)?;
+    if !same_id(item.organization_id.as_deref(), entry.org_id.as_deref()) {
+        return Err(coded(
+            ErrorCode::Unsupported,
+            "moving entries between organizations isn't supported yet",
+        ));
+    }
     if type_id(&entry.data) != item.ty {
         return Err(coded(
             ErrorCode::InvalidInput,
@@ -745,6 +770,7 @@ pub fn delete(id: &str) -> anyhow::Result<()> {
     crate::commands::unlock()?;
     let db = crate::commands::load_db()?;
     let entry = find(&db, id)?;
+    check_writable(entry)?;
     let (access_token, refresh_token) = tokens(&db)?;
     rbw::actions::trash(&access_token, &refresh_token, &entry.id)?;
     crate::actions::sync()
@@ -816,7 +842,6 @@ mod test {
     fn refuses_what_it_cant_save() {
         for item in [
             r#"{"type":9,"name":"Unknown"}"#,
-            r#"{"type":1,"name":"x","organizationId":"org"}"#,
             r#"{"type":1,"name":"x","login":{"fido2Credentials":[{}]}}"#,
         ] {
             assert!(read_item(item).is_err(), "{item}");

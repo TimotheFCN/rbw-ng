@@ -461,6 +461,8 @@ struct SyncResCipher {
     favorite: Option<bool>,
     #[serde(rename = "ArchivedDate", alias = "archivedDate", default)]
     archived_date: Option<String>,
+    #[serde(rename = "Edit", alias = "edit", default)]
+    edit: Option<bool>,
 }
 
 // The id and revision date of a cipher the server just created or changed.
@@ -617,6 +619,7 @@ impl SyncResCipher {
             revision_date: self.revision_date.clone(),
             favorite: self.favorite.unwrap_or(false),
             archived: self.archived_date.is_some(),
+            read_only: self.edit == Some(false),
         })
     }
 }
