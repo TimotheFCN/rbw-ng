@@ -1670,6 +1670,7 @@ pub fn add(
         &fields,
         notes.as_deref(),
         folder_id.as_deref(),
+        false,
     )?;
 
     crate::actions::sync()?;
@@ -1794,6 +1795,7 @@ pub fn generate(
             &[],
             None,
             folder_id.as_deref(),
+            false,
         )?;
 
         crate::actions::sync()?;
@@ -1856,6 +1858,7 @@ pub fn edit(
         entry.key.as_deref(),
         // the command line edits what the local copy has, like rbw always
         // did; a newer change on the server is overwritten
+        None,
         None,
     )?;
 

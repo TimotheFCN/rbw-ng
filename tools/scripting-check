@@ -148,6 +148,21 @@ def kinds(rbw, quiet):
     check("a broken SSH key is refused", error["code"] == "invalid_input", str(error))
 
 
+def favorites(rbw, quiet):
+    """The favorite flag, set by create and edit, kept when left out."""
+    note = rbw.json("item", "create", env=quiet, stdin=json.dumps({
+        "type": 2, "name": "Starred", "notes": "x", "favorite": True}))
+    check("create marks a favorite", note["favorite"] is True)
+    full = rbw.json("item", "get", note["id"], env=quiet)
+    del full["favorite"]
+    rbw.run("item", "edit", note["id"], env=quiet, stdin=json.dumps(full))
+    check("edit without the flag keeps it",
+          rbw.json("item", "get", note["id"], env=quiet)["favorite"] is True)
+    full["favorite"] = False
+    edited = rbw.json("item", "edit", note["id"], env=quiet, stdin=json.dumps(full))
+    check("edit unmarks a favorite", edited["favorite"] is False)
+
+
 def totp(secret_b32, at=None):
     """An RFC 6238 code (SHA-1, 6 digits, 30 s)."""
     import hashlib
@@ -323,6 +338,7 @@ def scenario(server, password):
         check("create takes base64 JSON", mail["login"]["uris"][0]["match"] == 3)
 
         kinds(rbw, quiet)
+        favorites(rbw, quiet)
 
         listed = rbw.json("item", "list", env=quiet)
         by_id = {item["id"]: item for item in listed}

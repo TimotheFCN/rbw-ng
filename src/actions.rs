@@ -184,9 +184,19 @@ pub fn add(
     fields: &[crate::db::Field],
     notes: Option<&str>,
     folder_id: Option<&str>,
+    favorite: bool,
 ) -> Result<(Option<RefreshedTokens>, crate::api::SavedCipher)> {
     with_exchange_refresh_token(access_token, refresh_token, |access_token| {
-        add_once(access_token, user_id, name, data, fields, notes, folder_id)
+        add_once(
+            access_token,
+            user_id,
+            name,
+            data,
+            fields,
+            notes,
+            folder_id,
+            favorite,
+        )
     })
 }
 
@@ -198,9 +208,19 @@ fn add_once(
     fields: &[crate::db::Field],
     notes: Option<&str>,
     folder_id: Option<&str>,
+    favorite: bool,
 ) -> Result<crate::api::SavedCipher> {
     let (client, _) = api_client()?;
-    client.add(access_token, user_id, name, data, fields, notes, folder_id)
+    client.add(
+        access_token,
+        user_id,
+        name,
+        data,
+        fields,
+        notes,
+        folder_id,
+        favorite,
+    )
 }
 
 pub fn edit(
@@ -217,6 +237,7 @@ pub fn edit(
     history: &[crate::db::HistoryEntry],
     key: Option<&str>,
     last_known_revision_date: Option<&str>,
+    favorite: Option<bool>,
 ) -> Result<(Option<RefreshedTokens>, crate::api::SavedCipher)> {
     with_exchange_refresh_token(access_token, refresh_token, |access_token| {
         edit_once(
@@ -232,6 +253,7 @@ pub fn edit(
             history,
             key,
             last_known_revision_date,
+            favorite,
         )
     })
 }
@@ -249,6 +271,7 @@ fn edit_once(
     history: &[crate::db::HistoryEntry],
     key: Option<&str>,
     last_known_revision_date: Option<&str>,
+    favorite: Option<bool>,
 ) -> Result<crate::api::SavedCipher> {
     let (client, _) = api_client()?;
     client.edit(
@@ -264,6 +287,7 @@ fn edit_once(
         history,
         key,
         last_known_revision_date,
+        favorite,
     )
 }
 

@@ -163,7 +163,7 @@ the entry doesn't have, fails with `not_found`.
 They print the entry as the server saved it, without secrets. They save:
 
 * logins, secure notes, cards, identities and SSH keys;
-* the name, notes and folder;
+* the name, notes, folder and favorite flag;
 * a login's username, password, TOTP secret and addresses with their match
   types;
 * every value of a card and of an identity;
@@ -173,9 +173,10 @@ They print the entry as the server saved it, without secrets. They save:
 
 Other keys, such as `id`, `object` or `collectionIds`, are ignored. `edit`
 replaces each of the values above, so send the whole entry: a missing password
-removes it. An edit that changes the password moves the old one into the
-history, as the official clients do. It keeps what `rbw` doesn't save, such as
-passkeys, attachments and the favorite flag. If the entry changed on the
+removes it, except for `favorite`, which stays as it is when it is left out.
+An edit that changes the password moves the old one into the history, as the
+official clients do. It keeps what `rbw` doesn't save, such as passkeys and
+attachments. If the entry changed on the
 server in the meantime, the edit fails instead of overwriting the change.
 
 These aren't supported yet:

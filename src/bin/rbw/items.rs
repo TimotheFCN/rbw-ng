@@ -321,6 +321,8 @@ struct ItemIn {
     notes: Option<String>,
     folder_id: Option<String>,
     organization_id: Option<String>,
+    // missing: unchanged by an edit
+    favorite: Option<bool>,
     login: Option<LoginIn>,
     card: Option<CardIn>,
     identity: Option<IdentityIn>,
@@ -680,6 +682,7 @@ pub fn create() -> anyhow::Result<()> {
         &fields,
         notes.as_deref(),
         item.folder_id.as_deref(),
+        item.favorite.unwrap_or(false),
     )?;
     print_saved(&saved.id)
 }
@@ -732,6 +735,7 @@ pub fn edit(id: &str) -> anyhow::Result<()> {
         &history,
         entry.key.as_deref(),
         entry.revision_date.as_deref(),
+        item.favorite,
     )?;
     print_saved(&entry.id)
 }

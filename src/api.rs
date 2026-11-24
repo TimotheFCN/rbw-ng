@@ -1005,6 +1005,7 @@ fn ciphers_post_req(
     fields: &[crate::db::Field],
     notes: Option<&str>,
     folder_id: Option<&str>,
+    favorite: bool,
 ) -> CiphersPostReq {
     let data_req = cipher_req_data(data);
     CiphersPostReq {
@@ -1017,6 +1018,7 @@ fn ciphers_post_req(
         identity: data_req.identity,
         secure_note: data_req.secure_note,
         ssh_key: data_req.ssh_key,
+        favorite,
         encrypted_for: user_id.to_string(),
         fields: cipher_fields(fields),
     }
@@ -1169,6 +1171,7 @@ struct CiphersPostReq {
     secure_note: Option<CipherSecureNote>,
     #[serde(rename = "sshKey")]
     ssh_key: Option<CipherSshKey>,
+    favorite: bool,
     #[serde(rename = "encryptedFor")]
     encrypted_for: String,
     fields: Vec<CipherField>,
@@ -1688,9 +1691,11 @@ impl Client {
         fields: &[crate::db::Field],
         notes: Option<&str>,
         folder_id: Option<&str>,
+        favorite: bool,
     ) -> Result<SavedCipher> {
-        let req =
-            ciphers_post_req(user_id, name, data, fields, notes, folder_id);
+        let req = ciphers_post_req(
+            user_id, name, data, fields, notes, folder_id, favorite,
+        );
         let client = self.blocking_reqwest_client()?;
         let res = client
             .post(self.api_url("/ciphers"))
@@ -1748,6 +1753,7 @@ impl Client {
         history: &[crate::db::HistoryEntry],
         key: Option<&str>,
         last_known_revision_date: Option<&str>,
+        favorite: Option<bool>,
     ) -> Result<SavedCipher> {
         let data_req = cipher_req_data(data);
         let req = CiphersPutReq {
@@ -1780,6 +1786,13 @@ impl Client {
             &server,
             &format_rfc3339(std::time::SystemTime::now()),
         );
+        if let (Some(favorite), Some(req)) = (favorite, req.as_object_mut()) {
+            req.retain(|k, _| !k.eq_ignore_ascii_case("favorite"));
+            req.insert(
+                "favorite".to_string(),
+                serde_json::Value::Bool(favorite),
+            );
+        }
         if let (Some(revision_date), Some(req)) =
             (last_known_revision_date, req.as_object_mut())
         {
@@ -2547,6 +2560,7 @@ mod tests {
             &fields,
             Some("2.notes"),
             Some("folder-id"),
+            false,
         );
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
@@ -2560,6 +2574,7 @@ mod tests {
                 "identity": null,
                 "secureNote": { "type": 0 },
                 "sshKey": null,
+                "favorite": false,
                 "encryptedFor": "user-id",
                 "fields": [{
                     "Type": 1,
@@ -2586,9 +2601,11 @@ mod tests {
             &[],
             None,
             None,
+            true,
         );
         let req = serde_json::to_value(&req).unwrap();
         assert_eq!(req["type"], 1);
+        assert_eq!(req["favorite"], true);
         assert_eq!(req["secureNote"], serde_json::Value::Null);
         assert_eq!(req["fields"], serde_json::json!([]));
         assert_eq!(
