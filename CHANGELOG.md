@@ -18,6 +18,22 @@
   * `rbw status [--json]` says whether the account is logged in and unlocked.
   * `rbw item list|get|create|edit` read and save entries as JSON in
     Bitwarden's item format, by id. Listing leaves secrets out unless asked.
+* `rbw ssh-agent install` runs `rbw-agent` as a login service of launchd
+  (macOS) or systemd (Linux). The service manager holds the agent's sockets
+  and starts the agent when a program connects, and `rbw` uses the same
+  agent. On Linux, `SSH_AUTH_SOCK` points to it in graphical sessions. On
+  macOS, Apple's `ssh-agent` keeps `SSH_AUTH_SOCK`, and SSH reaches
+  `rbw-agent` through `IdentityAgent` in `~/.ssh/config`, for all hosts or
+  some. `rbw ssh-agent uninstall` removes the service, `status` shows what
+  serves SSH, and `socket` prints the SSH socket's path.
+* `rbw-agent --service`, the mode the service runs the agent in: in the
+  foreground, with the sockets the service manager passes, and replacing an
+  agent that `rbw` started before.
+
+### Fixed
+
+* An agent started while another one answers on rbw's socket now leaves it
+  alone instead of taking over its path.
 
 ## [1.18.1] - 2026-11-23
 

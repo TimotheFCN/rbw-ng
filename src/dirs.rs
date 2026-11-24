@@ -77,6 +77,13 @@ pub fn ssh_agent_socket_file() -> std::path::PathBuf {
     runtime_dir().join("ssh-agent-socket")
 }
 
+// The SSH socket that launchd holds for the macOS service. launchd creates it
+// at login, before anything could create the runtime folder, so it lives in
+// a folder that outlasts restarts.
+pub fn service_ssh_agent_socket_file() -> std::path::PathBuf {
+    data_dir().join("ssh-agent-socket")
+}
+
 fn config_dir() -> std::path::PathBuf {
     let project_dirs =
         directories::ProjectDirs::from("", "", &profile()).unwrap();

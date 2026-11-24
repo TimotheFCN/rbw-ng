@@ -2525,9 +2525,17 @@ pub fn stop_agent() -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn ssh_agent_install() -> anyhow::Result<()> {
+    check_config()?;
+    crate::service::install()
+}
+
 pub fn ensure_agent() -> anyhow::Result<()> {
     check_config()?;
     if matches!(check_agent_version(), Ok(())) {
+        return Ok(());
+    }
+    if crate::service::start_agent()? {
         return Ok(());
     }
     run_agent()?;
