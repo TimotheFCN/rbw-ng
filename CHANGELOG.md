@@ -83,6 +83,9 @@
   UTF-8. Such a profile kept its files outside its own folders, so that
   `RBW_PROFILE=x/../.. rbw purge --all` removed the home folder, and one that
   wasn't UTF-8 used the default profile.
+* `rbw-agent` no longer quotes a request it can't read, in its log and in its
+  answer, only names the request's action: a request from a newer `rbw` can
+  carry the master password.
 
 ## [1.18.1] - 2026-11-23
 
