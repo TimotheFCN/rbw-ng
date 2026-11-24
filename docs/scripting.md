@@ -235,8 +235,10 @@ replaces each of the values above, so send the whole entry: a missing password
 removes it, except for `favorite`, which stays as it is when it is left out.
 An edit that changes the password moves the old one into the history, as the
 official clients do. It keeps what `rbw` doesn't save, such as passkeys and
-attachments. If the entry changed on the server in the meantime, the edit
-fails instead of overwriting the change.
+attachments. If the entry changed on the server since the `revisionDate` of
+the entry on stdin, as `rbw item get` printed it, the edit fails with
+`conflict` instead of overwriting the change; without a `revisionDate`, it
+fails if the entry changed since the last sync.
 
 Entries shared through an organization are read, edited and deleted like the
 others; an edit keeps the entry's `organizationId`. These aren't supported

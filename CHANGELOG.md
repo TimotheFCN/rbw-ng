@@ -108,6 +108,10 @@ service.
     logins.
 * `rbw register` with a wrong API key on Vaultwarden says the key is
   incorrect instead of reporting a server error.
+* `rbw item edit` takes the `revisionDate` of the entry on stdin, and fails
+  with `conflict` if the entry changed on the server since the program read
+  it, not only since the last sync. `rbw item favorite` and `rbw item move`
+  keep the folder or the flag that another device set since the last sync.
 * Logging in or registering with a server address that leads to no Bitwarden
   server says so, instead of failing to parse JSON or, with
   `RBW_ERROR_FORMAT=json`, reporting `not_found`.

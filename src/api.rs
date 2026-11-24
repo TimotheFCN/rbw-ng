@@ -1234,6 +1234,37 @@ struct CiphersPartialReq {
     favorite: bool,
 }
 
+// What a partial update changes. It sets the folder and the favorite flag
+// together, so the other one comes from the server's copy, which another
+// device may have changed since the last sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartialChange {
+    Folder(Option<String>),
+    Favorite(bool),
+}
+
+impl CiphersPartialReq {
+    fn new(server: &serde_json::Value, change: &PartialChange) -> Self {
+        let server = server.as_object();
+        let current =
+            |key| server.and_then(|server| get_ignore_case(server, key));
+        match change {
+            PartialChange::Folder(folder_id) => Self {
+                folder_id: folder_id.clone(),
+                favorite: current("favorite")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            },
+            PartialChange::Favorite(favorite) => Self {
+                folder_id: current("folderId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(std::string::ToString::to_string),
+                favorite: *favorite,
+            },
+        }
+    }
+}
+
 #[derive(serde::Serialize, Debug)]
 struct FoldersPostReq {
     name: String,
@@ -1928,13 +1959,10 @@ impl Client {
         &self,
         access_token: &str,
         id: &str,
-        folder_id: Option<&str>,
-        favorite: bool,
+        change: &PartialChange,
     ) -> Result<()> {
-        let req = CiphersPartialReq {
-            folder_id: folder_id.map(std::string::ToString::to_string),
-            favorite,
-        };
+        let req =
+            CiphersPartialReq::new(&self.cipher(access_token, id)?, change);
         let client = self.blocking_reqwest_client()?;
         let res = client
             .put(self.api_url(&format!("/ciphers/{id}/partial")))
@@ -2778,6 +2806,30 @@ mod tests {
             serde_json::to_value(&req).unwrap(),
             serde_json::json!({ "folderId": null, "favorite": true })
         );
+    }
+
+    #[test]
+    fn partial_update_keeps_the_servers_other_value() {
+        let server = serde_json::json!({
+            "id": "a", "folderId": "on-the-server", "favorite": true,
+        });
+        let req =
+            CiphersPartialReq::new(&server, &PartialChange::Favorite(false));
+        assert_eq!(req.folder_id.as_deref(), Some("on-the-server"));
+        assert!(!req.favorite);
+        let req = CiphersPartialReq::new(
+            &server,
+            &PartialChange::Folder(Some("new".to_string())),
+        );
+        assert_eq!(req.folder_id.as_deref(), Some("new"));
+        assert!(req.favorite);
+        let old_vaultwarden =
+            serde_json::json!({ "FolderId": "f", "Favorite": true });
+        let req = CiphersPartialReq::new(
+            &old_vaultwarden,
+            &PartialChange::Folder(None),
+        );
+        assert_eq!((req.folder_id, req.favorite), (None, true));
     }
 
     #[test]

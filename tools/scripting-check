@@ -240,6 +240,22 @@ def favorites(rbw, quiet):
           rbw.error("item", "get", note["id"])["code"] == "not_found")
 
 
+def other_device(rbw, quiet, server, email, password):
+    """Changes that another device made since the last sync."""
+    note = rbw.json("item", "create", env=quiet, stdin=json.dumps({
+        "type": 2, "name": "Moved elsewhere", "notes": "x"}))
+    folder = rbw.json("folder", "create", "Elsewhere", env=quiet)
+    call, _ = api(server, email, password)
+    call(f"/api/ciphers/{note['id']}/partial", {"folderId": folder["id"], "favorite": False})
+    marked = rbw.json("item", "favorite", note["id"], "true", env=quiet)
+    check("item favorite keeps the folder another device set",
+          marked["folderId"] == folder["id"] and marked["favorite"] is True, str(marked))
+    call(f"/api/ciphers/{note['id']}/partial", {"folderId": folder["id"], "favorite": False})
+    moved = rbw.json("item", "move", note["id"], env=quiet)
+    check("item move keeps the flag another device set",
+          moved["folderId"] is None and moved["favorite"] is False, str(moved))
+
+
 def share_login(server, email, password, public_der):
     """Creates an organization with two logins in its collection, as its
     owner, the second with master password reprompt; returns their ids."""
@@ -686,6 +702,7 @@ def scenario(server, password):
         organizations(rbw, quiet, shared_id)
         folders(rbw, quiet)
         favorites(rbw, quiet)
+        other_device(rbw, quiet, server, email, password)
 
         listed = rbw.json("item", "list", env=quiet)
         by_id = {item["id"]: item for item in listed}
@@ -724,6 +741,9 @@ def scenario(server, password):
         check("a broken item is invalid_input",
               rbw.error("item", "create", stdin="{")["code"] == "invalid_input")
 
+        # Vaultwarden takes a copy up to a second older than the entry as
+        # current, so the edit must come later for the stale one to conflict
+        time.sleep(2)
         got["login"]["password"] = "second-password"
         got["login"]["uris"].append({"uri": "https://gist.github.com", "match": 1})
         edited = rbw.json("item", "edit", item_id, env=quiet, stdin=json.dumps(got))
@@ -734,6 +754,9 @@ def scenario(server, password):
               and [h["password"] for h in again["passwordHistory"]] == ["first-password"])
         check("edit keeps the rest", again["notes"] == "recovery codes"
               and again["login"]["totp"] == "JBSWY3DPEHPK3PXP")
+        error = rbw.error("item", "edit", item_id, stdin=json.dumps(got))
+        check("an edit of what changed since it was read is a conflict",
+              error["code"] == "conflict", str(error))
         rbw.fails("item", "edit", item_id, env=quiet, needle="another id",
                   stdin=json.dumps({**again, "id": mail["id"]}))
         rbw.fails("item", "create", env=quiet, needle="passkeys aren't supported",

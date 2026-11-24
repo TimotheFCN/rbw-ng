@@ -384,6 +384,8 @@ struct ItemIn {
     organization_id: Option<String>,
     // missing: unchanged by an edit
     favorite: Option<bool>,
+    // what the program read: an edit fails if the entry changed since
+    revision_date: Option<String>,
     login: Option<LoginIn>,
     card: Option<CardIn>,
     identity: Option<IdentityIn>,
@@ -846,7 +848,9 @@ pub fn edit(id: &str) -> anyhow::Result<()> {
         item.folder_id.as_deref(),
         &history,
         entry.key.as_deref(),
-        entry.revision_date.as_deref(),
+        item.revision_date
+            .as_deref()
+            .or(entry.revision_date.as_deref()),
         item.favorite,
     )?;
     print_saved(&entry.id)
@@ -863,54 +867,41 @@ pub fn delete(id: &str) -> anyhow::Result<()> {
 }
 
 // Sets what belongs to the account rather than to the entry, its folder
-// and favorite flag, without its secrets, so that it works for entries in
+// or favorite flag, without its secrets, so that it works for entries in
 // read-only collections too.
 fn save_partial(
     id: &str,
-    folder_id: impl FnOnce(
-        &rbw::db::Db,
-        &rbw::db::Entry,
-    ) -> anyhow::Result<Option<String>>,
-    favorite: impl FnOnce(&rbw::db::Entry) -> bool,
+    change: impl FnOnce(&rbw::db::Db) -> anyhow::Result<rbw::api::PartialChange>,
 ) -> anyhow::Result<()> {
     crate::commands::unlock()?;
     let db = crate::commands::load_db()?;
     let entry = find(&db, id)?;
-    let folder_id = folder_id(&db, entry)?;
+    let change = change(&db)?;
     let (access_token, refresh_token) = tokens(&db)?;
-    rbw::actions::partial(
-        &access_token,
-        &refresh_token,
-        &entry.id,
-        folder_id.as_deref(),
-        favorite(entry),
-    )?;
+    rbw::actions::partial(&access_token, &refresh_token, &entry.id, &change)?;
     print_saved(&entry.id)
 }
 
 pub fn favorite(id: &str, favorite: bool) -> anyhow::Result<()> {
-    save_partial(id, |_, entry| Ok(entry.folder_id.clone()), |_| favorite)
+    save_partial(id, |_| Ok(rbw::api::PartialChange::Favorite(favorite)))
 }
 
 // Moves an entry into a folder, or out of any folder without one.
 pub fn move_to(id: &str, folder: Option<&str>) -> anyhow::Result<()> {
-    save_partial(
-        id,
-        |db, _| {
-            folder
-                .map(|folder| {
-                    db.folders
-                        .iter()
-                        .find(|known| known.id.eq_ignore_ascii_case(folder))
-                        .map(|known| known.id.clone())
-                        .ok_or_else(|| {
-                            coded(ErrorCode::NotFound, "no such folder")
-                        })
-                })
-                .transpose()
-        },
-        |entry| entry.favorite,
-    )
+    save_partial(id, |db| {
+        let folder = folder
+            .map(|folder| {
+                db.folders
+                    .iter()
+                    .find(|known| known.id.eq_ignore_ascii_case(folder))
+                    .map(|known| known.id.clone())
+                    .ok_or_else(|| {
+                        coded(ErrorCode::NotFound, "no such folder")
+                    })
+            })
+            .transpose()?;
+        Ok(rbw::api::PartialChange::Folder(folder))
+    })
 }
 
 // Opens an entry that asks for the master password again, so that its
