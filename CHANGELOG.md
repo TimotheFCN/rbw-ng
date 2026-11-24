@@ -48,6 +48,8 @@
     the wording of messages.
   * A login that the server refuses until the device is registered with
     the account's API key fails with `registration_required`.
+* `rbw icon HOST` prints a website's icon from the server's icon service,
+  for programs that show entries with their icons.
 * `rbw profiles [--json]` lists the profiles on this computer, and
   `rbw purge --all` removes a profile with its configuration and every file
   it keeps.

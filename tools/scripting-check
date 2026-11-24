@@ -307,6 +307,20 @@ def reprompt(rbw, quiet, password, protected_id):
           rbw.error("item", "get", protected_id)["code"] == "reprompt_required")
 
 
+def icons(rbw):
+    """Websites' icons from the server, without logging in."""
+    result = subprocess.run([os.path.join(BIN, "rbw"), "icon", "example.com"],
+                            capture_output=True, env={**rbw.env, "RBW_ERROR_FORMAT": "json"},
+                            timeout=120)
+    # whether the server finds an icon depends on its access to the internet
+    check("icon prints the server's image, or not_found",
+          (result.returncode == 0 and result.stdout)
+          or json.loads(result.stderr.decode().splitlines()[-1])["code"] == "not_found",
+          result.stderr.decode())
+    for host in ("not a host", "github.com/login", "hidden.onion"):
+        check(f"icon refuses {host!r}", rbw.error("icon", host)["code"] == "invalid_input")
+
+
 def totp(secret_b32, at=None):
     """An RFC 6238 code (SHA-1, 6 digits, 30 s)."""
     import hashlib
@@ -462,6 +476,7 @@ def scenario(server, password):
     quiet = {"RBW_NONINTERACTIVE": "1"}
     try:
         check("signed out", rbw.json("status", "--json")["status"] == "unauthenticated")
+        icons(rbw)
         rbw.fails("item", "list", env=quiet, needle="not logged in")
         check("errors have codes", rbw.error("item", "list") == {
             "code": "not_logged_in", "message": "rbw item list: not logged in"})

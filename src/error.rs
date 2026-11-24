@@ -179,6 +179,12 @@ pub enum Error {
     #[error("failed to run argon2")]
     Argon2,
 
+    #[error("failed to read the icon")]
+    IconRead { source: std::io::Error },
+
+    #[error("the icon is larger than 1 MiB")]
+    IconTooLarge,
+
     #[error("pinentry cancelled")]
     PinentryCancelled,
 
@@ -303,6 +309,8 @@ impl Error {
             }
             Self::RegistrationRequired => ErrorCode::RegistrationRequired,
             Self::CipherOutOfDate => ErrorCode::Conflict,
+            Self::IconTooLarge => ErrorCode::Server { status: None },
+            Self::IconRead { .. } => ErrorCode::Network,
             Self::RequestFailed { status: 403 } => ErrorCode::Forbidden,
             Self::RequestFailed { status: 404 } => ErrorCode::NotFound,
             Self::RequestFailed { status } => ErrorCode::Server {

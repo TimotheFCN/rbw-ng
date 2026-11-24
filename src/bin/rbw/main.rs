@@ -128,6 +128,17 @@ enum Opt {
         folder: Folder,
     },
 
+    #[command(
+        about = "Print a website's icon from the server's icon service",
+        long_about = "Print a website's icon from the server's icon service\n\n\
+            Writes the image the service sends to stdout, for programs that \
+            show entries with their website's icon. It needs no login."
+    )]
+    Icon {
+        #[arg(help = "The website's host name, such as github.com")]
+        host: String,
+    },
+
     #[command(about = "Check if the local Bitwarden database is unlocked")]
     Unlocked,
 
@@ -497,6 +508,7 @@ impl Opt {
             Self::Folder { folder } => {
                 format!("folder {}", folder.subcommand_name())
             }
+            Self::Icon { .. } => "icon".to_string(),
             Self::Unlocked => "unlocked".to_string(),
             Self::Sync => "sync".to_string(),
             Self::List { .. } => "list".to_string(),
@@ -667,6 +679,7 @@ fn main() {
             Folder::List => items::folder_list(),
             Folder::Create { name } => items::folder_create(&name),
         },
+        Opt::Icon { host } => scripting::icon(&host),
         Opt::Unlocked => commands::unlocked(),
         Opt::Sync => commands::sync(),
         Opt::List { fields, raw } => commands::list(&fields, raw),

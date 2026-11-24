@@ -237,6 +237,22 @@ impl Config {
         })
     }
 
+    // The icon service: Bitwarden's own for its cloud servers, /icons on a
+    // self-hosted one.
+    pub fn icons_url(&self) -> String {
+        self.base_url.clone().map_or_else(
+            || "https://icons.bitwarden.net".to_string(),
+            |url| {
+                let clean_url = url.trim_end_matches('/');
+                if clean_url == "https://api.bitwarden.eu" {
+                    "https://icons.bitwarden.eu".to_string()
+                } else {
+                    format!("{clean_url}/icons")
+                }
+            },
+        )
+    }
+
     pub fn notifications_url(&self) -> String {
         self.notifications_url.clone().unwrap_or_else(|| {
             self.base_url.clone().map_or_else(
@@ -382,6 +398,16 @@ pub async fn device_id(config: &Config) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icons_come_from_the_servers_icon_service() {
+        let mut config = Config::new();
+        assert_eq!(config.icons_url(), "https://icons.bitwarden.net");
+        config.base_url = Some("https://api.bitwarden.eu/".to_string());
+        assert_eq!(config.icons_url(), "https://icons.bitwarden.eu");
+        config.base_url = Some("https://vault.example.com/".to_string());
+        assert_eq!(config.icons_url(), "https://vault.example.com/icons");
+    }
 
     #[test]
     fn extra_headers_are_read_as_an_object() {

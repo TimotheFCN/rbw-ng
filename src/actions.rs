@@ -333,6 +333,11 @@ pub fn partial(
     })
 }
 
+pub fn icon(host: &str) -> Result<Option<Vec<u8>>> {
+    let (client, config) = api_client()?;
+    client.icon(&config.icons_url(), host)
+}
+
 pub fn list_folders(
     access_token: &str,
     refresh_token: &str,

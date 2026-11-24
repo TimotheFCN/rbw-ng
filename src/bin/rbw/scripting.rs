@@ -195,3 +195,35 @@ pub fn status(json: bool) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+// A website's icon from the icon service of the profile's server, as the
+// image the service sends. The official clients send it the host name of
+// a login's website, never of a .onion or .i2p site.
+pub fn icon(host: &str) -> anyhow::Result<()> {
+    let host = host.to_lowercase();
+    let valid = host.contains('.')
+        && !host.starts_with('.')
+        && host
+            .chars()
+            .all(|c| c.is_alphanumeric() || matches!(c, '.' | '-' | '_'));
+    if !valid {
+        return Err(coded(
+            ErrorCode::InvalidInput,
+            format!("{host} isn't a host name"),
+        ));
+    }
+    if matches!(host.rsplit('.').next(), Some("onion" | "i2p")) {
+        return Err(coded(
+            ErrorCode::InvalidInput,
+            "the icons of .onion and .i2p sites aren't fetched",
+        ));
+    }
+    let Some(icon) = rbw::actions::icon(&host)? else {
+        return Err(coded(
+            ErrorCode::NotFound,
+            format!("the server has no icon for {host}"),
+        ));
+    };
+    std::io::Write::write_all(&mut std::io::stdout(), &icon)
+        .context("failed to write the icon")
+}

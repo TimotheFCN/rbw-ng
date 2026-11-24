@@ -275,6 +275,27 @@ whether the password changed.
 A folder is `{"object":"folder","id":"...","name":"..."}`, as in Bitwarden's
 format. An entry's `folderId` puts it in a folder.
 
+## Icons
+
+```sh
+rbw icon github.com > github.png
+```
+
+prints a website's icon from the icon service of the profile's server:
+`icons.bitwarden.net` for bitwarden.com, `icons.bitwarden.eu` for
+bitwarden.eu, and `/icons` on a self-hosted server. It needs no login. The
+image is what the service sends, usually a PNG or an ICO of a few kilobytes,
+at most 1 MiB. The request carries the host name and nothing about the
+account: no token and no Bitwarden headers, only the extra headers and client
+certificate that reaching the server takes. It fails with `not_found` when
+the service has no icon, and with `invalid_input` for anything but a host
+name, and for `.onion` and `.i2p` sites, whose names the official clients
+never send to the icon service.
+
+The official clients show the icon of a login's first website, when it is
+an `http` or `https` address or a bare host name with a dot. Cache the icons:
+the service may fetch each one from the website.
+
 ## SSH agent
 
 `rbw ssh-agent install` and `rbw ssh-agent uninstall` need no terminal.

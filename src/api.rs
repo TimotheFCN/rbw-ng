@@ -1244,6 +1244,11 @@ struct FoldersPostReq {
 const BITWARDEN_CLIENT: &str = "cli";
 const BITWARDEN_CLIENT_VERSION: &str = "2024.12.0";
 
+// Icons are a few kilobytes; Bitwarden's icon service caches only those up
+// to 50 kB.
+const ICON_SIZE_LIMIT: u64 = 1024 * 1024;
+const ICON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
 // DeviceType.LinuxDesktop, as per Bitwarden API device types.
 const DEVICE_TYPE: u8 = 8;
 
@@ -1362,10 +1367,17 @@ impl Client {
     // Bitwarden-Client-Version header, the server refuses to edit items
     // that have their own encryption key.
     fn blocking_reqwest_client(&self) -> Result<reqwest::blocking::Client> {
+        self.blocking_reqwest_client_with(self.default_headers())
+    }
+
+    fn blocking_reqwest_client_with(
+        &self,
+        headers: axum::http::HeaderMap,
+    ) -> Result<reqwest::blocking::Client> {
         let mut builder = reqwest::blocking::Client::builder()
             .user_agent(Self::user_agent())
             .redirect(self.redirect_policy())
-            .default_headers(self.default_headers());
+            .default_headers(headers);
         if let Some(client_cert_path) = self.client_cert_path.as_ref() {
             let buf = std::fs::read(client_cert_path).map_err(|e| {
                 Error::LoadClientCert {
@@ -1915,6 +1927,42 @@ impl Client {
             }
             _ => Err(Error::RequestFailed {
                 status: res.status().as_u16(),
+            }),
+        }
+    }
+
+    // A website's icon from the server's icon service, or none if it has
+    // none. Like the official clients' request, it carries the host name
+    // only: no token and no Bitwarden headers, just what reaching the
+    // server takes (the extra headers and the client certificate).
+    pub fn icon(
+        &self,
+        icons_url: &str,
+        host: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let client =
+            self.blocking_reqwest_client_with(self.extra_headers.clone())?;
+        let res = client
+            .get(format!("{icons_url}/{host}/icon.png"))
+            .timeout(ICON_TIMEOUT)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        match res.status() {
+            reqwest::StatusCode::OK => {
+                let mut icon = vec![];
+                std::io::Read::read_to_end(
+                    &mut std::io::Read::take(res, ICON_SIZE_LIMIT + 1),
+                    &mut icon,
+                )
+                .map_err(|source| Error::IconRead { source })?;
+                if icon.len() as u64 > ICON_SIZE_LIMIT {
+                    return Err(Error::IconTooLarge);
+                }
+                Ok(Some(icon))
+            }
+            reqwest::StatusCode::NOT_FOUND => Ok(None),
+            status => Err(Error::RequestFailed {
+                status: status.as_u16(),
             }),
         }
     }
