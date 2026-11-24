@@ -289,6 +289,9 @@ pub enum Error {
 
     #[error("the entry changed on the server since it was last synced")]
     CipherOutOfDate,
+
+    #[error("invalid profile: {reason}")]
+    InvalidProfile { reason: String },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -309,6 +312,7 @@ impl Error {
             }
             Self::RegistrationRequired => ErrorCode::RegistrationRequired,
             Self::CipherOutOfDate => ErrorCode::Conflict,
+            Self::InvalidProfile { .. } => ErrorCode::InvalidInput,
             Self::IconTooLarge => ErrorCode::Server { status: None },
             Self::IconRead { .. } => ErrorCode::Network,
             Self::RequestFailed { status: 403 } => ErrorCode::Forbidden,

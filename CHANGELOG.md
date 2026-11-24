@@ -79,6 +79,10 @@
   incorrect instead of reporting a server error.
 * An agent started while another one answers on rbw's socket now leaves it
   alone instead of taking over its path.
+* `rbw` and `rbw-agent` refuse an `RBW_PROFILE` that contains `/` or isn't
+  UTF-8. Such a profile kept its files outside its own folders, so that
+  `RBW_PROFILE=x/../.. rbw purge --all` removed the home folder, and one that
+  wasn't UTF-8 used the default profile.
 
 ## [1.18.1] - 2026-11-23
 

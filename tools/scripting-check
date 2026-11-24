@@ -618,6 +618,10 @@ def scenario(server, password):
         check("profiles lists the profile",
               rbw.json("profiles", "--json") == [{
                   "profile": "scripting-check", "userEmail": email, "serverUrl": server}])
+        error = rbw.error("purge", "--all", env={"RBW_PROFILE": "scripting-check/../.."})
+        check("purge --all refuses a profile outside its folders",
+              error["code"] == "invalid_input"
+              and rbw.json("profiles", "--json")[0]["profile"] == "scripting-check", str(error))
         rbw.run("purge", "--all")
         check("purge --all removes the profile", rbw.json("profiles", "--json") == []
               and not any(files for _, _, files in os.walk(home)))

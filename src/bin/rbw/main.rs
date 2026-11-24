@@ -641,7 +641,26 @@ fn main() {
     .init();
 
     let subcommand_name = opt.subcommand_name();
-    let res = match opt {
+    let res = rbw::dirs::check_profile()
+        .map_err(anyhow::Error::from)
+        .and_then(|()| run(opt))
+        .with_context(|| format!("rbw {subcommand_name}"));
+
+    if let Err(e) = res {
+        if json_errors() {
+            let mut error = serde_json::to_value(rbw::error::code(&e))
+                .unwrap_or_default();
+            error["message"] = format!("{e:#}").into();
+            eprintln!("{error}");
+        } else {
+            eprintln!("{e:#}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn run(opt: Opt) -> anyhow::Result<()> {
+    match opt {
         Opt::Config { config } => match config {
             Config::Show => commands::config_show(),
             Config::Set { key, value } => commands::config_set(&key, &value),
@@ -887,19 +906,6 @@ fn main() {
             }
             Ok(())
         }
-    }
-    .with_context(|| format!("rbw {subcommand_name}"));
-
-    if let Err(e) = res {
-        if json_errors() {
-            let mut error = serde_json::to_value(rbw::error::code(&e))
-                .unwrap_or_default();
-            error["message"] = format!("{e:#}").into();
-            eprintln!("{error}");
-        } else {
-            eprintln!("{e:#}");
-        }
-        std::process::exit(1);
     }
 }
 

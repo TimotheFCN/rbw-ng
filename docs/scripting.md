@@ -61,7 +61,8 @@ The message is for people and can change. Some codes carry more:
 Use a profile of your own (`RBW_PROFILE=myapp`) so that your program never
 shares, or signs out, the account someone uses in a terminal. Each profile has
 its own configuration, local vault and agent, so a program can keep several
-accounts side by side by giving each one a profile.
+accounts side by side by giving each one a profile. A profile's name can't
+contain `/`.
 
 `rbw profiles --json` lists the profiles on this computer, as
 `[{"profile":"work","userEmail":"you@example.com","serverUrl":null}]`, with a

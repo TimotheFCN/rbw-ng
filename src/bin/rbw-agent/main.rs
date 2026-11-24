@@ -103,6 +103,8 @@ fn real_main() -> anyhow::Result<()> {
     )
     .init();
 
+    rbw::dirs::check_profile()?;
+
     let mode = daemon::Mode::from_args();
     // before any thread starts
     let sockets = if mode == daemon::Mode::Service {

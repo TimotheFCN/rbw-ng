@@ -155,9 +155,56 @@ fn runtime_dir() -> std::path::PathBuf {
     )
 }
 
+// The name of the profile's folders, from RBW_PROFILE, which rbw and
+// rbw-agent check with check_profile before anything else.
 pub fn profile() -> String {
-    match std::env::var("RBW_PROFILE") {
-        Ok(profile) if !profile.is_empty() => format!("rbw-{profile}"),
-        _ => "rbw".to_string(),
+    folder_name(std::env::var_os("RBW_PROFILE").as_deref())
+        .expect("RBW_PROFILE is checked at startup")
+}
+
+// Fails for an RBW_PROFILE that would put the profile's folders somewhere
+// else than its own: with RBW_PROFILE=a/../.. the configuration folder would
+// be the home folder, which rbw purge --all removes.
+pub fn check_profile() -> Result<()> {
+    folder_name(std::env::var_os("RBW_PROFILE").as_deref()).map(drop)
+}
+
+fn folder_name(profile: Option<&std::ffi::OsStr>) -> Result<String> {
+    let Some(profile) = profile.filter(|profile| !profile.is_empty()) else {
+        return Ok("rbw".to_string());
+    };
+    let invalid = |reason: &str| Error::InvalidProfile {
+        reason: reason.to_string(),
+    };
+    let profile = profile
+        .to_str()
+        .ok_or_else(|| invalid("RBW_PROFILE isn't valid UTF-8"))?;
+    if profile.contains('/') {
+        return Err(invalid("RBW_PROFILE can't contain '/'"));
+    }
+    Ok(format!("rbw-{profile}"))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn profiles_stay_in_their_own_folders() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let name = |profile: &[u8]| {
+            folder_name(Some(std::ffi::OsStr::from_bytes(profile)))
+        };
+        assert_eq!(folder_name(None).unwrap(), "rbw");
+        assert_eq!(name(b"").unwrap(), "rbw");
+        assert_eq!(name(b"work").unwrap(), "rbw-work");
+        assert_eq!(name(b"..").unwrap(), "rbw-..");
+        for invalid in [&b"work/../.."[..], b"/", b"../x", b"\xff"] {
+            assert!(
+                matches!(name(invalid), Err(Error::InvalidProfile { .. })),
+                "{invalid:?}"
+            );
+        }
     }
 }
