@@ -1,6 +1,6 @@
-// Commands for programs that drive rbw, such as a browser's password
-// manager: status as JSON, logging in and unlocking with secrets on stdin
-// or in the environment, and sessions. See docs/scripting.md.
+// Commands for programs that drive rbw, such as a desktop app: status as
+// JSON, logging in and unlocking with secrets on stdin or in the
+// environment, and sessions. See docs/scripting.md.
 
 use anyhow::Context as _;
 use rbw::error::coded;

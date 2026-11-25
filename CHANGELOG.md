@@ -10,8 +10,8 @@ service.
 
 ### Added
 
-* Commands for programs that drive `rbw`, such as a browser's password
-  manager (see [docs/scripting.md](docs/scripting.md)):
+* Commands for programs that drive `rbw`, such as a desktop app (see
+  [docs/scripting.md](docs/scripting.md)):
   * `rbw login --password-stdin` and `rbw unlock --password-stdin` take the
     master password on stdin. `--method` and `--code` finish a two-step or
     new device login, with `--code-env` reading the code from `RBW_CODE`,

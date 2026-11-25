@@ -1,6 +1,6 @@
 // Logging in and unlocking with secrets that the caller passes, instead of
-// asking through pinentry: for programs that drive rbw, such as a browser's
-// password manager. See docs/scripting.md.
+// asking through pinentry: for programs that drive rbw, such as a desktop
+// app. See docs/scripting.md.
 
 use anyhow::Context as _;
 use rbw::error::coded;
