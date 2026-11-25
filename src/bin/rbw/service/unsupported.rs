@@ -33,8 +33,15 @@ pub fn unload(_name: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn install(_service: &super::Service) -> anyhow::Result<()> {
-    check_supported()
+pub fn install(
+    _service: &super::Service,
+    _agent_runs: bool,
+) -> anyhow::Result<bool> {
+    check_supported().map(|()| false)
+}
+
+pub fn activate(_name: &str) -> anyhow::Result<()> {
+    Ok(())
 }
 
 pub fn next_steps(_socket: &std::path::Path) -> Vec<super::Step> {
