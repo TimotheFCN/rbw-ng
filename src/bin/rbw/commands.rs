@@ -1,7 +1,6 @@
 use std::{
     fmt::Write as _,
     io::{IsTerminal as _, Write as _},
-    os::unix::ffi::OsStrExt as _,
 };
 
 use anyhow::Context as _;
@@ -2611,11 +2610,13 @@ pub fn ensure_agent() -> anyhow::Result<()> {
     Ok(())
 }
 
+// RBW_AGENT, else the rbw-agent that came with this rbw, else the one in
+// PATH.
 fn run_agent() -> anyhow::Result<()> {
-    let agent_path = std::env::var_os("RBW_AGENT");
-    let agent_path = agent_path
-        .as_deref()
-        .unwrap_or_else(|| std::ffi::OsStr::from_bytes(b"rbw-agent"));
+    let agent_path = std::env::var_os("RBW_AGENT")
+        .map(std::path::PathBuf::from)
+        .or_else(own_agent)
+        .unwrap_or_else(|| "rbw-agent".into());
     let status = std::process::Command::new(agent_path)
         .status()
         .context("failed to run rbw-agent")?;
@@ -2630,6 +2631,19 @@ fn run_agent() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+// The rbw-agent beside this rbw's executable, with links resolved: an rbw
+// reached through a link in another folder still starts the agent of its
+// own install, which speaks the same protocol version, rather than whichever
+// rbw-agent PATH finds first.
+pub fn own_agent() -> Option<std::path::PathBuf> {
+    agent_beside(&std::env::current_exe().ok()?)
+}
+
+fn agent_beside(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let exe = std::fs::canonicalize(exe).ok()?;
+    Some(exe.parent()?.join("rbw-agent")).filter(|agent| agent.is_file())
 }
 
 fn check_config() -> anyhow::Result<()> {
@@ -3548,6 +3562,26 @@ fn display_field(name: &str, field: Option<&str>, clipboard: bool) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn the_agent_beside_rbw_is_found_through_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("install");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(install.join("rbw"), "").unwrap();
+        std::os::unix::fs::symlink(install.join("rbw"), bin.join("rbw"))
+            .unwrap();
+        // an agent beside the link belongs to another install
+        std::fs::write(bin.join("rbw-agent"), "").unwrap();
+        assert_eq!(agent_beside(&bin.join("rbw")), None);
+
+        std::fs::write(install.join("rbw-agent"), "").unwrap();
+        let own = std::fs::canonicalize(&install).unwrap().join("rbw-agent");
+        assert_eq!(agent_beside(&bin.join("rbw")), Some(own.clone()));
+        assert_eq!(agent_beside(&install.join("rbw")), Some(own));
+    }
 
     #[test]
     fn test_uri_checksum() {

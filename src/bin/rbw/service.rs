@@ -525,34 +525,41 @@ fn search_path() -> std::ffi::OsString {
         .unwrap_or_else(|| "/usr/local/bin:/usr/bin:/bin".into())
 }
 
-// The rbw-agent that rbw would start: RBW_AGENT, or the one in PATH. The
-// path is kept as found, not resolved: package managers point a stable
-// path at each new version.
+// The rbw-agent that rbw would start (RBW_AGENT, else the one beside rbw,
+// else the one in PATH), by the first path in PATH that leads to it: package
+// managers point a stable path, such as /opt/homebrew/bin/rbw-agent, at each
+// new version, while the resolved path names one version and goes away with
+// the next upgrade.
 fn agent_path(path: &std::ffi::OsStr) -> anyhow::Result<std::path::PathBuf> {
-    let agent = std::env::var_os("RBW_AGENT")
-        .map_or_else(|| "rbw-agent".into(), std::path::PathBuf::from);
-    let found = find_program(&agent, path).with_context(|| {
-        format!("couldn't find {} in PATH", agent.display())
-    })?;
-
-    // rbw-agent from one install with rbw from another would disagree on
-    // the protocol version
-    let resolved = std::fs::canonicalize(&found).ok();
-    let beside_rbw = std::env::current_exe()
-        .ok()
-        .and_then(|exe| std::fs::canonicalize(exe).ok())
-        .and_then(|exe| Some(exe.parent()?.join("rbw-agent")));
-    if let (Some(resolved), Some(beside_rbw)) = (resolved, beside_rbw) {
-        if beside_rbw.exists() && resolved != beside_rbw {
-            eprintln!(
-                "warning: the service will run {}, not {} which comes with \
-                this rbw",
-                found.display(),
-                beside_rbw.display()
-            );
-        }
+    if let Some(agent) = std::env::var_os("RBW_AGENT") {
+        let agent = std::path::PathBuf::from(agent);
+        return find_program(&agent, path).with_context(|| {
+            format!("couldn't find {} in PATH", agent.display())
+        });
     }
-    Ok(found)
+    service_agent(crate::commands::own_agent(), path)
+        .context("couldn't find rbw-agent beside rbw or in PATH")
+}
+
+fn service_agent(
+    own: Option<std::path::PathBuf>,
+    path: &std::ffi::OsStr,
+) -> Option<std::path::PathBuf> {
+    let program = std::path::Path::new("rbw-agent");
+    let Some(own) = own else {
+        return find_program(program, path);
+    };
+    let Ok(resolved) = std::fs::canonicalize(&own) else {
+        return Some(own);
+    };
+    std::env::split_paths(path)
+        .map(|dir| dir.join(program))
+        .find(|candidate| {
+            is_executable(candidate)
+                && std::fs::canonicalize(candidate).ok().as_ref()
+                    == Some(&resolved)
+        })
+        .or(Some(own))
 }
 
 fn find_program(
@@ -705,6 +712,51 @@ mod tests {
             parse_ssh_agent("identityagent none\n"),
             SshAgent::Disabled
         ));
+    }
+
+    #[test]
+    fn the_service_runs_rbws_own_agent_by_a_stable_path() {
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+        let dir = tempfile::tempdir().unwrap();
+        let dir = std::fs::canonicalize(dir.path()).unwrap();
+        let folder = |name: &str| {
+            let folder = dir.join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            folder
+        };
+        let agent = |folder: &std::path::Path| {
+            let agent = folder.join("rbw-agent");
+            std::fs::write(&agent, "").unwrap();
+            std::fs::set_permissions(
+                &agent,
+                std::fs::Permissions::from_mode(0o755),
+            )
+            .unwrap();
+            agent
+        };
+        // a versioned install, a package manager's stable link to it, and
+        // another install
+        let own = agent(&folder("Cellar/1.19.0/bin"));
+        let stable = folder("brew/bin").join("rbw-agent");
+        symlink(&own, &stable).unwrap();
+        let other = agent(&folder("other/bin"));
+        let path = |dirs: &[&str]| {
+            std::env::join_paths(dirs.iter().map(|name| dir.join(name)))
+                .unwrap()
+        };
+        let chosen = |own: Option<&std::path::PathBuf>, dirs: &[&str]| {
+            super::service_agent(own.cloned(), &path(dirs))
+        };
+
+        assert_eq!(
+            chosen(Some(&own), &["other/bin", "brew/bin"]),
+            Some(stable)
+        );
+        assert_eq!(chosen(Some(&own), &["other/bin"]), Some(own.clone()));
+        assert_eq!(chosen(Some(&own), &[]), Some(own));
+        assert_eq!(chosen(None, &["other/bin", "brew/bin"]), Some(other));
+        assert_eq!(chosen(None, &["nothing"]), None);
     }
 
     #[test]

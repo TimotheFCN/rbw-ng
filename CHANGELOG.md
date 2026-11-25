@@ -92,6 +92,12 @@ service.
 
 ### Changed
 
+* `rbw` starts the `rbw-agent` beside its executable, following links, and
+  looks in `PATH` only when there is none, so that an `rbw` reached through
+  a link never starts the agent of another install. `RBW_AGENT` still names
+  another. `rbw ssh-agent install` has the service run that same agent, by
+  a path in `PATH` that leads to it when there is one, which upgrades
+  leave in place.
 * `rbw config set` and `unset` no longer stop the agent, and lock the vault,
   for settings that change only what the agent does: `lock_timeout`,
   `sync_interval`, `pinentry`, `pinentry_timeout`, `touch_id_unlock` and

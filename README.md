@@ -120,10 +120,12 @@ The code is in three parts:
   the configuration (`config.rs`) and the agent protocol (`protocol.rs`).
 
 To try a development build without touching your own vault and agent, use a
-separate profile and point `rbw` at the agent you just built:
+separate profile. `rbw` starts the `rbw-agent` beside it, so
+`target/debug/rbw` runs the agent you just built (`RBW_AGENT` names
+another):
 
 ```sh
-export RBW_PROFILE=dev RBW_AGENT="$PWD/target/debug/rbw-agent"
+export RBW_PROFILE=dev
 target/debug/rbw config set email you@example.com
 target/debug/rbw config set base_url http://localhost:8000
 target/debug/rbw sync
