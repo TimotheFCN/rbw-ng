@@ -19,6 +19,11 @@ keeps up with server changes. Contributors' commits keep their authorship.
 
 Documentation lives in the [wiki](https://github.com/TimotheFCN/rbw-ng/wiki).
 
+Prefer a window? [Fastwarden](https://github.com/TimotheFCN/rbw-desktop) is a
+desktop app for macOS and Linux built on rbw-ng. It comes with its own `rbw`
+and `rbw-agent` and can put that `rbw` on your `PATH`, so it replaces a
+separate install of rbw-ng.
+
 ## Features
 
 * A background agent that keeps the vault unlocked between commands, locks
