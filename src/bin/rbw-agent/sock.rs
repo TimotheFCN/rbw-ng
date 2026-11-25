@@ -157,12 +157,14 @@ mod tests {
         ] {
             let (mut client, mut agent) =
                 tokio::net::UnixStream::pair().unwrap();
-            client.write_all(sent.as_bytes()).await.unwrap();
-            drop(client);
-            assert_eq!(
-                *read_line(&mut agent).await.unwrap(),
-                read.as_bytes()
-            );
+            // A socket holds little, 8 KB on macOS: the client writes
+            // while the agent reads, as rbw does.
+            let write = async move {
+                client.write_all(sent.as_bytes()).await.unwrap();
+                drop(client);
+            };
+            let (line, ()) = tokio::join!(read_line(&mut agent), write);
+            assert_eq!(*line.unwrap(), read.as_bytes());
         }
     }
 
