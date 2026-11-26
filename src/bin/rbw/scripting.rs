@@ -54,14 +54,20 @@ pub fn password_from_stdin() -> anyhow::Result<rbw::protocol::Secret> {
     Ok(password)
 }
 
-fn logged_in_db() -> Option<rbw::db::Db> {
-    crate::commands::load_db()
+// What the db says of the login, without reading its entries: this runs
+// before every command of a program, and for each status poll.
+fn logged_in_db(config: &rbw::config::Config) -> Option<rbw::db::DbMeta> {
+    let email = config.email.as_deref()?;
+    rbw::db::Db::load_meta(&config.server_name(), email)
         .ok()
         .filter(|db| !db.needs_login())
 }
 
 fn logged_in() -> bool {
-    logged_in_db().is_some()
+    rbw::config::Config::load()
+        .ok()
+        .and_then(|config| logged_in_db(&config))
+        .is_some()
 }
 
 // The unlock before a command, for a program: with RBW_SESSION, unlock with
@@ -187,7 +193,7 @@ struct Status {
 
 pub fn status(json: bool) -> anyhow::Result<()> {
     let config = rbw::config::Config::load().unwrap_or_default();
-    let db = logged_in_db();
+    let db = logged_in_db(&config);
     let (status, touch_id) = if db.is_some() {
         // not ensure_agent: a stopped agent means a locked vault
         let _ = crate::commands::check_agent_version();
