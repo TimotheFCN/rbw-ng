@@ -105,6 +105,22 @@ service.
 * A master password given to pinentry for an entry with master password
   re-prompt opens the entry for two minutes, as `rbw item unlock` does, so
   that reading its values asks once, not once per value.
+* Faster, for programs that poll `rbw` and for large vaults:
+  * `rbw status`, `rbw sync` and the unlock check before each command of a
+    program read only the beginning of the local copy of the vault, not its
+    entries.
+  * `rbw-agent` decrypts a batch of values under one lock, decrypts each
+    entry's own key once per batch, and hashes values only when an entry
+    asks for the master password again. `rbw item list` and `get` collect
+    the values to decrypt without building the JSON twice, and buffer it.
+  * The server's answers come gzip-compressed. Syncs look folders up by id.
+  * `rbw-agent` keeps one HTTP client, with its connections to the server,
+    from one sync to the next, and syncs asked for at once share one
+    request. It runs two worker threads rather than one per CPU core.
+  * `rbw icon` sets up a second HTTP client only for a redirect off the
+    server.
+* Requests to the server give up after 15 seconds without a connection, and
+  after 60 seconds without an answer.
 
 ### Fixed
 

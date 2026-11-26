@@ -495,9 +495,10 @@ fn is_out_of_date(body: &str) -> bool {
 }
 
 impl SyncResCipher {
+    // folders: the encrypted name of each folder, by id
     fn to_entry(
         &self,
-        folders: &[SyncResFolder],
+        folders: &std::collections::HashMap<&str, &str>,
     ) -> Option<crate::db::Entry> {
         if self.deleted_date.is_some() {
             return None;
@@ -525,12 +526,9 @@ impl SyncResCipher {
 
         let (folder, folder_id) =
             self.folder_id.as_ref().map_or((None, None), |folder_id| {
-                let mut folder_name = None;
-                for folder in folders {
-                    if &folder.id == folder_id {
-                        folder_name = Some(folder.name.clone());
-                    }
-                }
+                let folder_name = folders
+                    .get(folder_id.as_str())
+                    .map(|name| (*name).to_string());
                 (folder_name, Some(folder_id))
             });
         let data = if let Some(login) = &self.login {
@@ -1282,6 +1280,73 @@ const ICON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 // Vaultwarden with an external icon service answers with a redirect, which
 // can lead to one more.
 const ICON_REDIRECTS: usize = 5;
+// How long to wait for a connection to the server, and for a request to
+// it: for the blocking requests, the whole of it, and for the others, each
+// read of the answer.
+const CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+const REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+const READ_TIMEOUT: std::time::Duration = REQUEST_TIMEOUT;
+
+// Whether the async requests share one HTTP client, which only rbw-agent
+// asks for: as it lives for long, it then keeps connections and TLS
+// sessions to the server between syncs, and reads the system's root
+// certificates and the client certificate once. A client keeps its
+// connections on the tokio runtime that made them, so a process with
+// several runtimes, such as the tests, must not share one.
+static REUSE_CLIENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CLIENTS: std::sync::Mutex<ClientCache> =
+    std::sync::Mutex::new(ClientCache(None));
+
+// Lets the async requests of this process share one HTTP client (see
+// REUSE_CLIENTS).
+pub fn reuse_clients() {
+    REUSE_CLIENTS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+// Drops the shared HTTP client, for example after the configuration
+// changed, so that the next request makes a new one.
+pub fn forget_clients() {
+    lock_clients().0 = None;
+}
+
+fn lock_clients() -> std::sync::MutexGuard<'static, ClientCache> {
+    CLIENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// The shared client, with what it was made from: the client certificate's
+// path and the extra headers, which decide its headers and redirects.
+struct ClientCache(
+    Option<(
+        Option<std::path::PathBuf>,
+        axum::http::HeaderMap,
+        reqwest::Client,
+    )>,
+);
+
+impl ClientCache {
+    fn get(&self, for_client: &Client) -> Option<reqwest::Client> {
+        self.0
+            .as_ref()
+            .filter(|(client_cert_path, extra_headers, _)| {
+                *client_cert_path == for_client.client_cert_path
+                    && *extra_headers == for_client.extra_headers
+            })
+            .map(|(_, _, client)| client.clone())
+    }
+
+    fn put(&mut self, for_client: &Client, client: reqwest::Client) {
+        self.0 = Some((
+            for_client.client_cert_path.clone(),
+            for_client.extra_headers.clone(),
+            client,
+        ));
+    }
+}
 
 // DeviceType.LinuxDesktop, as per Bitwarden API device types.
 const DEVICE_TYPE: u8 = 8;
@@ -1371,10 +1436,21 @@ impl Client {
     }
 
     async fn reqwest_client(&self) -> Result<reqwest::Client> {
+        let reuse = REUSE_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
+        if reuse {
+            let cached = lock_clients().get(self);
+            if let Some(client) = cached {
+                return Ok(client);
+            }
+        }
         let mut builder = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .redirect(self.redirect_policy())
-            .default_headers(self.default_headers());
+            .default_headers(self.default_headers())
+            .connect_timeout(CONNECT_TIMEOUT)
+            // a server that stops answering, but not a large vault on a
+            // slow link, which a limit on the whole request would cut off
+            .read_timeout(READ_TIMEOUT);
         if let Some(client_cert_path) = self.client_cert_path.as_ref() {
             let mut buf = Vec::new();
             let mut f = tokio::fs::File::open(client_cert_path)
@@ -1391,9 +1467,13 @@ impl Client {
             })?;
             builder = builder.identity(Self::client_identity(&buf)?);
         }
-        builder
+        let client = builder
             .build()
-            .map_err(|e| Error::CreateReqwestClient { source: e })
+            .map_err(|e| Error::CreateReqwestClient { source: e })?;
+        if reuse {
+            lock_clients().put(self, client.clone());
+        }
+        Ok(client)
     }
 
     // The blocking requests (add, edit, remove and folders) need the same
@@ -1415,7 +1495,9 @@ impl Client {
         let mut builder = reqwest::blocking::Client::builder()
             .user_agent(Self::user_agent())
             .redirect(redirect)
-            .default_headers(headers);
+            .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
         if let Some(client_cert_path) = self.client_cert_path.as_ref() {
             let buf = std::fs::read(client_cert_path).map_err(|e| {
                 Error::LoadClientCert {
@@ -1729,12 +1811,22 @@ impl Client {
         match res.status() {
             reqwest::StatusCode::OK => {
                 let sync_res: SyncRes = res.json_with_path().await?;
-                let folders = sync_res.folders.clone();
-                let ciphers = sync_res
-                    .ciphers
-                    .iter()
-                    .filter_map(|cipher| cipher.to_entry(&folders))
-                    .collect();
+                let ciphers = {
+                    // the last folder with an id wins, as it always did
+                    let folders: std::collections::HashMap<_, _> = sync_res
+                        .folders
+                        .iter()
+                        .map(|folder| {
+                            (folder.id.as_str(), folder.name.as_str())
+                        })
+                        .collect();
+                    sync_res
+                        .ciphers
+                        .iter()
+                        .filter_map(|cipher| cipher.to_entry(&folders))
+                        .collect()
+                };
+                let folders = sync_res.folders;
                 let org_keys = sync_res
                     .profile
                     .organizations
@@ -2001,17 +2093,26 @@ impl Client {
             self.extra_headers.clone(),
             reqwest::redirect::Policy::none(),
         )?;
-        let elsewhere = reqwest::blocking::Client::builder()
-            .user_agent(Self::user_agent())
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|source| Error::CreateReqwestClient { source })?;
+        // made only for a redirect off the server, which most icons don't
+        // take: building a client loads the system's root certificates
+        let mut elsewhere = None;
         let deadline = std::time::Instant::now() + ICON_TIMEOUT;
         for _ in 0..=ICON_REDIRECTS {
             let client = if url.origin() == server {
                 &to_server
+            } else if let Some(elsewhere) = &elsewhere {
+                elsewhere
             } else {
-                &elsewhere
+                elsewhere.insert(
+                    reqwest::blocking::Client::builder()
+                        .user_agent(Self::user_agent())
+                        .redirect(reqwest::redirect::Policy::none())
+                        .connect_timeout(CONNECT_TIMEOUT)
+                        .build()
+                        .map_err(|source| Error::CreateReqwestClient {
+                            source,
+                        })?,
+                )
             };
             let res = client
                 .get(url.clone())
@@ -2468,6 +2569,60 @@ fn icon_redirect_allowed(url: &url::Url) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synced_entries_find_their_folder_by_id() {
+        let cipher = |folder_id: &str| -> SyncResCipher {
+            serde_json::from_str(&format!(
+                r#"{{"id":"c","name":"2.n","reprompt":0,"folderId":{folder_id},"secureNote":{{"type":0}}}}"#
+            ))
+            .unwrap()
+        };
+        let folders: std::collections::HashMap<&str, &str> =
+            [("f1", "2.one"), ("f2", "2.two")].into_iter().collect();
+        let entry = cipher(r#""f2""#).to_entry(&folders).unwrap();
+        assert_eq!(entry.folder.as_deref(), Some("2.two"));
+        assert_eq!(entry.folder_id.as_deref(), Some("f2"));
+        let entry = cipher(r#""gone""#).to_entry(&folders).unwrap();
+        assert_eq!(entry.folder, None);
+        assert_eq!(entry.folder_id.as_deref(), Some("gone"));
+        let entry = cipher("null").to_entry(&folders).unwrap();
+        assert_eq!((entry.folder, entry.folder_id), (None, None));
+    }
+
+    #[test]
+    fn a_shared_http_client_is_for_the_same_settings_only() {
+        let client = |cert: Option<&str>, header: Option<&'static str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(value) = header {
+                headers.insert(
+                    "x-token",
+                    axum::http::HeaderValue::from_static(value),
+                );
+            }
+            Client::new(
+                "https://example.com/api",
+                "https://example.com/identity",
+                "https://example.com",
+                cert.map(std::path::Path::new),
+                headers,
+            )
+        };
+        let mut cache = ClientCache(None);
+        let plain = client(None, None);
+        assert!(cache.get(&plain).is_none());
+        cache.put(&plain, reqwest::Client::new());
+        assert!(cache.get(&plain).is_some());
+        assert!(cache.get(&client(None, None)).is_some());
+        assert!(cache.get(&client(Some("/cert.pem"), None)).is_none());
+        assert!(cache.get(&client(None, Some("a"))).is_none());
+
+        let with_header = client(None, Some("a"));
+        cache.put(&with_header, reqwest::Client::new());
+        assert!(cache.get(&with_header).is_some());
+        assert!(cache.get(&client(None, Some("b"))).is_none());
+        assert!(cache.get(&plain).is_none());
+    }
 
     fn device_error(message: &str) -> Error {
         let body = format!(

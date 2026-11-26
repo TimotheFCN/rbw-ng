@@ -1364,7 +1364,7 @@ pub fn unlocked() -> anyhow::Result<()> {
 pub fn sync() -> anyhow::Result<()> {
     ensure_agent()?;
     if crate::scripting::noninteractive()
-        && load_db().map_or(true, |db| db.needs_login())
+        && load_db_meta().map_or(true, |db| db.needs_login())
     {
         anyhow::bail!("not logged in");
     }
@@ -3536,6 +3536,18 @@ pub fn load_db() -> anyhow::Result<rbw::db::Db> {
         || Err(anyhow::anyhow!("failed to find email address in config")),
         |email| {
             rbw::db::Db::load(&config.server_name(), email)
+                .map_err(anyhow::Error::new)
+        },
+    )
+}
+
+// What the db says of the login, without reading its entries.
+pub fn load_db_meta() -> anyhow::Result<rbw::db::DbMeta> {
+    let config = rbw::config::Config::load()?;
+    config.email.as_ref().map_or_else(
+        || Err(anyhow::anyhow!("failed to find email address in config")),
+        |email| {
+            rbw::db::Db::load_meta(&config.server_name(), email)
                 .map_err(anyhow::Error::new)
         },
     )

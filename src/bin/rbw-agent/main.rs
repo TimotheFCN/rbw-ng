@@ -32,6 +32,10 @@ async fn tokio_main(
         startup_ack.ack()?;
     }
 
+    // one runtime for the life of the agent, so its requests can share an
+    // HTTP client
+    rbw::api::reuse_clients();
+
     let config = rbw::config::Config::load()?;
     let timeout_duration =
         std::time::Duration::from_secs(config.lock_timeout);
@@ -55,6 +59,7 @@ async fn tokio_main(
             master_password_reprompt: None,
             unlocked_entries: std::collections::HashMap::new(),
             unlock_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            sync_flight: std::sync::Arc::default(),
             #[cfg(target_os = "macos")]
             touch_id_unlock: config.touch_id_unlock,
             ssh_confirm: config.confirms_ssh_signatures(),
@@ -135,14 +140,21 @@ fn real_main() -> anyhow::Result<()> {
     let (w, r) = std::sync::mpsc::channel();
     // can't use tokio::main because we need to daemonize before starting the
     // tokio runloop, or else things break
+    // the agent mostly waits, and an agent runs for each profile, so a
+    // thread per CPU core would be too many
     // unwrap is fine here because there's no good reason that this should
     // ever fail
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        if let Err(e) = tokio_main(startup_ack, sockets).await {
-            // this unwrap is fine because it's the only real option here
-            w.send(e).unwrap();
-        }
-    });
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            if let Err(e) = tokio_main(startup_ack, sockets).await {
+                // this unwrap is fine because it's the only real option here
+                w.send(e).unwrap();
+            }
+        });
 
     if let Ok(e) = r.recv() {
         return Err(e);

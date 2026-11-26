@@ -330,6 +330,41 @@ pub struct Db {
     pub reprompt_mac: Option<String>,
 }
 
+// The beginning of the db: whether the account is logged in and when the
+// vault last synced, read without the entries and folders, which a status
+// check has no use for and which can be large.
+#[derive(serde::Deserialize, Default, Debug)]
+pub struct DbMeta {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub kdf: Option<crate::api::KdfType>,
+    pub iterations: Option<u32>,
+    pub protected_key: Option<String>,
+    #[serde(default)]
+    pub last_sync: Option<String>,
+}
+
+impl DbMeta {
+    // The db at this path, of any profile.
+    pub fn load_from(file: std::path::PathBuf) -> Result<Self> {
+        let json = std::fs::read(&file).map_err(|source| Error::LoadDb {
+            source,
+            file: file.clone(),
+        })?;
+        serde_json::from_slice(&json)
+            .map_err(|source| Error::LoadDbJson { source, file })
+    }
+
+    // The same as Db::needs_login.
+    pub fn needs_login(&self) -> bool {
+        self.access_token.is_none()
+            || self.refresh_token.is_none()
+            || self.iterations.is_none()
+            || self.kdf.is_none()
+            || self.protected_key.is_none()
+    }
+}
+
 // A temporary file in the same directory as the db (or the config), so that
 // renaming it over the file is atomic. Unique per process and per save.
 pub(crate) fn temp_file(file: &std::path::Path) -> std::path::PathBuf {
@@ -384,6 +419,27 @@ impl Db {
         let slf: Self = serde_json::from_str(&json)
             .map_err(|source| Error::LoadDbJson { source, file })?;
         Ok(slf)
+    }
+
+    // See DbMeta.
+    pub fn load_meta(server: &str, email: &str) -> Result<DbMeta> {
+        DbMeta::load_from(crate::dirs::db_file(server, email))
+    }
+
+    // See DbMeta.
+    pub async fn load_meta_async(
+        server: &str,
+        email: &str,
+    ) -> Result<DbMeta> {
+        let file = crate::dirs::db_file(server, email);
+        let json = tokio::fs::read(&file).await.map_err(|source| {
+            Error::LoadDbAsync {
+                source,
+                file: file.clone(),
+            }
+        })?;
+        serde_json::from_slice(&json)
+            .map_err(|source| Error::LoadDbJson { source, file })
     }
 
     // Writes to a temporary file next to the db and renames it into place,
@@ -484,6 +540,58 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_meta_of_a_db_skips_its_entries() {
+        let mut db = Db::new();
+        let meta: DbMeta =
+            serde_json::from_str(&serde_json::to_string(&db).unwrap())
+                .unwrap();
+        assert!(meta.needs_login() && db.needs_login());
+
+        db.access_token = Some("access".to_string());
+        db.refresh_token = Some("refresh".to_string());
+        db.kdf = Some(crate::api::KdfType::Argon2id);
+        db.iterations = Some(3);
+        db.protected_key = Some("2.key".to_string());
+        db.last_sync = Some("2026-11-26T10:00:00Z".to_string());
+        db.entries.push(Entry {
+            id: "id".to_string(),
+            org_id: None,
+            folder: None,
+            folder_id: None,
+            name: "2.name".to_string(),
+            data: EntryData::SecureNote,
+            fields: vec![],
+            notes: None,
+            history: vec![],
+            key: None,
+            master_password_reprompt: crate::api::CipherRepromptType::None,
+            revision_date: None,
+            favorite: false,
+            archived: false,
+            read_only: false,
+        });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), serde_json::to_string(&db).unwrap())
+            .unwrap();
+        let meta = DbMeta::load_from(file.path().to_path_buf()).unwrap();
+        assert!(!meta.needs_login() && !db.needs_login());
+        assert_eq!(meta.access_token.as_deref(), Some("access"));
+        assert_eq!(meta.last_sync, db.last_sync);
+        for missing in [
+            |meta: &mut DbMeta| meta.access_token = None,
+            |meta: &mut DbMeta| meta.refresh_token = None,
+            |meta: &mut DbMeta| meta.kdf = None,
+            |meta: &mut DbMeta| meta.iterations = None,
+            |meta: &mut DbMeta| meta.protected_key = None,
+        ] {
+            let mut meta =
+                DbMeta::load_from(file.path().to_path_buf()).unwrap();
+            missing(&mut meta);
+            assert!(meta.needs_login());
+        }
+    }
 
     #[test]
     fn uri_checksum_stays_out_of_the_db() {

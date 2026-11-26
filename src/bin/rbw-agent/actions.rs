@@ -632,7 +632,8 @@ async fn unlock_with_touch_id(
 async fn touch_id_ready(
     state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> bool {
-    let protected_key = load_db().await.ok().and_then(|db| db.protected_key);
+    let protected_key =
+        load_db_meta().await.ok().and_then(|db| db.protected_key);
     let state = state.lock().await;
     state.touch_id_unlock
         && state
@@ -691,6 +692,8 @@ pub async fn reload_config(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
     let config = rbw::config::Config::load_async().await?;
+    // the next request makes a client with the settings as they are now
+    rbw::api::forget_clients();
     let mut state = state.lock().await;
     state.timeout_duration =
         std::time::Duration::from_secs(config.lock_timeout);
@@ -887,6 +890,23 @@ pub async fn sync(
     sock: Option<&mut crate::sock::Sock>,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
+    // a timer, a notification from the server and several programs can
+    // ask at once; one sync answers them all
+    let sync_flight = state.lock().await.sync_flight.clone();
+    // boxed: the request and the answer it parses are large, and every
+    // caller's future would carry them
+    sync_flight.run(Box::pin(sync_once(state))).await?;
+
+    if let Some(sock) = sock {
+        respond_ack(sock).await?;
+    }
+
+    Ok(())
+}
+
+async fn sync_once(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
     let db = load_db().await?;
 
     let access_token = if let Some(access_token) = &db.access_token {
@@ -952,12 +972,12 @@ pub async fn sync(
         state.lock().await.biometric_unlock = None;
     }
 
-    if let Err(e) = subscribe_to_notifications(state.clone()).await {
-        eprintln!("failed to subscribe to notifications: {e}");
-    }
-
-    if let Some(sock) = sock {
-        respond_ack(sock).await?;
+    if let Some(access_token) = db.access_token {
+        if let Err(e) =
+            subscribe_to_notifications(state.clone(), access_token).await
+        {
+            eprintln!("failed to subscribe to notifications: {e}");
+        }
     }
 
     Ok(())
@@ -970,35 +990,51 @@ async fn decrypt_cipher(
     entry_key: Option<&str>,
     org_id: Option<&str>,
 ) -> anyhow::Result<rbw::protocol::Secret> {
-    decrypt_cipher_in_request(
-        state,
+    learn_master_password_reprompt(&state).await?;
+    let mut state = state.lock().await;
+    decrypt_in_request(
+        &mut state,
         environment,
         cipherstring,
         entry_key,
         org_id,
-        &mut false,
+        &mut DecryptRequest::default(),
     )
     .await
 }
 
-// Decrypts one cipherstring as part of a request that may decrypt several.
-// If the user cancels or fails a master password reprompt, the request sets
-// reprompt_declined, and the remaining reprompt-protected values in the same
-// request fail without asking again. A password that checks out opens the
-// entry, as rbw item unlock does.
-async fn decrypt_cipher_in_request(
-    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+// What a request that decrypts several values keeps from one to the next.
+#[derive(Default)]
+struct DecryptRequest<'a> {
+    // If the user cancels or fails a master password reprompt, the remaining
+    // reprompt-protected values in the same request fail without asking
+    // again.
+    reprompt_declined: bool,
+    // whether pinentry asked for the master password, which can take
+    // minutes, since the request last checked the lock timeout
+    prompted: bool,
+    // the individual keys of the entries, by organization and encrypted
+    // key, so that an entry's values don't each decrypt it again
+    entry_keys: std::collections::HashMap<
+        (Option<&'a str>, &'a str),
+        rbw::locked::Keys,
+    >,
+}
+
+// Decrypts one cipherstring as part of a request that may decrypt several,
+// with the state locked. A password given to a master password reprompt
+// that checks out opens the entry, as rbw item unlock does.
+async fn decrypt_in_request<'a>(
+    state: &mut crate::state::State,
     environment: &rbw::protocol::Environment,
     cipherstring: &str,
-    entry_key: Option<&str>,
-    org_id: Option<&str>,
-    reprompt_declined: &mut bool,
+    entry_key: Option<&'a str>,
+    org_id: Option<&'a str>,
+    request: &mut DecryptRequest<'a>,
 ) -> anyhow::Result<rbw::protocol::Secret> {
-    learn_master_password_reprompt(&state).await?;
     let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
         .context("failed to parse encrypted secret")?;
 
-    let mut state = state.lock().await;
     if state.needs_unlock() {
         return Err(anyhow::anyhow!(
             "failed to find decryption keys in in-memory state"
@@ -1010,9 +1046,13 @@ async fn decrypt_cipher_in_request(
              password again; try again"
         ));
     };
-    if let Some(entry_id) =
+    // most vaults have no entry with reprompt, which spares the hash
+    let entry_id = if protected.is_empty() {
+        None
+    } else {
         protected.get(&cipherstring.fingerprint()).cloned()
-    {
+    };
+    if let Some(entry_id) = entry_id {
         if !state.use_unlocked_entry(&entry_id) {
             if environment.is_noninteractive() {
                 return Err(rbw::error::coded(
@@ -1023,18 +1063,19 @@ async fn decrypt_cipher_in_request(
                     ),
                 ));
             }
-            if *reprompt_declined {
+            if request.reprompt_declined {
                 return Err(anyhow::anyhow!(
                     "master password reprompt was declined earlier in this \
                      request"
                 ));
             }
             // other requests wait for the state until pinentry is answered
-            let account = PasswordCheck::load(&state).await?;
+            request.prompted = true;
+            let account = PasswordCheck::load(state).await?;
             if let Err(e) =
                 confirm_master_password(environment, &account).await
             {
-                *reprompt_declined = true;
+                request.reprompt_declined = true;
                 return Err(e);
             }
             state.unlock_entry(&entry_id);
@@ -1047,21 +1088,27 @@ async fn decrypt_cipher_in_request(
         ));
     };
     let entry_key = if let Some(entry_key) = entry_key {
-        let key_cipherstring =
-            rbw::cipherstring::CipherString::new(entry_key)
-                .context("failed to parse individual item encryption key")?;
-        Some(rbw::locked::Keys::new(
-            key_cipherstring.decrypt_locked_symmetric(keys).context(
-                "failed to decrypt individual item encryption key",
-            )?,
-        ))
+        if let std::collections::hash_map::Entry::Vacant(vacant) =
+            request.entry_keys.entry((org_id, entry_key))
+        {
+            let key_cipherstring = rbw::cipherstring::CipherString::new(
+                entry_key,
+            )
+            .context("failed to parse individual item encryption key")?;
+            vacant.insert(rbw::locked::Keys::new(
+                key_cipherstring.decrypt_locked_symmetric(keys).context(
+                    "failed to decrypt individual item encryption key",
+                )?,
+            ));
+        }
+        request.entry_keys.get(&(org_id, entry_key))
     } else {
         None
     };
 
     let plaintext = String::from_utf8(
         cipherstring
-            .decrypt_symmetric(keys, entry_key.as_ref())
+            .decrypt_symmetric(keys, entry_key)
             .context("failed to decrypt encrypted secret")?,
     )
     .map_err(|e| {
@@ -1282,29 +1329,47 @@ pub async fn decrypt_many(
     environment: &rbw::protocol::Environment,
     items: &[rbw::protocol::DecryptItem],
 ) -> anyhow::Result<()> {
+    let to_error = |e: &anyhow::Error| rbw::protocol::DecryptError {
+        error: format!("{e:#}"),
+        code: Some(rbw::error::code(e)),
+    };
+    // once for the whole request; a failure fails each value
+    let learned = learn_master_password_reprompt(&state)
+        .await
+        .map_err(|e| to_error(&e));
+    // the state stays locked for the whole request, as it does while
+    // pinentry asks for the master password
+    let mut state = state.lock().await;
+    let mut request = DecryptRequest::default();
     let mut plaintexts = Vec::with_capacity(items.len());
-    let mut reprompt_declined = false;
     for item in items {
-        // handle_request checked the lock deadline before the batch, but a
-        // reprompt can keep it running for minutes (or across a sleep), so
-        // check again before each value, as separate requests would
-        state.lock().await.lock_if_expired();
+        if let Err(error) = &learned {
+            plaintexts.push(Err(error.clone()));
+            continue;
+        }
+        // handle_request checked the lock deadline before the request, but
+        // a reprompt can keep it running for minutes (or across a sleep), so
+        // check again after one, as separate requests would
+        if std::mem::take(&mut request.prompted) {
+            state.lock_if_expired();
+            if state.needs_unlock() {
+                request.entry_keys.clear();
+            }
+        }
         plaintexts.push(
-            decrypt_cipher_in_request(
-                state.clone(),
+            decrypt_in_request(
+                &mut state,
                 environment,
                 &item.cipherstring,
                 item.entry_key.as_deref(),
                 item.org_id.as_deref(),
-                &mut reprompt_declined,
+                &mut request,
             )
             .await
-            .map_err(|e| rbw::protocol::DecryptError {
-                error: format!("{e:#}"),
-                code: Some(rbw::error::code(&e)),
-            }),
+            .map_err(|e| to_error(&e)),
         );
     }
+    drop(state);
     sock.send(&rbw::protocol::Response::DecryptMany { plaintexts })
         .await?;
 
@@ -1434,6 +1499,18 @@ pub async fn load_db() -> anyhow::Result<rbw::db::Db> {
     }
 }
 
+// What the db says of the login, without its entries (see DbMeta).
+#[cfg(target_os = "macos")]
+async fn load_db_meta() -> anyhow::Result<rbw::db::DbMeta> {
+    let config = rbw::config::Config::load_async().await?;
+    let email = config.email.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("failed to find email address in config")
+    })?;
+    rbw::db::Db::load_meta_async(&config.server_name(), email)
+        .await
+        .map_err(anyhow::Error::new)
+}
+
 async fn save_db(db: &rbw::db::Db) -> anyhow::Result<()> {
     let config = rbw::config::Config::load_async().await?;
     if let Some(email) = &config.email {
@@ -1458,8 +1535,11 @@ pub async fn config_pinentry() -> anyhow::Result<rbw::pinentry::Pinentry> {
     })
 }
 
+// With the access token that the sync just used, rather than reading the
+// db again.
 pub async fn subscribe_to_notifications(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    access_token: String,
 ) -> anyhow::Result<()> {
     if state.lock().await.notifications_handler.is_connected() {
         return Ok(());
@@ -1468,11 +1548,6 @@ pub async fn subscribe_to_notifications(
     let config = rbw::config::Config::load_async()
         .await
         .context("Config is missing")?;
-    let email = config.email.clone().context("Config is missing email")?;
-    let db = rbw::db::Db::load_async(config.server_name().as_str(), &email)
-        .await?;
-    let access_token =
-        db.access_token.context("Error getting access token")?;
 
     let websocket_url = crate::notifications::websocket_url(
         &config.notifications_url(),

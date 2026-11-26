@@ -14,9 +14,10 @@ const CARD: u8 = 3;
 const IDENTITY: u8 = 4;
 const SSH_KEY: u8 = 5;
 
-// Opens one cipherstring of an entry. The JSON is built twice with the same
-// entry: once to collect every cipherstring it needs, then with the
-// plaintexts, so the whole list takes one request to the agent.
+// Opens one cipherstring of an entry. collect_entry_cipherstrings lists
+// every cipherstring the JSON of an entry needs, in the order item_json
+// opens them, so that the whole list takes one request to the agent, and
+// item_json then builds the JSON with the plaintexts.
 type Open<'a> =
     dyn FnMut(&rbw::db::Entry, Option<&str>) -> Option<String> + 'a;
 
@@ -189,6 +190,115 @@ fn item_json(
     item
 }
 
+// The cipherstrings that item_json opens for an entry, in the same order,
+// without building any JSON. Keep the two in step: a test checks they are.
+fn collect_entry_cipherstrings<'a>(
+    entry: &'a rbw::db::Entry,
+    secrets: bool,
+    wanted: &mut Vec<&'a str>,
+) {
+    let mut push = |value: Option<&'a str>| wanted.extend(value);
+    push(Some(&entry.name));
+    if secrets {
+        push(entry.notes.as_deref());
+        for field in &entry.fields {
+            push(field.name.as_deref());
+            push(field.value.as_deref());
+        }
+        for history in &entry.history {
+            push(Some(&history.password));
+        }
+    }
+    match &entry.data {
+        rbw::db::EntryData::Login {
+            username,
+            password,
+            totp,
+            uris,
+        } => {
+            for uri in uris {
+                push(Some(&uri.uri));
+            }
+            push(username.as_deref());
+            if secrets {
+                push(password.as_deref());
+                push(totp.as_deref());
+            }
+        }
+        rbw::db::EntryData::SecureNote => {}
+        rbw::db::EntryData::Card {
+            cardholder_name,
+            number,
+            brand,
+            exp_month,
+            exp_year,
+            code,
+        } => {
+            push(brand.as_deref());
+            if secrets {
+                for value in
+                    [cardholder_name, number, exp_month, exp_year, code]
+                {
+                    push(value.as_deref());
+                }
+            }
+        }
+        rbw::db::EntryData::Identity {
+            title,
+            first_name,
+            middle_name,
+            last_name,
+            address1,
+            address2,
+            address3,
+            city,
+            state,
+            postal_code,
+            country,
+            phone,
+            email,
+            ssn,
+            license_number,
+            passport_number,
+            username,
+        } => {
+            for value in [title, first_name, middle_name, last_name] {
+                push(value.as_deref());
+            }
+            if secrets {
+                for value in [
+                    address1,
+                    address2,
+                    address3,
+                    city,
+                    state,
+                    postal_code,
+                    country,
+                    phone,
+                    email,
+                    ssn,
+                    license_number,
+                    passport_number,
+                    username,
+                ] {
+                    push(value.as_deref());
+                }
+            }
+        }
+        rbw::db::EntryData::SshKey {
+            private_key,
+            public_key,
+            fingerprint,
+        } => {
+            push(public_key.as_deref());
+            push(fingerprint.as_deref());
+            if secrets {
+                push(private_key.as_deref());
+            }
+        }
+    }
+}
+
 // The JSON of each entry, or why it couldn't be decrypted, with one request
 // to the agent.
 fn each_item_json(
@@ -196,17 +306,17 @@ fn each_item_json(
     secrets: bool,
 ) -> anyhow::Result<Vec<anyhow::Result<Value>>> {
     let mut wanted = vec![];
+    let mut cipherstrings = vec![];
     for entry in entries {
-        item_json(entry, secrets, &mut |entry, cipherstring| {
-            if let Some(cipherstring) = cipherstring {
-                wanted.push(rbw::protocol::DecryptItem {
-                    cipherstring: cipherstring.to_string(),
-                    entry_key: entry.key.clone(),
-                    org_id: entry.org_id.clone(),
-                });
+        cipherstrings.clear();
+        collect_entry_cipherstrings(entry, secrets, &mut cipherstrings);
+        wanted.extend(cipherstrings.iter().map(|cipherstring| {
+            rbw::protocol::DecryptItem {
+                cipherstring: (*cipherstring).to_string(),
+                entry_key: entry.key.clone(),
+                org_id: entry.org_id.clone(),
             }
-            None
-        });
+        }));
     }
     let mut plaintexts = crate::actions::decrypt_many(wanted)?.into_iter();
     Ok(entries
@@ -242,10 +352,15 @@ fn items_json(
 }
 
 fn print_json(value: &Value) -> anyhow::Result<()> {
-    serde_json::to_writer(std::io::stdout(), value)
+    use std::io::Write as _;
+
+    // a list can be large, and stdout itself writes each line apart
+    let mut stdout = std::io::BufWriter::new(std::io::stdout().lock());
+    serde_json::to_writer(&mut stdout, value)
         .context("failed to write the JSON")?;
-    println!();
-    Ok(())
+    writeln!(stdout)
+        .and_then(|()| stdout.flush())
+        .context("failed to write the JSON")
 }
 
 fn find<'a>(
@@ -975,6 +1090,124 @@ fn folder_json(id: &str, name: &str) -> Value {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    // An entry of each kind with every value set, each to a cipherstring of
+    // its own, so that the order of the values shows.
+    fn entries() -> Vec<rbw::db::Entry> {
+        let mut n = 0;
+        let mut next = || {
+            n += 1;
+            Some(format!("2.value{n}"))
+        };
+        let datas = [
+            rbw::db::EntryData::Login {
+                username: next(),
+                password: next(),
+                totp: next(),
+                uris: (0..2)
+                    .map(|_| rbw::db::Uri {
+                        uri: next().unwrap(),
+                        match_type: None,
+                        uri_checksum: None,
+                    })
+                    .collect(),
+            },
+            rbw::db::EntryData::SecureNote,
+            rbw::db::EntryData::Card {
+                cardholder_name: next(),
+                number: next(),
+                brand: next(),
+                exp_month: next(),
+                exp_year: next(),
+                code: next(),
+            },
+            rbw::db::EntryData::Identity {
+                title: next(),
+                first_name: next(),
+                middle_name: next(),
+                last_name: next(),
+                address1: next(),
+                address2: next(),
+                address3: next(),
+                city: next(),
+                state: next(),
+                postal_code: next(),
+                country: next(),
+                phone: next(),
+                email: next(),
+                ssn: next(),
+                license_number: next(),
+                passport_number: next(),
+                username: next(),
+            },
+            rbw::db::EntryData::SshKey {
+                private_key: next(),
+                public_key: next(),
+                fingerprint: next(),
+            },
+        ];
+        datas
+            .into_iter()
+            .map(|data| rbw::db::Entry {
+                id: "id".to_string(),
+                org_id: None,
+                folder: None,
+                folder_id: None,
+                name: next().unwrap(),
+                data,
+                fields: (0..2)
+                    .map(|_| rbw::db::Field {
+                        ty: None,
+                        name: next(),
+                        value: next(),
+                        linked_id: None,
+                    })
+                    .collect(),
+                notes: next(),
+                history: (0..2)
+                    .map(|_| rbw::db::HistoryEntry {
+                        last_used_date: "2026-01-01T00:00:00Z".to_string(),
+                        password: next().unwrap(),
+                    })
+                    .collect(),
+                key: None,
+                master_password_reprompt: rbw::api::CipherRepromptType::None,
+                revision_date: None,
+                favorite: false,
+                archived: false,
+                read_only: false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn collected_cipherstrings_follow_the_order_item_json_opens() {
+        for mut entry in entries() {
+            for secrets in [false, true] {
+                let mut opened = vec![];
+                item_json(&entry, secrets, &mut |_, cipherstring| {
+                    opened.extend(cipherstring.map(str::to_string));
+                    None
+                });
+                let mut collected = vec![];
+                collect_entry_cipherstrings(&entry, secrets, &mut collected);
+                // the name, at least
+                assert_ne!(collected.len(), 0);
+                assert_eq!(collected, opened, "{:?} {secrets}", entry.data);
+            }
+            // and with values missing
+            entry.notes = None;
+            entry.fields[0].name = None;
+            let mut opened = vec![];
+            item_json(&entry, true, &mut |_, cipherstring| {
+                opened.extend(cipherstring.map(str::to_string));
+                None
+            });
+            let mut collected = vec![];
+            collect_entry_cipherstrings(&entry, true, &mut collected);
+            assert_eq!(collected, opened);
+        }
+    }
 
     #[test]
     fn reads_items_as_json_or_base64() {

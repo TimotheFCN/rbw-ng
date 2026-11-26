@@ -31,6 +31,39 @@ impl LastUse {
     }
 }
 
+// Runs one sync at a time, and spares a caller that waited for one its own
+// sync when one that started after the caller asked has succeeded since:
+// that one is at least as fresh. A sync that started before the caller
+// asked may miss a change the caller just made, so the caller doesn't take
+// its result.
+#[derive(Default)]
+pub struct SyncFlight {
+    running: tokio::sync::Mutex<()>,
+    // syncs started, numbered from 1
+    started: std::sync::atomic::AtomicU64,
+    // the number of the last one that succeeded
+    succeeded: std::sync::atomic::AtomicU64,
+}
+
+impl SyncFlight {
+    pub async fn run<F>(&self, sync: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        use std::sync::atomic::Ordering;
+
+        let asked = self.started.load(Ordering::SeqCst);
+        let _running = self.running.lock().await;
+        if self.succeeded.load(Ordering::SeqCst) > asked {
+            return Ok(());
+        }
+        let number = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+        sync.await?;
+        self.succeeded.store(number, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
 pub struct State {
     pub priv_key: Option<rbw::locked::Keys>,
     pub org_keys:
@@ -48,6 +81,7 @@ pub struct State {
     // last read
     pub unlocked_entries: std::collections::HashMap<String, LastUse>,
     pub unlock_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub sync_flight: std::sync::Arc<SyncFlight>,
     #[cfg(target_os = "macos")]
     // Read at startup and when `rbw config` changes it, so that a password
     // unlock doesn't reread the config.
@@ -188,6 +222,65 @@ impl State {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[tokio::test]
+    async fn waiting_syncs_share_the_next_one() {
+        let flight = std::sync::Arc::new(SyncFlight::default());
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+
+        // a first sync, held until released
+        let first = tokio::spawn({
+            let (flight, runs) = (flight.clone(), runs.clone());
+            async move {
+                flight
+                    .run(async {
+                        runs.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        released.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        while runs.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // asked while it runs: they may miss what it fetched already, so
+        // they need a sync of their own, and share one
+        let waiting: Vec<_> = (0..3)
+            .map(|_| {
+                let (flight, runs) = (flight.clone(), runs.clone());
+                tokio::spawn(async move {
+                    flight
+                        .run(async {
+                            runs.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            Ok(())
+                        })
+                        .await
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        for sync in waiting {
+            sync.await.unwrap().unwrap();
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // a failed sync is no result to share
+        assert!(flight
+            .run(async { Err(anyhow::anyhow!("offline")) })
+            .await
+            .is_err());
+        flight.run(async { Ok(()) }).await.unwrap();
+    }
 
     #[test]
     fn an_unlocked_entry_closes_once_unread_on_either_clock() {
