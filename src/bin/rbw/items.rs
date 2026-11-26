@@ -462,18 +462,21 @@ struct FieldIn {
     linked_id: Option<rbw::api::LinkedIdType>,
 }
 
-// The item on stdin: JSON, or base64 JSON as bw encode makes it.
+// The item on stdin: JSON, or base64 JSON as bw encode makes it. It holds
+// secrets, so copies of it are wiped when dropped.
 fn read_item(input: &str) -> anyhow::Result<ItemIn> {
     let text = input.trim();
-    let json = if text.starts_with('{') {
+    let json = zeroize::Zeroizing::new(if text.starts_with('{') {
         text.to_string()
     } else {
-        String::from_utf8(
+        let decoded = zeroize::Zeroizing::new(
             rbw::base64::decode(text)
                 .context("the item on stdin isn't JSON or base64 JSON")?,
-        )
-        .context("the item on stdin isn't UTF-8")?
-    };
+        );
+        std::str::from_utf8(&decoded)
+            .context("the item on stdin isn't UTF-8")?
+            .to_string()
+    });
     // serde's message can quote a value, such as a password given as a
     // number, so only say where the item went wrong
     let item: ItemIn = serde_json::from_str(&json).map_err(|e| {
@@ -504,7 +507,7 @@ fn read_item(input: &str) -> anyhow::Result<ItemIn> {
 }
 
 fn read_stdin_item() -> anyhow::Result<ItemIn> {
-    let mut input = String::new();
+    let mut input = zeroize::Zeroizing::new(String::new());
     std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
         .context("failed to read the item from stdin")?;
     read_item(&input).map_err(|e| match rbw::error::code(&e) {
@@ -861,6 +864,9 @@ pub fn delete(id: &str) -> anyhow::Result<()> {
     let db = crate::commands::load_db()?;
     let entry = find(&db, id)?;
     check_writable(entry)?;
+    // as for an edit: the official clients ask for the master password
+    // again before they delete such an entry
+    require_open(entry)?;
     let (access_token, refresh_token) = tokens(&db)?;
     rbw::actions::trash(&access_token, &refresh_token, &entry.id)?;
     crate::actions::sync()

@@ -21,7 +21,7 @@ fn password(text: &str) -> rbw::locked::Password {
 
 async fn respond(
     sock: &mut crate::sock::Sock,
-    session: Option<String>,
+    session: Option<rbw::protocol::Secret>,
 ) -> anyhow::Result<()> {
     match session {
         Some(session) => {
@@ -301,7 +301,7 @@ pub async fn unlock_with(
 async fn new_session(
     state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     wanted: bool,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<rbw::protocol::Secret>> {
     if !wanted {
         return Ok(None);
     }

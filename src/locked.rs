@@ -4,6 +4,9 @@ const LEN: usize = 4096;
 
 static REGION_LOCK_WORKS: std::sync::OnceLock<bool> =
     std::sync::OnceLock::new();
+// whether a lock failed after the first ones worked, to say so only once
+static REGION_LOCK_FAILED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 pub struct Vec {
     // Fields are dropped in declaration order after `Vec::drop`. Keep the
@@ -16,8 +19,21 @@ impl Default for Vec {
     fn default() -> Self {
         let data = Box::new(arrayvec::ArrayVec::<_, LEN>::new());
         let lock = match REGION_LOCK_WORKS.get() {
+            // locking can still fail later, for example once the process
+            // reaches RLIMIT_MEMLOCK with many keys at once: the secret
+            // then stays unlocked rather than taking the process down
             Some(true) => {
-                Some(region::lock(data.as_ptr(), data.capacity()).unwrap())
+                match region::lock(data.as_ptr(), data.capacity()) {
+                    Ok(lock) => Some(lock),
+                    Err(e) => {
+                        if !REGION_LOCK_FAILED
+                            .swap(true, std::sync::atomic::Ordering::Relaxed)
+                        {
+                            eprintln!("failed to lock memory region: {e}");
+                        }
+                        None
+                    }
+                }
             }
             Some(false) => None,
             None => match region::lock(data.as_ptr(), data.capacity()) {

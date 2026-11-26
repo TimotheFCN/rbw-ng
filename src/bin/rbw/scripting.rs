@@ -87,9 +87,9 @@ pub fn unlock_for_program() -> anyhow::Result<bool> {
     Ok(true)
 }
 
-fn print_session(session: Option<String>) {
+fn print_session(session: Option<rbw::protocol::Secret>) {
     if let Some(session) = session {
-        println!("{session}");
+        println!("{}", session.as_str());
     }
 }
 

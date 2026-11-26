@@ -46,7 +46,7 @@ fn digest(protected_key: &str) -> String {
 pub fn wrap(
     vault_key: &rbw::locked::Keys,
     protected_key: &str,
-) -> anyhow::Result<(String, Wrapped)> {
+) -> anyhow::Result<(rbw::protocol::Secret, Wrapped)> {
     let mut session_key = rbw::locked::Vec::new();
     session_key.extend(std::iter::repeat_n(0, SESSION_KEY_LEN));
     rand::rng().fill_bytes(session_key.data_mut());
@@ -57,7 +57,9 @@ pub fn wrap(
     )
     .context("failed to encrypt the vault key")?;
     Ok((
-        rbw::base64::encode(wrapping_keys.as_bytes()),
+        rbw::protocol::Secret::new(rbw::base64::encode(
+            wrapping_keys.as_bytes(),
+        )),
         Wrapped {
             protected_key_digest: digest(protected_key),
             wrapped_key: wrapped_key.to_string(),
@@ -108,9 +110,6 @@ pub fn load() -> Option<Wrapped> {
 }
 
 pub fn save(wrapped: &Wrapped) -> anyhow::Result<()> {
-    use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-
     let file = rbw::dirs::session_file();
     if let Some(dir) = file.parent() {
         std::fs::create_dir_all(dir)
@@ -118,21 +117,35 @@ pub fn save(wrapped: &Wrapped) -> anyhow::Result<()> {
     }
     let json = serde_json::to_vec(wrapped)
         .context("failed to encode the session")?;
-    // write a new file and rename it over the old one, so a crash never
-    // leaves half a key
-    let tmp = file.with_extension("json.tmp");
-    let mut fh = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .context("failed to save the session")?;
-    fh.write_all(&json)
-        .and_then(|()| fh.sync_all())
-        .context("failed to save the session")?;
-    std::fs::rename(&tmp, &file).context("failed to save the session")?;
-    Ok(())
+    save_to(&file, &json).context("failed to save the session")
+}
+
+// Writes a new file and renames it over the old one, so a crash never
+// leaves half a key. The new file's name is unique to the process and the
+// save, so that two saves at once don't write into the same file.
+fn save_to(file: &std::path::Path, json: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+
+    static COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp =
+        file.with_extension(format!("json.{}.{n}.tmp", std::process::id()));
+    let res = (|| {
+        let mut fh = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        fh.write_all(json)?;
+        fh.sync_all()?;
+        std::fs::rename(&tmp, file)
+    })();
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 pub fn delete() {
@@ -185,6 +198,26 @@ mod test {
         let (_, wrapped) = wrap(&key, "2.protected").unwrap();
         assert!(unwrap(&wrapped, "not base64!", "2.protected").is_err());
         assert!(unwrap(&wrapped, "AAAA", "2.protected").is_err());
+    }
+
+    #[test]
+    fn saves_replace_the_file_and_leave_no_temporary_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.json");
+        save_to(&file, b"first").unwrap();
+        save_to(&file, b"second").unwrap();
+        assert_eq!(std::fs::read(&file).unwrap(), b"second");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // a failed save removes its temporary file
+        assert!(
+            save_to(&dir.path().join("missing/session.json"), b"x").is_err()
+        );
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
     #[test]

@@ -117,8 +117,7 @@ async fn subscribe_to_notifications(
         .send(tokio_tungstenite::tungstenite::Message::Text(
             "{\"protocol\":\"messagepack\",\"version\":1}\x1e".into(),
         ))
-        .await
-        .unwrap();
+        .await?;
 
     let read_future = async move {
         let sending_channels = &sending_channels;
@@ -129,7 +128,9 @@ async fn subscribe_to_notifications(
                         let sending_channels = sending_channels.read().await;
                         let sending_channels = sending_channels.as_slice();
                         for channel in sending_channels {
-                            channel.send(message).unwrap();
+                            // the receiver is gone only when the agent
+                            // stops listening, which is no reason to panic
+                            let _ = channel.send(message);
                         }
                     }
                 }
@@ -142,6 +143,31 @@ async fn subscribe_to_notifications(
     };
 
     Ok((write, tokio::spawn(read_future)))
+}
+
+// The address of the notifications hub for the server's notifications URL,
+// over a websocket: wss for https, ws for http.
+pub fn websocket_url(notifications_url: &str, access_token: &str) -> String {
+    let base = notifications_url
+        .strip_prefix("https://")
+        .map(|rest| format!("wss://{rest}"))
+        .or_else(|| {
+            notifications_url
+                .strip_prefix("http://")
+                .map(|rest| format!("ws://{rest}"))
+        })
+        .unwrap_or_else(|| notifications_url.to_string());
+    format!("{base}/hub?access_token={access_token}")
+}
+
+// An error to log, without the access token that the hub's address carries:
+// agent.err is no place for credentials.
+pub fn redact(error: &str, access_token: &str) -> String {
+    if access_token.is_empty() {
+        error.to_string()
+    } else {
+        error.replace(access_token, "[redacted]")
+    }
 }
 
 fn parse_message(
@@ -186,6 +212,33 @@ fn parse_message(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn hub_urls_use_websockets_for_both_schemes() {
+        assert_eq!(
+            super::websocket_url("https://notifications.bitwarden.com", "t"),
+            "wss://notifications.bitwarden.com/hub?access_token=t"
+        );
+        assert_eq!(
+            super::websocket_url("http://localhost:8080/notifications", "t"),
+            "ws://localhost:8080/notifications/hub?access_token=t"
+        );
+        // not a prefix anywhere else
+        assert_eq!(
+            super::websocket_url("https://example.com/https://x", "t"),
+            "wss://example.com/https://x/hub?access_token=t"
+        );
+    }
+
+    #[test]
+    fn logged_errors_leave_out_the_access_token() {
+        let url = super::websocket_url("https://example.com", "secret.jwt");
+        let logged =
+            super::redact(&format!("failed to reach {url}"), "secret.jwt");
+        assert!(!logged.contains("secret.jwt"), "{logged}");
+        assert!(logged.contains("access_token=[redacted]"), "{logged}");
+        assert_eq!(super::redact("no token", ""), "no token");
+    }
+
     #[tokio::test]
     async fn websocket_handshake_sends_extra_headers() {
         use tokio::io::AsyncReadExt as _;

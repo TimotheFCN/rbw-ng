@@ -1,7 +1,7 @@
 use crate::prelude::*;
 
 use std::io::{Read as _, Write as _};
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -142,45 +142,52 @@ impl Config {
         Ok(slf)
     }
 
+    // Writes to a temporary file next to the config and renames it into
+    // place, so that a crash or a concurrent reader never sees a partly
+    // written config. extra_headers can hold credentials, so the config is
+    // private, and so is a folder made for it.
     pub fn save(&self) -> Result<()> {
-        let file = crate::dirs::config_file();
-        // unwrap is safe here because Self::filename is explicitly
-        // constructed as a filename in a directory
-        std::fs::create_dir_all(file.parent().unwrap()).map_err(
-            |source| Error::SaveConfig {
+        self.save_to(crate::dirs::config_file())
+    }
+
+    fn save_to(&self, file: std::path::PathBuf) -> Result<()> {
+        let json = serde_json::to_string(self).map_err(|source| {
+            Error::SaveConfigJson {
                 source,
                 file: file.clone(),
-            },
-        )?;
-        // extra_headers can hold credentials, so a new config file is
-        // private, and an existing one is made private once it has them
-        let mut fh = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&file)
+            }
+        })?;
+        // unwrap is safe here because Self::filename is explicitly
+        // constructed as a filename in a directory
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(file.parent().unwrap())
             .map_err(|source| Error::SaveConfig {
                 source,
                 file: file.clone(),
             })?;
-        if !self.extra_headers.is_empty() {
-            fh.set_permissions(std::fs::Permissions::from_mode(0o600))
-                .map_err(|source| Error::SaveConfig {
-                    source,
-                    file: file.clone(),
-                })?;
+        // a config that links to another file, for example in a dotfiles
+        // repository, stays a link
+        let target = std::fs::canonicalize(&file).unwrap_or(file);
+        let temp = crate::db::temp_file(&target);
+        let res = (|| {
+            let mut fh = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&temp)?;
+            fh.write_all(json.as_bytes())?;
+            fh.sync_all()?;
+            std::fs::rename(&temp, &target)
+        })();
+        if res.is_err() {
+            let _ = std::fs::remove_file(&temp);
         }
-        fh.write_all(
-            serde_json::to_string(self)
-                .map_err(|source| Error::SaveConfigJson {
-                    source,
-                    file: file.clone(),
-                })?
-                .as_bytes(),
-        )
-        .map_err(|source| Error::SaveConfig { source, file })?;
-        Ok(())
+        res.map_err(|source| Error::SaveConfig {
+            source,
+            file: target,
+        })
     }
 
     pub fn validate() -> Result<()> {
@@ -407,6 +414,45 @@ mod tests {
         assert_eq!(config.icons_url(), "https://icons.bitwarden.eu");
         config.base_url = Some("https://vault.example.com/".to_string());
         assert_eq!(config.icons_url(), "https://vault.example.com/icons");
+    }
+
+    #[test]
+    fn saves_are_atomic_and_private() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rbw/config.json");
+        let mut config = Config::new();
+        config.email = Some("me@example.com".to_string());
+        config.save_to(file.clone()).unwrap();
+        config.email = Some("you@example.com".to_string());
+        config.save_to(file.clone()).unwrap();
+
+        let saved: Config =
+            serde_json::from_str(&std::fs::read_to_string(&file).unwrap())
+                .unwrap();
+        assert_eq!(saved.email.as_deref(), Some("you@example.com"));
+        let mode = |path: &std::path::Path| {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        };
+        assert_eq!(mode(&file), 0o600);
+        assert_eq!(mode(file.parent().unwrap()), 0o700);
+        // no temporary file is left behind
+        assert_eq!(
+            std::fs::read_dir(file.parent().unwrap()).unwrap().count(),
+            1
+        );
+
+        // a config that links elsewhere stays a link
+        let target = dir.path().join("dotfiles.json");
+        std::fs::write(&target, "{}").unwrap();
+        let link = dir.path().join("link.json");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        config.save_to(link.clone()).unwrap();
+        assert!(std::fs::symlink_metadata(&link).unwrap().is_symlink());
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("you@example.com"));
     }
 
     #[test]

@@ -271,8 +271,8 @@ each time such an entry is opened and not while it stays open. Without
 `--password-stdin`, `rbw item unlock` asks through pinentry, and a password
 given to pinentry when a value is read opens the entry the same way.
 
-Editing such an entry needs it open too, whatever its kind: otherwise `edit`
-fails with `reprompt_required`.
+Editing or deleting such an entry needs it open too, whatever its kind:
+otherwise `edit` and `delete` fail with `reprompt_required`.
 
 The agent, not `rbw`, keeps these values closed: it decrypts none of them
 without the master password, whatever program asks. It knows which entries

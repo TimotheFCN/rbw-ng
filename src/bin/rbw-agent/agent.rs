@@ -307,10 +307,81 @@ async fn handle_request(
     };
 
     let mut state = state.lock().await;
-    state.set_last_environment(environment);
+    if keeps_environment(&action, &environment) {
+        state.set_last_environment(environment);
+    }
     if set_timeout {
         state.set_timeout();
     }
 
     Ok(())
+}
+
+// Whether the SSH agent may reuse a request's environment for its prompts
+// (see State::last_environment). A program that polls the agent without a
+// terminal or a display, such as a desktop app that runs rbw status every
+// few seconds with RBW_NONINTERACTIVE, must not replace the environment of
+// the last person who used rbw, or the SSH agent could no longer ask for
+// the master password or confirm a signature.
+fn keeps_environment(
+    action: &rbw::protocol::Action,
+    environment: &rbw::protocol::Environment,
+) -> bool {
+    !environment.is_noninteractive()
+        && !matches!(
+            action,
+            rbw::protocol::Action::Status
+                | rbw::protocol::Action::CheckLock
+                | rbw::protocol::Action::Version
+        )
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn environment(vars: &[(&str, &str)]) -> rbw::protocol::Environment {
+        rbw::protocol::Environment::new(
+            Some("/dev/pts/3".into()),
+            vars.iter()
+                .map(|(name, value)| ((*name).into(), (*value).into()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn polls_dont_replace_the_environment_of_ssh_prompts() {
+        let interactive = environment(&[("DISPLAY", ":0")]);
+        let program = environment(&[("RBW_NONINTERACTIVE", "1")]);
+
+        assert!(keeps_environment(
+            &rbw::protocol::Action::Unlock,
+            &interactive
+        ));
+        assert!(!keeps_environment(&rbw::protocol::Action::Unlock, &program));
+        for action in [
+            rbw::protocol::Action::Status,
+            rbw::protocol::Action::CheckLock,
+            rbw::protocol::Action::Version,
+        ] {
+            assert!(!keeps_environment(&action, &interactive));
+        }
+        assert!(keeps_environment(
+            &rbw::protocol::Action::Unlock,
+            &environment(&[("RBW_NONINTERACTIVE", "0")])
+        ));
+
+        // what the SSH agent prompts with stays the interactive one
+        let mut last = interactive.clone();
+        for (action, environment) in [
+            (rbw::protocol::Action::Status, program.clone()),
+            (rbw::protocol::Action::Sync, program),
+        ] {
+            if keeps_environment(&action, &environment) {
+                last = environment;
+            }
+        }
+        assert!(!last.is_noninteractive());
+        assert_eq!(last.tty(), interactive.tty());
+    }
 }
