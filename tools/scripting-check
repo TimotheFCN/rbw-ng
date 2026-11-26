@@ -342,6 +342,16 @@ def organizations(rbw, quiet, shared_id):
     marked = rbw.json("item", "favorite", shared_id, "true", env=quiet)
     check("item favorite marks it", marked["favorite"] is True
           and marked["organizationId"] == shared["organizationId"], str(marked))
+    fresh = rbw.json("item", "get", shared_id, env=quiet)
+    del fresh["organizationId"]
+    fresh["notes"] = "still shared"
+    saved = rbw.json("item", "edit", shared_id, env=quiet, stdin=json.dumps(fresh))
+    check("edit without organizationId keeps the entry's",
+          saved["organizationId"] == shared["organizationId"], str(saved))
+    error = rbw.error("item", "edit", shared_id,
+                      stdin=json.dumps({**fresh, "organizationId": None}))
+    check("edit out of the organization is unsupported", error["code"] == "unsupported",
+          str(error))
     error = rbw.error("item", "create", stdin=json.dumps({**full, "id": None}))
     check("create refuses an organization", error["code"] == "unsupported", str(error))
     rbw.run("item", "delete", shared_id, env=quiet)
@@ -480,6 +490,8 @@ def reprompt(rbw, quiet, password, protected_id):
     rbw.fails("item", "edit", protected_id, env=quiet, stdin=json.dumps(in_list),
               needle="asks for the master password again")
     check("edit needs it unlocked", True)
+    error = rbw.error("item", "delete", protected_id)
+    check("delete needs it unlocked", error["code"] == "reprompt_required", str(error))
     rbw.run("item", "unlock", protected_id, "--password-stdin", stdin=password, env=quiet)
     full = rbw.json("item", "get", protected_id, env=quiet)
     check("unlock opens it", full["login"]["password"] == "bank-password", str(full["login"]))
@@ -782,6 +794,19 @@ def scenario(server, password):
               and code["code"] == totp("JBSWY3DPEHPK3PXP", code["expiresAt"] - 1), str(code))
         check("item code without a code is not_found",
               rbw.error("item", "code", mail["id"])["code"] == "not_found")
+        with_code = rbw.json("item", "get", item_id, "--with-code", env=quiet)
+        code = with_code["totpCode"]
+        check("get --with-code adds the current code",
+              code["period"] == 30 and code["code"] == totp("JBSWY3DPEHPK3PXP", code["expiresAt"] - 1)
+              and with_code["login"] == got["login"], str(code))
+        check("get --with-code of a login without a code adds none",
+              "totpCode" not in rbw.json("item", "get", mail["id"], "--with-code", env=quiet))
+        logins = rbw.json("item", "list", "--type", "login", env=quiet)
+        notes = rbw.json("item", "list", "--type", "note", env=quiet)
+        check("list --type lists that type only",
+              {item_id, mail["id"]} <= {i["id"] for i in logins}
+              and all(i["type"] == 1 for i in logins) and all(i["type"] == 2 for i in notes)
+              and len(logins) + len(notes) <= len(rbw.json("item", "list", env=quiet)))
         rbw.fails("item", "get", "00000000-0000-0000-0000-000000000000", env=quiet, needle="not found")
         check("an unknown id is not_found",
               rbw.error("item", "get", "00000000-0000-0000-0000-000000000000")["code"]
@@ -845,6 +870,16 @@ def scenario(server, password):
               rbw.json("status", "--json")["status"] == "locked")
         rbw.run("config", "set", "lock_timeout", "3600")
         rbw.run("unlock", "--password-stdin", env=quiet, stdin=password)
+        status = rbw.json("status", "--json")
+        expected = [{"profile": "scripting-check", "userEmail": email, "serverUrl": server,
+                     "status": "unlocked", "lastSync": status["lastSync"],
+                     "touchId": status["touchId"]}]
+        listed = rbw.json("profiles", "--json", "--status")
+        check("profiles --status says what status says",
+              status["status"] == "unlocked" and listed == expected, str(listed))
+        listed = rbw.json("profiles", "--json", "--status", env={"RBW_PROFILE": "elsewhere"})
+        check("also from another profile, through the profile's own agent",
+              listed == expected, str(listed))
         reprompt(rbw, quiet, password, protected_id)
         reprompt_kinds(rbw, quiet, protected)
         reprompt_attacks(rbw, quiet, password, protected_id, email)
@@ -855,6 +890,8 @@ def scenario(server, password):
         check("profiles lists the profile",
               rbw.json("profiles", "--json") == [{
                   "profile": "scripting-check", "userEmail": email, "serverUrl": server}])
+        check("profiles --status of a signed out profile",
+              rbw.json("profiles", "--json", "--status")[0]["status"] == "unauthenticated")
         error = rbw.error("purge", "--all", env={"RBW_PROFILE": "scripting-check/../.."})
         check("purge --all refuses a profile outside its folders",
               error["code"] == "invalid_input"

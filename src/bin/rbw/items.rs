@@ -373,12 +373,41 @@ fn find<'a>(
         .ok_or_else(|| coded(ErrorCode::NotFound, "not found"))
 }
 
-pub fn list(secrets: bool) -> anyhow::Result<()> {
+// The kinds of entries, for rbw item list --type.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ItemType {
+    Login,
+    Note,
+    Card,
+    Identity,
+    SshKey,
+}
+
+impl ItemType {
+    const fn id(self) -> u8 {
+        match self {
+            Self::Login => LOGIN,
+            Self::Note => SECURE_NOTE,
+            Self::Card => CARD,
+            Self::Identity => IDENTITY,
+            Self::SshKey => SSH_KEY,
+        }
+    }
+}
+
+pub fn list(secrets: bool, ty: Option<ItemType>) -> anyhow::Result<()> {
     crate::commands::unlock()?;
     let db = crate::commands::load_db()?;
-    // archived entries stay out of lists, as in the official clients
-    let entries: Vec<_> =
-        db.entries.iter().filter(|entry| !entry.archived).collect();
+    // archived entries stay out of lists, as in the official clients, and
+    // entries of other types aren't decrypted at all
+    let entries: Vec<_> = db
+        .entries
+        .iter()
+        .filter(|entry| {
+            !entry.archived
+                && ty.is_none_or(|ty| type_id(&entry.data) == ty.id())
+        })
+        .collect();
     let mut items = each_item_json(&entries, secrets)?;
     // entries that ask for the master password again and aren't open are
     // listed without their secrets
@@ -413,12 +442,19 @@ pub enum Field {
     Notes,
 }
 
-pub fn get(id: &str, field: Option<Field>) -> anyhow::Result<()> {
+pub fn get(
+    id: &str,
+    field: Option<Field>,
+    with_code: bool,
+) -> anyhow::Result<()> {
     crate::commands::unlock()?;
     let db = crate::commands::load_db()?;
     let entry = find(&db, id)?;
     let Some(field) = field else {
-        let item = items_json(&[entry], true)?.remove(0);
+        let mut item = items_json(&[entry], true)?.remove(0);
+        if with_code {
+            add_code(&mut item);
+        }
         return print_json(&item);
     };
     let (cipherstring, name) = match (&entry.data, field) {
@@ -457,6 +493,27 @@ pub fn get(id: &str, field: Option<Field>) -> anyhow::Result<()> {
     Ok(())
 }
 
+// A login's current code as rbw item code prints it, in totpCode, from the
+// secret the item already holds. An item without a secret, or with one that
+// isn't a TOTP secret, gets none, and still prints.
+fn add_code(item: &mut Value) {
+    let Some(code) = item["login"]["totp"]
+        .as_str()
+        .and_then(|secret| rbw::totp::current(secret).ok())
+    else {
+        return;
+    };
+    item["totpCode"] = code_json(&code);
+}
+
+fn code_json(code: &rbw::totp::Code) -> Value {
+    json!({
+        "code": code.code,
+        "period": code.period,
+        "expiresAt": code.expires_at,
+    })
+}
+
 // The current code of a login, with the time it stays valid, so that a
 // program can count it down.
 pub fn code(id: &str) -> anyhow::Result<()> {
@@ -477,12 +534,7 @@ pub fn code(id: &str) -> anyhow::Result<()> {
         }])?
         .remove(0)
         .map_err(|error| error.into_error().context("failed to decrypt"))?;
-    let code = rbw::totp::current(&secret)?;
-    print_json(&json!({
-        "code": code.code,
-        "period": code.period,
-        "expiresAt": code.expires_at,
-    }))
+    print_json(&code_json(&rbw::totp::current(&secret)?))
 }
 
 // An item as a program sends it, in Bitwarden's format. Other keys, such
@@ -496,7 +548,8 @@ struct ItemIn {
     name: String,
     notes: Option<String>,
     folder_id: Option<String>,
-    organization_id: Option<String>,
+    #[serde(default)]
+    organization_id: OrganizationIn,
     // missing: unchanged by an edit
     favorite: Option<bool>,
     // what the program read: an edit fails if the entry changed since
@@ -575,6 +628,25 @@ struct FieldIn {
     #[serde(rename = "type")]
     ty: rbw::api::FieldType,
     linked_id: Option<rbw::api::LinkedIdType>,
+}
+
+// The organizationId of an item on stdin. Missing, an edit keeps the
+// entry's. Given, null or an id, it must be the entry's, as moving entries
+// between organizations isn't supported.
+#[derive(Debug, Default, PartialEq, Eq)]
+enum OrganizationIn {
+    #[default]
+    Missing,
+    Given(Option<String>),
+}
+
+impl<'de> serde::Deserialize<'de> for OrganizationIn {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Option::deserialize(deserializer).map(Self::Given)
+    }
 }
 
 // The item on stdin: JSON, or base64 JSON as bw encode makes it. It holds
@@ -877,7 +949,7 @@ fn same_id(a: Option<&str>, b: Option<&str>) -> bool {
 
 pub fn create() -> anyhow::Result<()> {
     let item = read_stdin_item()?;
-    if item.organization_id.is_some() {
+    if matches!(item.organization_id, OrganizationIn::Given(Some(_))) {
         return Err(coded(
             ErrorCode::Unsupported,
             "creating entries in organizations isn't supported yet",
@@ -928,7 +1000,11 @@ pub fn edit(id: &str) -> anyhow::Result<()> {
     let entry = find(&db, id)?;
     check_writable(entry)?;
     require_open(entry)?;
-    if !same_id(item.organization_id.as_deref(), entry.org_id.as_deref()) {
+    if matches!(
+        &item.organization_id,
+        OrganizationIn::Given(given)
+            if !same_id(given.as_deref(), entry.org_id.as_deref())
+    ) {
         return Err(coded(
             ErrorCode::Unsupported,
             "moving entries between organizations isn't supported yet",
@@ -1206,6 +1282,52 @@ mod test {
             let mut collected = vec![];
             collect_entry_cipherstrings(&entry, true, &mut collected);
             assert_eq!(collected, opened);
+        }
+    }
+
+    #[test]
+    fn a_missing_organization_id_is_told_from_null() {
+        let org = |item: &str| read_item(item).unwrap().organization_id;
+        assert_eq!(org(r#"{"type":2,"name":"x"}"#), OrganizationIn::Missing);
+        assert_eq!(
+            org(r#"{"type":2,"name":"x","organizationId":null}"#),
+            OrganizationIn::Given(None)
+        );
+        assert_eq!(
+            org(r#"{"type":2,"name":"x","organizationId":"o1"}"#),
+            OrganizationIn::Given(Some("o1".to_string()))
+        );
+    }
+
+    #[test]
+    fn with_code_adds_the_current_code_of_a_totp_secret() {
+        let mut item = json!({"login": {"totp": "JBSWY3DPEHPK3PXP"}});
+        add_code(&mut item);
+        let code = &item["totpCode"];
+        assert_eq!(code["code"].as_str().unwrap().len(), 6);
+        assert_eq!(code["period"], 30);
+        assert!(code["expiresAt"].as_u64().unwrap() > 0);
+
+        for mut item in [
+            json!({"login": {"totp": null}}),
+            json!({"login": {"totp": "not a secret!"}}),
+            json!({"secureNote": {"type": 0}}),
+        ] {
+            add_code(&mut item);
+            assert!(item.get("totpCode").is_none(), "{item}");
+        }
+    }
+
+    #[test]
+    fn types_have_bitwardens_ids() {
+        for (entry, ty) in entries().iter().zip([
+            ItemType::Login,
+            ItemType::Note,
+            ItemType::Card,
+            ItemType::Identity,
+            ItemType::SshKey,
+        ]) {
+            assert_eq!(type_id(&entry.data), ty.id());
         }
     }
 

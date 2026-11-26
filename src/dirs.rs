@@ -41,10 +41,36 @@ pub fn config_file() -> std::path::PathBuf {
 const INVALID_PATH: &percent_encoding::AsciiSet =
     &percent_encoding::CONTROLS.add(b'/').add(b'%').add(b':');
 pub fn db_file(server: &str, email: &str) -> std::path::PathBuf {
+    db_file_in(&cache_dir(), server, email)
+}
+
+fn db_file_in(
+    cache_dir: &std::path::Path,
+    server: &str,
+    email: &str,
+) -> std::path::PathBuf {
     let server =
         percent_encoding::percent_encode(server.as_bytes(), INVALID_PATH)
             .to_string();
-    cache_dir().join(format!("{server}:{email}.json"))
+    cache_dir.join(format!("{server}:{email}.json"))
+}
+
+// The db and the agent's socket of a profile that profiles() lists, which
+// needn't be the one RBW_PROFILE selects.
+pub fn profile_db_file(
+    profile: Option<&str>,
+    server: &str,
+    email: &str,
+) -> Result<std::path::PathBuf> {
+    let folder = folder_name(profile.map(std::ffi::OsStr::new))?;
+    Ok(db_file_in(&cache_dir_of(&folder), server, email))
+}
+
+pub fn profile_socket_file(
+    profile: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let folder = folder_name(profile.map(std::ffi::OsStr::new))?;
+    Ok(runtime_dir_of(&folder).join("socket"))
 }
 
 pub fn pid_file() -> std::path::PathBuf {
@@ -127,8 +153,12 @@ fn config_dir() -> std::path::PathBuf {
 }
 
 fn cache_dir() -> std::path::PathBuf {
+    cache_dir_of(&profile())
+}
+
+fn cache_dir_of(folder: &str) -> std::path::PathBuf {
     let project_dirs =
-        directories::ProjectDirs::from("", "", &profile()).unwrap();
+        directories::ProjectDirs::from("", "", folder).unwrap();
     project_dirs.cache_dir().to_path_buf()
 }
 
@@ -139,14 +169,18 @@ fn data_dir() -> std::path::PathBuf {
 }
 
 fn runtime_dir() -> std::path::PathBuf {
+    runtime_dir_of(&profile())
+}
+
+fn runtime_dir_of(folder: &str) -> std::path::PathBuf {
     let project_dirs =
-        directories::ProjectDirs::from("", "", &profile()).unwrap();
+        directories::ProjectDirs::from("", "", folder).unwrap();
     project_dirs.runtime_dir().map_or_else(
         || {
             format!(
                 "{}/{}-{}",
                 std::env::temp_dir().to_string_lossy(),
-                profile(),
+                folder,
                 rustix::process::getuid().as_raw()
             )
             .into()
@@ -188,6 +222,24 @@ fn folder_name(profile: Option<&std::ffi::OsStr>) -> Result<String> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn other_profiles_have_their_own_db_and_socket() {
+        let socket = profile_socket_file(Some("work")).unwrap();
+        assert_eq!(socket, runtime_dir_of("rbw-work").join("socket"));
+        assert_ne!(socket, profile_socket_file(None).unwrap());
+        assert_eq!(
+            profile_socket_file(None).unwrap(),
+            runtime_dir_of("rbw").join("socket")
+        );
+        let db = profile_db_file(Some("work"), "https://x", "me@x").unwrap();
+        assert_eq!(
+            db,
+            cache_dir_of("rbw-work").join("https%3A%2F%2Fx:me@x.json")
+        );
+        assert!(profile_socket_file(Some("a/b")).is_err());
+        assert!(profile_db_file(Some("a/b"), "default", "me@x").is_err());
+    }
 
     #[test]
     fn profiles_stay_in_their_own_folders() {

@@ -439,11 +439,20 @@ enum Opt {
         long_about = "List the profiles on this computer\n\n\
             Prints each profile's name, the RBW_PROFILE that selects it, and \
             its email, or with --json an array of objects with profile \
-            (null for the default profile), userEmail and serverUrl."
+            (null for the default profile), userEmail and serverUrl. With \
+            --status, each object also has status, lastSync and touchId, as \
+            rbw status --json prints them."
     )]
     Profiles {
         #[arg(long, help = "Display output as JSON")]
         json: bool,
+        #[arg(
+            long,
+            requires = "json",
+            help = "Add each profile's status, as rbw status --json says it, \
+                without starting any agent"
+        )]
+        status: bool,
     },
 
     #[command(name = "stop-agent", about = "Terminate the background agent")]
@@ -476,12 +485,26 @@ enum Item {
                 password history"
         )]
         secrets: bool,
+        #[arg(
+            long = "type",
+            value_name = "TYPE",
+            value_enum,
+            help = "List only the entries of this type"
+        )]
+        ty: Option<items::ItemType>,
     },
     #[command(about = "Show one entry, or one of its fields")]
     Get {
         id: String,
         #[arg(long, value_enum, help = "Print only this field")]
         field: Option<items::Field>,
+        #[arg(
+            long,
+            conflicts_with = "field",
+            help = "Add a login's current code as totpCode, as rbw item code \
+                prints it"
+        )]
+        with_code: bool,
     },
     #[command(
         about = "Show a login's current code, its period and when it \
@@ -766,8 +789,12 @@ fn run(opt: Opt) -> anyhow::Result<()> {
         } => scripting::unlock(password_stdin, session, touch_id),
         Opt::Status { json } => scripting::status(json),
         Opt::Item { item } => match item {
-            Item::List { secrets } => items::list(secrets),
-            Item::Get { id, field } => items::get(&id, field),
+            Item::List { secrets, ty } => items::list(secrets, ty),
+            Item::Get {
+                id,
+                field,
+                with_code,
+            } => items::get(&id, field, with_code),
             Item::Code { id } => items::code(&id),
             Item::Create => items::create(),
             Item::Edit { id } => items::edit(&id),
@@ -936,7 +963,7 @@ fn run(opt: Opt) -> anyhow::Result<()> {
         ),
         Opt::Lock => commands::lock(),
         Opt::Purge { all } => commands::purge(all),
-        Opt::Profiles { json } => commands::profiles(json),
+        Opt::Profiles { json, status } => commands::profiles(json, status),
         Opt::StopAgent => commands::stop_agent(),
         Opt::SshAgent { cmd } => match cmd {
             SshAgent::Install => commands::ssh_agent_install(),

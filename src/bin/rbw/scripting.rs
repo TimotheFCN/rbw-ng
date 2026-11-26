@@ -191,26 +191,78 @@ struct Status {
     touch_id: bool,
 }
 
+// What rbw status says of a vault, which rbw profiles --status says of each
+// profile's: whether it is logged in and unlocked, when it last synced, and
+// whether Touch ID can unlock it.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VaultStatus {
+    status: &'static str,
+    last_sync: Option<String>,
+    touch_id: bool,
+}
+
+// From the db of a logged in account, if it is, and from its agent if that
+// is: whether the vault is unlocked, and whether Touch ID can unlock it. A
+// stopped agent means a locked vault.
+fn vault_status(
+    db: Option<rbw::db::DbMeta>,
+    agent_status: impl FnOnce() -> anyhow::Result<(bool, bool)>,
+) -> VaultStatus {
+    let Some(db) = db else {
+        return VaultStatus {
+            status: "unauthenticated",
+            last_sync: None,
+            touch_id: false,
+        };
+    };
+    let (status, touch_id) = match agent_status() {
+        Ok((true, _)) => ("unlocked", false),
+        Ok((false, touch_id)) => ("locked", touch_id),
+        Err(_) => ("locked", false),
+    };
+    VaultStatus {
+        status,
+        last_sync: db.last_sync,
+        touch_id,
+    }
+}
+
+// The status of a profile that rbw profiles lists, with its configuration.
+// Its agent isn't started, nor restarted when it is of another version.
+pub fn profile_status(
+    profile: Option<&str>,
+    config: &rbw::config::Config,
+) -> VaultStatus {
+    let db = config
+        .email
+        .as_deref()
+        .and_then(|email| {
+            rbw::dirs::profile_db_file(profile, &config.server_name(), email)
+                .ok()
+        })
+        .and_then(|file| rbw::db::DbMeta::load_from(file).ok())
+        .filter(|db| !db.needs_login());
+    vault_status(db, || {
+        crate::actions::profile_status(&rbw::dirs::profile_socket_file(
+            profile,
+        )?)
+    })
+}
+
 pub fn status(json: bool) -> anyhow::Result<()> {
     let config = rbw::config::Config::load().unwrap_or_default();
-    let db = logged_in_db(&config);
-    let (status, touch_id) = if db.is_some() {
+    let vault = vault_status(logged_in_db(&config), || {
         // not ensure_agent: a stopped agent means a locked vault
         let _ = crate::commands::check_agent_version();
-        match crate::actions::status() {
-            Ok((true, _)) => ("unlocked", false),
-            Ok((false, touch_id)) => ("locked", touch_id),
-            Err(_) => ("locked", false),
-        }
-    } else {
-        ("unauthenticated", false)
-    };
+        crate::actions::status()
+    });
     let status = Status {
-        status,
+        status: vault.status,
         server_url: config.base_url,
         user_email: config.email,
-        last_sync: db.and_then(|db| db.last_sync),
-        touch_id,
+        last_sync: vault.last_sync,
+        touch_id: vault.touch_id,
     };
     if json {
         serde_json::to_writer(std::io::stdout(), &status)
@@ -265,6 +317,36 @@ fn icon_host(host: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn vault_status_is_the_same_for_status_and_profiles() {
+        let db = || {
+            Some(rbw::db::DbMeta {
+                last_sync: Some("2026-11-26T10:00:00Z".to_string()),
+                ..rbw::db::DbMeta::default()
+            })
+        };
+        let json =
+            |status: VaultStatus| serde_json::to_string(&status).unwrap();
+
+        assert_eq!(
+            json(vault_status(None, || unreachable!())),
+            r#"{"status":"unauthenticated","lastSync":null,"touchId":false}"#
+        );
+        assert_eq!(
+            json(vault_status(db(), || Ok((true, true)))),
+            r#"{"status":"unlocked","lastSync":"2026-11-26T10:00:00Z","touchId":false}"#
+        );
+        assert_eq!(
+            json(vault_status(db(), || Ok((false, true)))),
+            r#"{"status":"locked","lastSync":"2026-11-26T10:00:00Z","touchId":true}"#
+        );
+        // a stopped agent
+        assert_eq!(
+            json(vault_status(db(), || Err(anyhow::anyhow!("refused")))),
+            r#"{"status":"locked","lastSync":"2026-11-26T10:00:00Z","touchId":false}"#
+        );
+    }
 
     #[test]
     fn icons_are_fetched_for_host_names_but_hidden_sites() {
