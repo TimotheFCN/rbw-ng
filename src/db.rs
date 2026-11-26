@@ -19,11 +19,102 @@ pub struct Entry {
     pub history: Vec<HistoryEntry>,
     pub key: Option<String>,
     pub master_password_reprompt: crate::api::CipherRepromptType,
+    // when the server last changed the entry, as the server wrote it. edits
+    // send it back so the server can refuse to overwrite a newer change.
+    // dbs from before rbw-ng 1.19 don't have it until the next sync.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision_date: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub favorite: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub archived: bool,
+    // in a collection this account can only read
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_only: bool,
 }
 
 impl Entry {
     pub fn master_password_reprompt(&self) -> bool {
         self.master_password_reprompt != crate::api::CipherRepromptType::None
+    }
+
+    // The encrypted values that an entry with master password reprompt
+    // keeps closed: all but its name and what a list shows of it (a login's
+    // username and addresses, a card's brand, an identity's title and names,
+    // an SSH key's public key and fingerprint). The official clients show
+    // no more of such an entry before the password.
+    pub fn protected_values(&self) -> Vec<&str> {
+        let mut values = vec![self.notes.as_deref()];
+        for field in &self.fields {
+            values.extend([field.name.as_deref(), field.value.as_deref()]);
+        }
+        values.extend(
+            self.history
+                .iter()
+                .map(|history| Some(history.password.as_str())),
+        );
+        match &self.data {
+            EntryData::Login {
+                username: _,
+                password,
+                totp,
+                uris: _,
+            } => values.extend([password.as_deref(), totp.as_deref()]),
+            EntryData::Card {
+                cardholder_name,
+                number,
+                brand: _,
+                exp_month,
+                exp_year,
+                code,
+            } => values.extend([
+                cardholder_name.as_deref(),
+                number.as_deref(),
+                exp_month.as_deref(),
+                exp_year.as_deref(),
+                code.as_deref(),
+            ]),
+            EntryData::Identity {
+                title: _,
+                first_name: _,
+                middle_name: _,
+                last_name: _,
+                address1,
+                address2,
+                address3,
+                city,
+                state,
+                postal_code,
+                country,
+                phone,
+                email,
+                ssn,
+                license_number,
+                passport_number,
+                username,
+            } => values.extend([
+                address1.as_deref(),
+                address2.as_deref(),
+                address3.as_deref(),
+                city.as_deref(),
+                state.as_deref(),
+                postal_code.as_deref(),
+                country.as_deref(),
+                phone.as_deref(),
+                email.as_deref(),
+                ssn.as_deref(),
+                license_number.as_deref(),
+                passport_number.as_deref(),
+                username.as_deref(),
+            ]),
+            EntryData::SecureNote => {}
+            EntryData::SshKey {
+                private_key,
+                public_key: _,
+                fingerprint: _,
+            } => values.push(private_key.as_deref()),
+        }
+        values.into_iter().flatten().collect()
     }
 }
 
@@ -195,6 +286,15 @@ pub struct Field {
 #[derive(
     serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
 )]
+pub struct Folder {
+    pub id: String,
+    // encrypted
+    pub name: String,
+}
+
+#[derive(
+    serde::Serialize, serde::Deserialize, Debug, Clone, Eq, PartialEq,
+)]
 pub struct HistoryEntry {
     pub last_used_date: String,
     pub password: String,
@@ -216,11 +316,58 @@ pub struct Db {
     pub user_id: Option<String>,
 
     pub entries: Vec<Entry>,
+    // every folder, also the empty ones. dbs from before rbw-ng 1.19 don't
+    // have them until the next sync.
+    #[serde(default)]
+    pub folders: Vec<Folder>,
+    // when the agent last synced, as RFC 3339
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_sync: Option<String>,
+    // the agent's MAC of which values need the master password again, as
+    // it learned them from the server, so that an agent started later can
+    // trust the entries' reprompt flags without syncing first
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reprompt_mac: Option<String>,
 }
 
-// A temporary file in the same directory as the db, so that renaming it over
-// the db is atomic. Unique per process and per save.
-fn temp_file(file: &std::path::Path) -> std::path::PathBuf {
+// The beginning of the db: whether the account is logged in and when the
+// vault last synced, read without the entries and folders, which a status
+// check has no use for and which can be large.
+#[derive(serde::Deserialize, Default, Debug)]
+pub struct DbMeta {
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub kdf: Option<crate::api::KdfType>,
+    pub iterations: Option<u32>,
+    pub protected_key: Option<String>,
+    #[serde(default)]
+    pub last_sync: Option<String>,
+}
+
+impl DbMeta {
+    // The db at this path, of any profile.
+    pub fn load_from(file: std::path::PathBuf) -> Result<Self> {
+        let json = std::fs::read(&file).map_err(|source| Error::LoadDb {
+            source,
+            file: file.clone(),
+        })?;
+        serde_json::from_slice(&json)
+            .map_err(|source| Error::LoadDbJson { source, file })
+    }
+
+    // The same as Db::needs_login.
+    pub fn needs_login(&self) -> bool {
+        self.access_token.is_none()
+            || self.refresh_token.is_none()
+            || self.iterations.is_none()
+            || self.kdf.is_none()
+            || self.protected_key.is_none()
+    }
+}
+
+// A temporary file in the same directory as the db (or the config), so that
+// renaming it over the file is atomic. Unique per process and per save.
+pub(crate) fn temp_file(file: &std::path::Path) -> std::path::PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -272,6 +419,27 @@ impl Db {
         let slf: Self = serde_json::from_str(&json)
             .map_err(|source| Error::LoadDbJson { source, file })?;
         Ok(slf)
+    }
+
+    // See DbMeta.
+    pub fn load_meta(server: &str, email: &str) -> Result<DbMeta> {
+        DbMeta::load_from(crate::dirs::db_file(server, email))
+    }
+
+    // See DbMeta.
+    pub async fn load_meta_async(
+        server: &str,
+        email: &str,
+    ) -> Result<DbMeta> {
+        let file = crate::dirs::db_file(server, email);
+        let json = tokio::fs::read(&file).await.map_err(|source| {
+            Error::LoadDbAsync {
+                source,
+                file: file.clone(),
+            }
+        })?;
+        serde_json::from_slice(&json)
+            .map_err(|source| Error::LoadDbJson { source, file })
     }
 
     // Writes to a temporary file next to the db and renames it into place,
@@ -372,6 +540,58 @@ impl Db {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_meta_of_a_db_skips_its_entries() {
+        let mut db = Db::new();
+        let meta: DbMeta =
+            serde_json::from_str(&serde_json::to_string(&db).unwrap())
+                .unwrap();
+        assert!(meta.needs_login() && db.needs_login());
+
+        db.access_token = Some("access".to_string());
+        db.refresh_token = Some("refresh".to_string());
+        db.kdf = Some(crate::api::KdfType::Argon2id);
+        db.iterations = Some(3);
+        db.protected_key = Some("2.key".to_string());
+        db.last_sync = Some("2026-11-26T10:00:00Z".to_string());
+        db.entries.push(Entry {
+            id: "id".to_string(),
+            org_id: None,
+            folder: None,
+            folder_id: None,
+            name: "2.name".to_string(),
+            data: EntryData::SecureNote,
+            fields: vec![],
+            notes: None,
+            history: vec![],
+            key: None,
+            master_password_reprompt: crate::api::CipherRepromptType::None,
+            revision_date: None,
+            favorite: false,
+            archived: false,
+            read_only: false,
+        });
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), serde_json::to_string(&db).unwrap())
+            .unwrap();
+        let meta = DbMeta::load_from(file.path().to_path_buf()).unwrap();
+        assert!(!meta.needs_login() && !db.needs_login());
+        assert_eq!(meta.access_token.as_deref(), Some("access"));
+        assert_eq!(meta.last_sync, db.last_sync);
+        for missing in [
+            |meta: &mut DbMeta| meta.access_token = None,
+            |meta: &mut DbMeta| meta.refresh_token = None,
+            |meta: &mut DbMeta| meta.kdf = None,
+            |meta: &mut DbMeta| meta.iterations = None,
+            |meta: &mut DbMeta| meta.protected_key = None,
+        ] {
+            let mut meta =
+                DbMeta::load_from(file.path().to_path_buf()).unwrap();
+            missing(&mut meta);
+            assert!(meta.needs_login());
+        }
+    }
 
     #[test]
     fn uri_checksum_stays_out_of_the_db() {

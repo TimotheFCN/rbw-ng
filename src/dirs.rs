@@ -41,10 +41,36 @@ pub fn config_file() -> std::path::PathBuf {
 const INVALID_PATH: &percent_encoding::AsciiSet =
     &percent_encoding::CONTROLS.add(b'/').add(b'%').add(b':');
 pub fn db_file(server: &str, email: &str) -> std::path::PathBuf {
+    db_file_in(&cache_dir(), server, email)
+}
+
+fn db_file_in(
+    cache_dir: &std::path::Path,
+    server: &str,
+    email: &str,
+) -> std::path::PathBuf {
     let server =
         percent_encoding::percent_encode(server.as_bytes(), INVALID_PATH)
             .to_string();
-    cache_dir().join(format!("{server}:{email}.json"))
+    cache_dir.join(format!("{server}:{email}.json"))
+}
+
+// The db and the agent's socket of a profile that profiles() lists, which
+// needn't be the one RBW_PROFILE selects.
+pub fn profile_db_file(
+    profile: Option<&str>,
+    server: &str,
+    email: &str,
+) -> Result<std::path::PathBuf> {
+    let folder = folder_name(profile.map(std::ffi::OsStr::new))?;
+    Ok(db_file_in(&cache_dir_of(&folder), server, email))
+}
+
+pub fn profile_socket_file(
+    profile: Option<&str>,
+) -> Result<std::path::PathBuf> {
+    let folder = folder_name(profile.map(std::ffi::OsStr::new))?;
+    Ok(runtime_dir_of(&folder).join("socket"))
 }
 
 pub fn pid_file() -> std::path::PathBuf {
@@ -63,12 +89,61 @@ pub fn device_id_file() -> std::path::PathBuf {
     data_dir().join("device_id")
 }
 
+// The vault key, encrypted with a session key that the program that made
+// the session keeps (see rbw unlock --session).
+pub fn session_file() -> std::path::PathBuf {
+    data_dir().join("session.json")
+}
+
 pub fn socket_file() -> std::path::PathBuf {
     runtime_dir().join("socket")
 }
 
 pub fn ssh_agent_socket_file() -> std::path::PathBuf {
     runtime_dir().join("ssh-agent-socket")
+}
+
+// The SSH socket that launchd holds for the macOS service. launchd creates it
+// at login, before anything could create the runtime folder, so it lives in
+// a folder that outlasts restarts.
+pub fn service_ssh_agent_socket_file() -> std::path::PathBuf {
+    data_dir().join("ssh-agent-socket")
+}
+
+// Every profile on this computer that has a configuration, with its
+// configuration file. The default profile has no name.
+pub fn profiles() -> Vec<(Option<String>, std::path::PathBuf)> {
+    let Some(entries) = config_dir()
+        .parent()
+        .and_then(|parent| std::fs::read_dir(parent).ok())
+    else {
+        return vec![];
+    };
+    let mut profiles: Vec<_> = entries
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let name = entry.file_name().into_string().ok()?;
+            let profile = match name.strip_prefix("rbw-") {
+                _ if name == "rbw" => None,
+                Some(profile) if !profile.is_empty() => {
+                    Some(profile.to_string())
+                }
+                _ => return None,
+            };
+            let config = entry.path().join("config.json");
+            config.is_file().then_some((profile, config))
+        })
+        .collect();
+    profiles.sort();
+    profiles
+}
+
+// Every folder the profile keeps files in. On macOS the configuration and
+// the data share one.
+pub fn profile_dirs() -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![config_dir(), data_dir(), cache_dir(), runtime_dir()];
+    dirs.dedup();
+    dirs
 }
 
 fn config_dir() -> std::path::PathBuf {
@@ -78,8 +153,12 @@ fn config_dir() -> std::path::PathBuf {
 }
 
 fn cache_dir() -> std::path::PathBuf {
+    cache_dir_of(&profile())
+}
+
+fn cache_dir_of(folder: &str) -> std::path::PathBuf {
     let project_dirs =
-        directories::ProjectDirs::from("", "", &profile()).unwrap();
+        directories::ProjectDirs::from("", "", folder).unwrap();
     project_dirs.cache_dir().to_path_buf()
 }
 
@@ -90,14 +169,18 @@ fn data_dir() -> std::path::PathBuf {
 }
 
 fn runtime_dir() -> std::path::PathBuf {
+    runtime_dir_of(&profile())
+}
+
+fn runtime_dir_of(folder: &str) -> std::path::PathBuf {
     let project_dirs =
-        directories::ProjectDirs::from("", "", &profile()).unwrap();
+        directories::ProjectDirs::from("", "", folder).unwrap();
     project_dirs.runtime_dir().map_or_else(
         || {
             format!(
                 "{}/{}-{}",
                 std::env::temp_dir().to_string_lossy(),
-                profile(),
+                folder,
                 rustix::process::getuid().as_raw()
             )
             .into()
@@ -106,9 +189,74 @@ fn runtime_dir() -> std::path::PathBuf {
     )
 }
 
+// The name of the profile's folders, from RBW_PROFILE, which rbw and
+// rbw-agent check with check_profile before anything else.
 pub fn profile() -> String {
-    match std::env::var("RBW_PROFILE") {
-        Ok(profile) if !profile.is_empty() => format!("rbw-{profile}"),
-        _ => "rbw".to_string(),
+    folder_name(std::env::var_os("RBW_PROFILE").as_deref())
+        .expect("RBW_PROFILE is checked at startup")
+}
+
+// Fails for an RBW_PROFILE that would put the profile's folders somewhere
+// else than its own: with RBW_PROFILE=a/../.. the configuration folder would
+// be the home folder, which rbw purge --all removes.
+pub fn check_profile() -> Result<()> {
+    folder_name(std::env::var_os("RBW_PROFILE").as_deref()).map(drop)
+}
+
+fn folder_name(profile: Option<&std::ffi::OsStr>) -> Result<String> {
+    let Some(profile) = profile.filter(|profile| !profile.is_empty()) else {
+        return Ok("rbw".to_string());
+    };
+    let invalid = |reason: &str| Error::InvalidProfile {
+        reason: reason.to_string(),
+    };
+    let profile = profile
+        .to_str()
+        .ok_or_else(|| invalid("RBW_PROFILE isn't valid UTF-8"))?;
+    if profile.contains('/') {
+        return Err(invalid("RBW_PROFILE can't contain '/'"));
+    }
+    Ok(format!("rbw-{profile}"))
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn other_profiles_have_their_own_db_and_socket() {
+        let socket = profile_socket_file(Some("work")).unwrap();
+        assert_eq!(socket, runtime_dir_of("rbw-work").join("socket"));
+        assert_ne!(socket, profile_socket_file(None).unwrap());
+        assert_eq!(
+            profile_socket_file(None).unwrap(),
+            runtime_dir_of("rbw").join("socket")
+        );
+        let db = profile_db_file(Some("work"), "https://x", "me@x").unwrap();
+        assert_eq!(
+            db,
+            cache_dir_of("rbw-work").join("https%3A%2F%2Fx:me@x.json")
+        );
+        assert!(profile_socket_file(Some("a/b")).is_err());
+        assert!(profile_db_file(Some("a/b"), "default", "me@x").is_err());
+    }
+
+    #[test]
+    fn profiles_stay_in_their_own_folders() {
+        use std::os::unix::ffi::OsStrExt as _;
+
+        let name = |profile: &[u8]| {
+            folder_name(Some(std::ffi::OsStr::from_bytes(profile)))
+        };
+        assert_eq!(folder_name(None).unwrap(), "rbw");
+        assert_eq!(name(b"").unwrap(), "rbw");
+        assert_eq!(name(b"work").unwrap(), "rbw-work");
+        assert_eq!(name(b"..").unwrap(), "rbw-..");
+        for invalid in [&b"work/../.."[..], b"/", b"../x", b"\xff"] {
+            assert!(
+                matches!(name(invalid), Err(Error::InvalidProfile { .. })),
+                "{invalid:?}"
+            );
+        }
     }
 }

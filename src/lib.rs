@@ -14,4 +14,6 @@ pub mod pinentry;
 mod prelude;
 pub mod protocol;
 pub mod pwgen;
+pub mod totp;
+pub mod uri_match;
 pub mod wordlist;

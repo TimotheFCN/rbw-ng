@@ -179,8 +179,17 @@ pub enum Error {
     #[error("failed to run argon2")]
     Argon2,
 
+    #[error("failed to read the icon")]
+    IconRead { source: std::io::Error },
+
+    #[error("the icon is larger than 1 MiB")]
+    IconTooLarge,
+
     #[error("pinentry cancelled")]
     PinentryCancelled,
+
+    #[error("input required, but RBW_NONINTERACTIVE is set")]
+    InteractionRequired,
 
     #[error("pinentry prompt timed out")]
     PinentryTimedOut,
@@ -277,6 +286,121 @@ pub enum Error {
 
     #[error("invalid kdf type: {ty}")]
     InvalidKdfType { ty: String },
+
+    #[error("the entry changed on the server since it was last synced")]
+    CipherOutOfDate,
+
+    #[error("invalid profile: {reason}")]
+    InvalidProfile { reason: String },
+
+    #[error("{message}")]
+    InvalidGeneratorOptions { message: String },
+
+    #[error("invalid url")]
+    InvalidUrl { source: url::ParseError },
+
+    #[error("the server's address doesn't lead to a Bitwarden server")]
+    WrongServer,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+impl Error {
+    fn code(&self) -> Option<crate::protocol::ErrorCode> {
+        use crate::protocol::ErrorCode;
+        Some(match self {
+            Self::IncorrectPassword { .. } | Self::IncorrectApiKey => {
+                ErrorCode::IncorrectPassword
+            }
+            Self::InteractionRequired => ErrorCode::InputRequired,
+            Self::RequestUnauthorized | Self::RefreshTokenInvalid => {
+                ErrorCode::NotLoggedIn
+            }
+            Self::NewDeviceVerificationRequired => {
+                ErrorCode::NewDeviceCodeRequired
+            }
+            Self::RegistrationRequired => ErrorCode::RegistrationRequired,
+            Self::CipherOutOfDate => ErrorCode::Conflict,
+            Self::InvalidProfile { .. }
+            | Self::InvalidGeneratorOptions { .. } => ErrorCode::InvalidInput,
+            Self::WrongServer => ErrorCode::WrongServer,
+            Self::IconTooLarge => ErrorCode::Server { status: None },
+            Self::IconRead { .. } => ErrorCode::Network,
+            Self::RequestFailed { status: 403 } => ErrorCode::Forbidden,
+            Self::RequestFailed { status: 404 } => ErrorCode::NotFound,
+            Self::RequestFailed { status } => ErrorCode::Server {
+                status: Some(*status),
+            },
+            Self::Reqwest { source }
+                if source.is_connect() || source.is_timeout() =>
+            {
+                ErrorCode::Network
+            }
+            Self::Reqwest { source } => ErrorCode::Server {
+                status: source.status().map(|status| status.as_u16()),
+            },
+            _ => return None,
+        })
+    }
+}
+
+// An error with the code a program sees (see protocol::ErrorCode).
+#[derive(Debug)]
+pub struct Coded {
+    pub code: crate::protocol::ErrorCode,
+    message: String,
+}
+
+impl std::fmt::Display for Coded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for Coded {}
+
+pub fn coded(
+    code: crate::protocol::ErrorCode,
+    message: impl Into<String>,
+) -> anyhow::Error {
+    anyhow::Error::new(Coded {
+        code,
+        message: message.into(),
+    })
+}
+
+// The code of an error: the first one its chain of causes has.
+pub fn code(error: &anyhow::Error) -> crate::protocol::ErrorCode {
+    error
+        .chain()
+        .find_map(|cause| {
+            cause
+                .downcast_ref::<Coded>()
+                .map(|coded| coded.code.clone())
+                .or_else(|| cause.downcast_ref::<Error>()?.code())
+        })
+        .unwrap_or(crate::protocol::ErrorCode::Other)
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use crate::protocol::ErrorCode;
+
+    #[test]
+    fn codes_come_from_the_first_cause_that_has_one() {
+        let error = anyhow::Error::new(Error::CipherOutOfDate)
+            .context("failed to edit");
+        assert_eq!(code(&error), ErrorCode::Conflict);
+        let error = coded(ErrorCode::Locked, "the vault is locked")
+            .context("rbw item list");
+        assert_eq!(code(&error), ErrorCode::Locked);
+        assert_eq!(
+            format!("{error:#}"),
+            "rbw item list: the vault is locked"
+        );
+        assert_eq!(code(&anyhow::anyhow!("oops")), ErrorCode::Other);
+        let error = anyhow::Error::new(Error::RequestFailed { status: 403 });
+        assert_eq!(code(&error), ErrorCode::Forbidden);
+    }
+}

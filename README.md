@@ -19,6 +19,11 @@ keeps up with server changes. Contributors' commits keep their authorship.
 
 Documentation lives in the [wiki](https://github.com/TimotheFCN/rbw-ng/wiki).
 
+Prefer a window? [Fastwarden](https://github.com/TimotheFCN/rbw-desktop) is a
+desktop app for macOS and Linux built on rbw-ng. It comes with its own `rbw`
+and `rbw-agent` and can put that `rbw` on your `PATH`, so it replaces a
+separate install of rbw-ng.
+
 ## Features
 
 * A background agent that keeps the vault unlocked between commands, locks
@@ -36,6 +41,9 @@ Documentation lives in the [wiki](https://github.com/TimotheFCN/rbw-ng/wiki).
   YubiKey OTP two-factor, client certificates and extra HTTP headers for
   servers behind Cloudflare Access or another proxy.
 * Profiles, to use several accounts side by side.
+* An interface for other programs: logging in and unlocking without a
+  terminal, sessions, and entries as JSON in Bitwarden's item format
+  ([docs/scripting.md](docs/scripting.md)).
 
 What changed since `rbw` 1.15.0 is in the [changelog](CHANGELOG.md).
 
@@ -117,10 +125,12 @@ The code is in three parts:
   the configuration (`config.rs`) and the agent protocol (`protocol.rs`).
 
 To try a development build without touching your own vault and agent, use a
-separate profile and point `rbw` at the agent you just built:
+separate profile. `rbw` starts the `rbw-agent` beside it, so
+`target/debug/rbw` runs the agent you just built (`RBW_AGENT` names
+another):
 
 ```sh
-export RBW_PROFILE=dev RBW_AGENT="$PWD/target/debug/rbw-agent"
+export RBW_PROFILE=dev
 target/debug/rbw config set email you@example.com
 target/debug/rbw config set base_url http://localhost:8000
 target/debug/rbw sync

@@ -1,6 +1,7 @@
 use anyhow::Context as _;
 
 mod actions;
+mod activation;
 mod agent;
 #[cfg(target_os = "macos")]
 mod biometric;
@@ -10,6 +11,9 @@ mod notifications;
 mod peer;
 #[cfg(target_os = "macos")]
 mod presence;
+mod reprompt;
+mod scripted;
+mod session;
 mod sock;
 mod ssh_agent;
 mod state;
@@ -17,12 +21,20 @@ mod timeout;
 
 async fn tokio_main(
     startup_ack: Option<crate::daemon::StartupAck>,
+    sockets: crate::activation::Sockets,
 ) -> anyhow::Result<()> {
-    let listener = crate::sock::listen()?;
+    let listener = match sockets.control {
+        Some(listener) => tokio::net::UnixListener::from_std(listener)?,
+        None => crate::sock::listen()?,
+    };
 
     if let Some(startup_ack) = startup_ack {
         startup_ack.ack()?;
     }
+
+    // one runtime for the life of the agent, so its requests can share an
+    // HTTP client
+    rbw::api::reuse_clients();
 
     let config = rbw::config::Config::load()?;
     let timeout_duration =
@@ -44,12 +56,14 @@ async fn tokio_main(
             sync_timeout,
             sync_timeout_duration,
             notifications_handler,
-            master_password_reprompt: std::collections::HashSet::new(),
-            master_password_reprompt_initialized: false,
+            master_password_reprompt: None,
+            unlocked_entries: std::collections::HashMap::new(),
             unlock_lock: std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            sync_flight: std::sync::Arc::default(),
             #[cfg(target_os = "macos")]
             touch_id_unlock: config.touch_id_unlock,
             ssh_confirm: config.confirms_ssh_signatures(),
+            serves_service_socket: false,
             #[cfg(target_os = "macos")]
             biometric_unlock: None,
             last_environment: rbw::protocol::Environment::from_process(),
@@ -66,7 +80,7 @@ async fn tokio_main(
 
     let ssh_agent = crate::ssh_agent::SshAgent::new(state.clone());
 
-    tokio::try_join!(agent.run(listener), ssh_agent.run())?;
+    tokio::try_join!(agent.run(listener), ssh_agent.run(sockets.ssh))?;
 
     Ok(())
 }
@@ -95,14 +109,29 @@ fn real_main() -> anyhow::Result<()> {
     )
     .init();
 
-    let no_daemonize = std::env::args()
-        .nth(1)
-        .is_some_and(|arg| arg == "--no-daemonize");
+    rbw::dirs::check_profile()?;
+
+    let mode = daemon::Mode::from_args();
+    // before any thread starts
+    let sockets = if mode == daemon::Mode::Service {
+        crate::activation::take()?
+    } else {
+        crate::activation::Sockets::default()
+    };
+
+    if mode != daemon::Mode::Service && crate::sock::answers() {
+        // the code rbw takes for an agent that already runs
+        eprintln!(
+            "an agent already answers on {}",
+            rbw::dirs::socket_file().display()
+        );
+        std::process::exit(23);
+    }
 
     rbw::dirs::make_all()?;
 
     let startup_ack =
-        daemon::daemonize(no_daemonize).context("failed to daemonize")?;
+        daemon::daemonize(mode).context("failed to daemonize")?;
 
     if let Err(e) = debugger::disable_tracing() {
         log::warn!("{e}");
@@ -111,14 +140,21 @@ fn real_main() -> anyhow::Result<()> {
     let (w, r) = std::sync::mpsc::channel();
     // can't use tokio::main because we need to daemonize before starting the
     // tokio runloop, or else things break
+    // the agent mostly waits, and an agent runs for each profile, so a
+    // thread per CPU core would be too many
     // unwrap is fine here because there's no good reason that this should
     // ever fail
-    tokio::runtime::Runtime::new().unwrap().block_on(async {
-        if let Err(e) = tokio_main(startup_ack).await {
-            // this unwrap is fine because it's the only real option here
-            w.send(e).unwrap();
-        }
-    });
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async {
+            if let Err(e) = tokio_main(startup_ack, sockets).await {
+                // this unwrap is fine because it's the only real option here
+                w.send(e).unwrap();
+            }
+        });
 
     if let Ok(e) = r.recv() {
         return Err(e);

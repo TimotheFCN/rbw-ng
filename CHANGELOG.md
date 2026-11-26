@@ -1,5 +1,200 @@
 # Changelog
 
+## [1.19.0] - 2026-11-26
+
+Programs can drive `rbw` without a terminal, the way they would drive
+Bitwarden's official CLI: log in, unlock and read or save entries as JSON,
+with errors that carry stable codes (see
+[docs/scripting.md](docs/scripting.md)). `rbw-agent` can also run as a login
+service.
+
+### Added
+
+* Commands for programs that drive `rbw`, such as a desktop app (see
+  [docs/scripting.md](docs/scripting.md)):
+  * `rbw login --password-stdin` and `rbw unlock --password-stdin` take the
+    master password on stdin. `--method` and `--code` finish a two-step or
+    new device login, with `--code-env` reading the code from `RBW_CODE`,
+    out of sight of other users, and `rbw register --api-key-env` reads the
+    API key from the environment.
+  * `--session` prints a session key that unlocks the vault again through
+    `RBW_SESSION`, even after the agent restarted. The agent keeps only the
+    vault key encrypted with it.
+  * `RBW_NONINTERACTIVE=1` makes `rbw` fail with a clear error instead of
+    opening pinentry.
+  * `rbw status [--json]` says whether the account is logged in and
+    unlocked, when the vault last synced and whether Touch ID can unlock it.
+  * `rbw unlock --touch-id` unlocks with Touch ID only, without falling
+    back to the master password.
+  * `rbw item list|get|create|edit` read and save entries as JSON in
+    Bitwarden's item format, by id. Listing leaves secrets out unless asked.
+    `rbw item edit` fails with `conflict` if the entry changed on the server
+    since the `revisionDate` it is given, as `rbw item get` printed it.
+  * `rbw item create` and `rbw item edit` save cards, identities and SSH
+    keys too. An SSH key's public key and fingerprint come from its private
+    key. Listing without secrets shows a card's brand, an identity's names
+    and an SSH key's public key.
+  * `rbw item create` and `rbw item edit` set the favorite flag.
+  * `rbw item favorite` and `rbw item move` change an entry's favorite flag
+    and folder alone, without its secrets, also for entries in read-only
+    collections.
+  * `rbw item delete` moves an entry to the trash, as the official clients
+    do, instead of deleting it for good like `rbw remove`.
+  * `rbw folder list|create` list and add folders as JSON. The local copy
+    of the vault now keeps every folder, also the empty ones.
+  * `rbw item edit` and `rbw item delete` work on entries shared through
+    an organization, and items say with `edit` whether the account may
+    change them.
+  * `rbw item unlock` opens an entry that asks for the master password
+    again, with the password on stdin, for two minutes from its last read.
+    Without it, reading the entry's secrets fails with `reprompt_required`
+    when `RBW_NONINTERACTIVE` is set, and `rbw item list --secrets` lists
+    it without them.
+  * `rbw item code` prints a login's current code with its period and when
+    it expires, so a program can count it down.
+  * `rbw item get --with-code` adds that code to the item as `totpCode`, and
+    `rbw item list --type` lists, and decrypts, the entries of one type
+    only.
+  * `rbw item edit` keeps the entry's organization when the item on stdin
+    has no `organizationId`.
+  * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such
+    as `locked` or `two_step_required`, so that programs don't depend on
+    the wording of messages.
+  * A login that the server refuses until the device is registered with
+    the account's API key fails with `registration_required`.
+* `rbw icon HOST` prints a website's icon from the server's icon service,
+  for programs that show entries with their icons.
+* `rbw profiles [--json]` lists the profiles on this computer, and
+  `rbw purge --all` removes a profile with its configuration and every file
+  it keeps. `rbw profiles --json --status` adds each profile's `status`,
+  `lastSync` and `touchId`, as `rbw status --json` says them, without
+  starting any agent.
+* `rbw ssh-agent install` runs `rbw-agent` as a login service of launchd
+  (macOS) or systemd (Linux). The service manager holds the agent's sockets
+  and starts the agent when a program connects, and `rbw` uses the same
+  agent. On Linux, `SSH_AUTH_SOCK` points to it in graphical sessions. On
+  macOS, Apple's `ssh-agent` keeps `SSH_AUTH_SOCK`, and SSH reaches
+  `rbw-agent` through `IdentityAgent` in `~/.ssh/config`, for all hosts or
+  some. `rbw ssh-agent uninstall` removes the service, `status` shows what
+  serves SSH, `status --json` says it for programs, and `socket` prints the
+  SSH socket's path. Installing leaves an agent that runs, and the vault
+  with it, as it is: the agent serves SSH where the service will until it
+  stops, and the service takes over then. Uninstalling does too on Linux;
+  on macOS it stops the service's agent, which launchd doesn't let outlive
+  its service.
+* `rbw-agent --service`, the mode the service runs the agent in: in the
+  foreground, with the sockets the service manager passes, and replacing an
+  agent that `rbw` started before.
+* `rbw generate` options, as in Bitwarden's generator (see
+  [docs/scripting.md](docs/scripting.md#passwords)):
+  * `--no-uppercase`, `--no-lowercase` and `--no-numbers` leave a class of
+    characters out, as `--no-symbols` does, and combine with it, so that a
+    password can be letters only, or letters and symbols.
+  * `--each-class` makes a password hold at least one character of each of
+    its classes. The password is drawn uniformly from all the passwords that
+    do, so it loses no more randomness than the requirement takes.
+  * `--separator`, `--capitalize` and `--include-number` choose what goes
+    between the words of a `--diceware` passphrase, begin each word with an
+    upper-case letter, and put a digit after one of them.
+
+### Changed
+
+* `rbw` starts the `rbw-agent` beside its executable, following links, and
+  looks in `PATH` only when there is none, so that an `rbw` reached through
+  a link never starts the agent of another install. `RBW_AGENT` still names
+  another. `rbw ssh-agent install` has the service run that same agent, by
+  a path in `PATH` that leads to it when there is one, which upgrades
+  leave in place.
+* `rbw config set` and `unset` no longer stop the agent, and lock the vault,
+  for settings that change only what the agent does: `lock_timeout`,
+  `sync_interval`, `pinentry`, `pinentry_timeout`, `touch_id_unlock` and
+  `ssh_confirm`. A running agent takes them over at once.
+* A master password given to pinentry for an entry with master password
+  re-prompt opens the entry for two minutes, as `rbw item unlock` does, so
+  that reading its values asks once, not once per value.
+* Faster, for programs that poll `rbw` and for large vaults:
+  * `rbw status`, `rbw sync` and the unlock check before each command of a
+    program read only the beginning of the local copy of the vault, not its
+    entries.
+  * `rbw-agent` decrypts a batch of values under one lock, decrypts each
+    entry's own key once per batch, and hashes values only when an entry
+    asks for the master password again. `rbw item list` and `get` collect
+    the values to decrypt without building the JSON twice, and buffer it.
+  * The server's answers come gzip-compressed. Syncs look folders up by id.
+  * `rbw-agent` keeps one HTTP client, with its connections to the server,
+    from one sync to the next, and syncs asked for at once share one
+    request. It runs two worker threads rather than one per CPU core.
+  * `rbw icon` sets up a second HTTP client only for a redirect off the
+    server.
+* Requests to the server give up after 15 seconds without a connection, and
+  after 60 seconds without an answer.
+
+### Fixed
+
+* Master password re-prompt held back less than it should, and other
+  programs of the same user could get past it:
+  * An entry with re-prompt now keeps closed everything but what lists show
+    of it: its name, a login's username and addresses, a card's brand, an
+    identity's title and names, an SSH key's public key and fingerprint. Its
+    notes, custom fields (also text ones), password history and the rest of
+    a card or an identity were readable without the password. `rbw search`
+    and `rbw get NAME` no longer look into the notes and fields of such an
+    entry.
+  * `rbw-agent` decrypts no cipherstring without its MAC. Without one, a
+    program could strip the MAC from a protected value, which the agent then
+    didn't recognize and decrypted.
+  * The agent takes the entries' re-prompt flags from the server, or from a
+    local copy of the vault that carries its MAC of them. It used to trust
+    the local copy when it started, which any program can edit. The local
+    copy gets the MAC at the first sync or unlock after the upgrade; until
+    then, the agent syncs before it decrypts anything.
+  * The re-prompt checks the master password against the key of the
+    unlocked vault. It checked it against the keys in the local copy of the
+    vault, which a program could replace with keys that its own password
+    opens.
+  * `rbw item edit` needs every kind of entry with re-prompt open, not only
+    logins, and `rbw item delete` needs it open too.
+* `rbw register` with a wrong API key on Vaultwarden says the key is
+  incorrect instead of reporting a server error.
+* Logging in or registering with a server address that leads to no Bitwarden
+  server says so, instead of failing to parse JSON or, with
+  `RBW_ERROR_FORMAT=json`, reporting `not_found`.
+* An agent started while another one answers on rbw's socket now leaves it
+  alone instead of taking over its path.
+* A program that polls `rbw` with `RBW_NONINTERACTIVE`, such as `rbw status`
+  every few seconds, no longer takes the place of the terminal or display
+  that the SSH agent asks for the master password and confirmations on.
+  `rbw status`, `rbw unlocked` and version checks no longer take it either.
+* The SSH agent offers no key of an archived entry, and an entry whose public
+  key can't be decrypted, for example of an organization whose key is
+  missing, no longer stops it from finding the requested key.
+* `rbw-agent` no longer exits when it can't lock more memory against
+  swapping, as it could with many organization keys: the secrets that don't
+  fit stay unlocked, and it says so once in `agent.err`.
+* Argon2 settings from the server that are missing or out of range fail the
+  unlock instead of making `rbw-agent` exit, and more than 2 GiB of memory
+  is refused so that a server can't make the agent run out of memory.
+* `rbw-agent` wipes the secrets it answers with from its memory, as it does
+  for the ones it is sent, and `rbw item create` and `edit` wipe the item
+  read from stdin.
+* `rbw config set` writes the configuration to a new file and renames it into
+  place, so a crash never leaves half a configuration. A new configuration
+  folder is private. Two session saves at once no longer write into the same
+  temporary file.
+* The agent no longer exits when the server's notifications can't be
+  subscribed to, follows them on `http://` servers too, and logs no access
+  token when it can't reach them.
+* `rbw` and `rbw-agent` refuse an `RBW_PROFILE` that contains `/` or isn't
+  UTF-8. Such a profile kept its files outside its own folders, so that
+  `RBW_PROFILE=x/../.. rbw purge --all` removed the home folder, and one that
+  wasn't UTF-8 used the default profile.
+* With `RBW_ERROR_FORMAT=json`, wrong arguments, such as an unknown option,
+  fail with `invalid_input` in JSON and exit status 1, like any other error,
+  instead of a text message and status 2.
+* `rbw-agent` no longer quotes a request it can't read, in its log and in its
+  answer, only names the request's action: a request from a newer `rbw` can
+  carry the master password.
+
 ## [1.18.1] - 2026-11-23
 
 First packaged release. `rbw-ng` now installs with Homebrew, Cargo or a

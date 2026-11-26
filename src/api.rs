@@ -455,12 +455,50 @@ struct SyncResCipher {
     key: Option<String>,
     #[serde(rename = "Reprompt", alias = "reprompt")]
     reprompt: CipherRepromptType,
+    #[serde(rename = "RevisionDate", alias = "revisionDate", default)]
+    revision_date: Option<String>,
+    #[serde(rename = "Favorite", alias = "favorite", default)]
+    favorite: Option<bool>,
+    #[serde(rename = "ArchivedDate", alias = "archivedDate", default)]
+    archived_date: Option<String>,
+    #[serde(rename = "Edit", alias = "edit", default)]
+    edit: Option<bool>,
+}
+
+// The id and revision date of a cipher the server just created or changed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedCipher {
+    pub id: String,
+    pub revision_date: Option<String>,
+}
+
+impl SavedCipher {
+    fn from_response(json: &serde_json::Value) -> Self {
+        let field = |upper: &str, lower: &str| {
+            json.get(lower)
+                .or_else(|| json.get(upper))
+                .and_then(serde_json::Value::as_str)
+                .map(std::string::ToString::to_string)
+        };
+        Self {
+            id: field("Id", "id").unwrap_or_default(),
+            revision_date: field("RevisionDate", "revisionDate"),
+        }
+    }
+}
+
+// Bitwarden answers "The cipher you are updating is out of date. ..." and
+// Vaultwarden "The client copy of this cipher is out of date. ..." when
+// lastKnownRevisionDate is older than the cipher.
+fn is_out_of_date(body: &str) -> bool {
+    body.to_ascii_lowercase().contains("out of date")
 }
 
 impl SyncResCipher {
+    // folders: the encrypted name of each folder, by id
     fn to_entry(
         &self,
-        folders: &[SyncResFolder],
+        folders: &std::collections::HashMap<&str, &str>,
     ) -> Option<crate::db::Entry> {
         if self.deleted_date.is_some() {
             return None;
@@ -488,12 +526,9 @@ impl SyncResCipher {
 
         let (folder, folder_id) =
             self.folder_id.as_ref().map_or((None, None), |folder_id| {
-                let mut folder_name = None;
-                for folder in folders {
-                    if &folder.id == folder_id {
-                        folder_name = Some(folder.name.clone());
-                    }
-                }
+                let folder_name = folders
+                    .get(folder_id.as_str())
+                    .map(|name| (*name).to_string());
                 (folder_name, Some(folder_id))
             });
         let data = if let Some(login) = &self.login {
@@ -579,6 +614,10 @@ impl SyncResCipher {
             history,
             key: self.key.clone(),
             master_password_reprompt: self.reprompt,
+            revision_date: self.revision_date.clone(),
+            favorite: self.favorite.unwrap_or(false),
+            archived: self.archived_date.is_some(),
+            read_only: self.edit == Some(false),
         })
     }
 }
@@ -693,7 +732,11 @@ struct CipherSshKey {
     private_key: Option<String>,
     #[serde(rename = "PublicKey", alias = "publicKey")]
     public_key: Option<String>,
-    #[serde(rename = "Fingerprint", alias = "keyFingerprint")]
+    #[serde(
+        rename = "KeyFingerprint",
+        alias = "keyFingerprint",
+        alias = "Fingerprint"
+    )]
     fingerprint: Option<String>,
 }
 
@@ -789,7 +832,7 @@ fn cipher_type(data: &crate::db::EntryData) -> u32 {
         crate::db::EntryData::SecureNote => 2,
         crate::db::EntryData::Card { .. } => 3,
         crate::db::EntryData::Identity { .. } => 4,
-        crate::db::EntryData::SshKey { .. } => unreachable!(),
+        crate::db::EntryData::SshKey { .. } => 5,
     }
 }
 
@@ -832,14 +875,16 @@ fn cipher_fields(fields: &[crate::db::Field]) -> Vec<CipherField> {
 }
 
 // the type-specific part of a cipher request, of which exactly one is set
-fn cipher_req_data(
-    data: &crate::db::EntryData,
-) -> (
-    Option<CipherLogin>,
-    Option<CipherCard>,
-    Option<CipherIdentity>,
-    Option<CipherSecureNote>,
-) {
+#[derive(Default)]
+struct CipherReqData {
+    login: Option<CipherLogin>,
+    card: Option<CipherCard>,
+    identity: Option<CipherIdentity>,
+    secure_note: Option<CipherSecureNote>,
+    ssh_key: Option<CipherSshKey>,
+}
+
+fn cipher_req_data(data: &crate::db::EntryData) -> CipherReqData {
     match data {
         crate::db::EntryData::Login {
             username,
@@ -866,7 +911,10 @@ fn cipher_req_data(
                 totp: totp.clone(),
                 uris,
             };
-            (Some(login), None, None, None)
+            CipherReqData {
+                login: Some(login),
+                ..CipherReqData::default()
+            }
         }
         crate::db::EntryData::Card {
             cardholder_name,
@@ -884,7 +932,10 @@ fn cipher_req_data(
                 exp_year: exp_year.clone(),
                 code: code.clone(),
             };
-            (None, Some(card), None, None)
+            CipherReqData {
+                card: Some(card),
+                ..CipherReqData::default()
+            }
         }
         crate::db::EntryData::Identity {
             title,
@@ -924,12 +975,27 @@ fn cipher_req_data(
                 passport_number: passport_number.clone(),
                 username: username.clone(),
             };
-            (None, None, Some(identity), None)
+            CipherReqData {
+                identity: Some(identity),
+                ..CipherReqData::default()
+            }
         }
-        crate::db::EntryData::SecureNote => {
-            (None, None, None, Some(CipherSecureNote { ty: Some(0) }))
-        }
-        crate::db::EntryData::SshKey { .. } => unreachable!(),
+        crate::db::EntryData::SecureNote => CipherReqData {
+            secure_note: Some(CipherSecureNote { ty: Some(0) }),
+            ..CipherReqData::default()
+        },
+        crate::db::EntryData::SshKey {
+            private_key,
+            public_key,
+            fingerprint,
+        } => CipherReqData {
+            ssh_key: Some(CipherSshKey {
+                private_key: private_key.clone(),
+                public_key: public_key.clone(),
+                fingerprint: fingerprint.clone(),
+            }),
+            ..CipherReqData::default()
+        },
     }
 }
 
@@ -940,17 +1006,20 @@ fn ciphers_post_req(
     fields: &[crate::db::Field],
     notes: Option<&str>,
     folder_id: Option<&str>,
+    favorite: bool,
 ) -> CiphersPostReq {
-    let (login, card, identity, secure_note) = cipher_req_data(data);
+    let data_req = cipher_req_data(data);
     CiphersPostReq {
         ty: cipher_type(data),
         folder_id: folder_id.map(std::string::ToString::to_string),
         name: name.to_string(),
         notes: notes.map(std::string::ToString::to_string),
-        login,
-        card,
-        identity,
-        secure_note,
+        login: data_req.login,
+        card: data_req.card,
+        identity: data_req.identity,
+        secure_note: data_req.secure_note,
+        ssh_key: data_req.ssh_key,
+        favorite,
         encrypted_for: user_id.to_string(),
         fields: cipher_fields(fields),
     }
@@ -1006,7 +1075,7 @@ fn keep_server_data(
         }
     }
 
-    for ty in ["login", "card", "identity", "secureNote"] {
+    for ty in ["login", "card", "identity", "secureNote", "sshKey"] {
         let Some(server_data) = get_ignore_case(server, ty)
             .and_then(serde_json::Value::as_object)
         else {
@@ -1101,6 +1170,9 @@ struct CiphersPostReq {
     identity: Option<CipherIdentity>,
     #[serde(rename = "secureNote")]
     secure_note: Option<CipherSecureNote>,
+    #[serde(rename = "sshKey")]
+    ssh_key: Option<CipherSshKey>,
+    favorite: bool,
     #[serde(rename = "encryptedFor")]
     encrypted_for: String,
     fields: Vec<CipherField>,
@@ -1122,6 +1194,8 @@ struct CiphersPutReq {
     fields: Vec<CipherField>,
     #[serde(rename = "secureNote")]
     secure_note: Option<CipherSecureNote>,
+    #[serde(rename = "sshKey")]
+    ssh_key: Option<CipherSshKey>,
     #[serde(rename = "passwordHistory")]
     password_history: Vec<CiphersPutReqHistory>,
     key: Option<String>,
@@ -1152,6 +1226,44 @@ struct FoldersResData {
 }
 
 #[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct CiphersPartialReq {
+    folder_id: Option<String>,
+    favorite: bool,
+}
+
+// What a partial update changes. It sets the folder and the favorite flag
+// together, so the other one comes from the server's copy, which another
+// device may have changed since the last sync.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PartialChange {
+    Folder(Option<String>),
+    Favorite(bool),
+}
+
+impl CiphersPartialReq {
+    fn new(server: &serde_json::Value, change: &PartialChange) -> Self {
+        let server = server.as_object();
+        let current =
+            |key| server.and_then(|server| get_ignore_case(server, key));
+        match change {
+            PartialChange::Folder(folder_id) => Self {
+                folder_id: folder_id.clone(),
+                favorite: current("favorite")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
+            },
+            PartialChange::Favorite(favorite) => Self {
+                folder_id: current("folderId")
+                    .and_then(serde_json::Value::as_str)
+                    .map(std::string::ToString::to_string),
+                favorite: *favorite,
+            },
+        }
+    }
+}
+
+#[derive(serde::Serialize, Debug)]
 struct FoldersPostReq {
     name: String,
 }
@@ -1160,6 +1272,81 @@ struct FoldersPostReq {
 // https://github.com/bitwarden/server/blob/main/src/Core/Enums/BitwardenClient.cs
 const BITWARDEN_CLIENT: &str = "cli";
 const BITWARDEN_CLIENT_VERSION: &str = "2024.12.0";
+
+// Icons are a few kilobytes; Bitwarden's icon service caches only those up
+// to 50 kB.
+const ICON_SIZE_LIMIT: u64 = 1024 * 1024;
+const ICON_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+// Vaultwarden with an external icon service answers with a redirect, which
+// can lead to one more.
+const ICON_REDIRECTS: usize = 5;
+// How long to wait for a connection to the server, and for a request to
+// it: for the blocking requests, the whole of it, and for the others, each
+// read of the answer.
+const CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(15);
+const REQUEST_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(60);
+const READ_TIMEOUT: std::time::Duration = REQUEST_TIMEOUT;
+
+// Whether the async requests share one HTTP client, which only rbw-agent
+// asks for: as it lives for long, it then keeps connections and TLS
+// sessions to the server between syncs, and reads the system's root
+// certificates and the client certificate once. A client keeps its
+// connections on the tokio runtime that made them, so a process with
+// several runtimes, such as the tests, must not share one.
+static REUSE_CLIENTS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static CLIENTS: std::sync::Mutex<ClientCache> =
+    std::sync::Mutex::new(ClientCache(None));
+
+// Lets the async requests of this process share one HTTP client (see
+// REUSE_CLIENTS).
+pub fn reuse_clients() {
+    REUSE_CLIENTS.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+// Drops the shared HTTP client, for example after the configuration
+// changed, so that the next request makes a new one.
+pub fn forget_clients() {
+    lock_clients().0 = None;
+}
+
+fn lock_clients() -> std::sync::MutexGuard<'static, ClientCache> {
+    CLIENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+// The shared client, with what it was made from: the client certificate's
+// path and the extra headers, which decide its headers and redirects.
+struct ClientCache(
+    Option<(
+        Option<std::path::PathBuf>,
+        axum::http::HeaderMap,
+        reqwest::Client,
+    )>,
+);
+
+impl ClientCache {
+    fn get(&self, for_client: &Client) -> Option<reqwest::Client> {
+        self.0
+            .as_ref()
+            .filter(|(client_cert_path, extra_headers, _)| {
+                *client_cert_path == for_client.client_cert_path
+                    && *extra_headers == for_client.extra_headers
+            })
+            .map(|(_, _, client)| client.clone())
+    }
+
+    fn put(&mut self, for_client: &Client, client: reqwest::Client) {
+        self.0 = Some((
+            for_client.client_cert_path.clone(),
+            for_client.extra_headers.clone(),
+            client,
+        ));
+    }
+}
 
 // DeviceType.LinuxDesktop, as per Bitwarden API device types.
 const DEVICE_TYPE: u8 = 8;
@@ -1249,10 +1436,21 @@ impl Client {
     }
 
     async fn reqwest_client(&self) -> Result<reqwest::Client> {
+        let reuse = REUSE_CLIENTS.load(std::sync::atomic::Ordering::Relaxed);
+        if reuse {
+            let cached = lock_clients().get(self);
+            if let Some(client) = cached {
+                return Ok(client);
+            }
+        }
         let mut builder = reqwest::Client::builder()
             .user_agent(Self::user_agent())
             .redirect(self.redirect_policy())
-            .default_headers(self.default_headers());
+            .default_headers(self.default_headers())
+            .connect_timeout(CONNECT_TIMEOUT)
+            // a server that stops answering, but not a large vault on a
+            // slow link, which a limit on the whole request would cut off
+            .read_timeout(READ_TIMEOUT);
         if let Some(client_cert_path) = self.client_cert_path.as_ref() {
             let mut buf = Vec::new();
             let mut f = tokio::fs::File::open(client_cert_path)
@@ -1269,9 +1467,13 @@ impl Client {
             })?;
             builder = builder.identity(Self::client_identity(&buf)?);
         }
-        builder
+        let client = builder
             .build()
-            .map_err(|e| Error::CreateReqwestClient { source: e })
+            .map_err(|e| Error::CreateReqwestClient { source: e })?;
+        if reuse {
+            lock_clients().put(self, client.clone());
+        }
+        Ok(client)
     }
 
     // The blocking requests (add, edit, remove and folders) need the same
@@ -1279,10 +1481,23 @@ impl Client {
     // Bitwarden-Client-Version header, the server refuses to edit items
     // that have their own encryption key.
     fn blocking_reqwest_client(&self) -> Result<reqwest::blocking::Client> {
+        self.blocking_reqwest_client_with(
+            self.default_headers(),
+            self.redirect_policy(),
+        )
+    }
+
+    fn blocking_reqwest_client_with(
+        &self,
+        headers: axum::http::HeaderMap,
+        redirect: reqwest::redirect::Policy,
+    ) -> Result<reqwest::blocking::Client> {
         let mut builder = reqwest::blocking::Client::builder()
             .user_agent(Self::user_agent())
-            .redirect(self.redirect_policy())
-            .default_headers(self.default_headers());
+            .redirect(redirect)
+            .default_headers(headers)
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT);
         if let Some(client_cert_path) = self.client_cert_path.as_ref() {
             let buf = std::fs::read(client_cert_path).map_err(|e| {
                 Error::LoadClientCert {
@@ -1311,7 +1526,18 @@ impl Client {
             .send()
             .await
             .map_err(|source| Error::Reqwest { source })?;
-        let prelogin_res: PreloginRes = res.json_with_path().await?;
+        match res.status() {
+            status if not_identity(status) => return Err(Error::WrongServer),
+            status if !status.is_success() => {
+                return Err(Error::RequestFailed {
+                    status: status.as_u16(),
+                })
+            }
+            _ => {}
+        }
+        // a web page instead of JSON: some other site
+        let prelogin_res: PreloginRes =
+            res.json_with_path().await.map_err(|_| Error::WrongServer)?;
         Ok((
             prelogin_res.kdf,
             prelogin_res.kdf_iterations,
@@ -1358,6 +1584,8 @@ impl Client {
             .map_err(|source| Error::Reqwest { source })?;
         if res.status() == reqwest::StatusCode::OK {
             Ok(())
+        } else if not_identity(res.status()) {
+            Err(Error::WrongServer)
         } else {
             let code = res.status().as_u16();
             match res.text().await {
@@ -1455,6 +1683,8 @@ impl Client {
                 connect_res.refresh_token,
                 connect_res.key,
             ))
+        } else if not_identity(res.status()) {
+            Err(Error::WrongServer)
         } else {
             let code = res.status().as_u16();
             match res.text().await {
@@ -1566,6 +1796,7 @@ impl Client {
         String,
         std::collections::HashMap<String, String>,
         Vec<crate::db::Entry>,
+        Vec<crate::db::Folder>,
         String,
     )> {
         let client = self.reqwest_client().await?;
@@ -1580,12 +1811,22 @@ impl Client {
         match res.status() {
             reqwest::StatusCode::OK => {
                 let sync_res: SyncRes = res.json_with_path().await?;
-                let folders = sync_res.folders.clone();
-                let ciphers = sync_res
-                    .ciphers
-                    .iter()
-                    .filter_map(|cipher| cipher.to_entry(&folders))
-                    .collect();
+                let ciphers = {
+                    // the last folder with an id wins, as it always did
+                    let folders: std::collections::HashMap<_, _> = sync_res
+                        .folders
+                        .iter()
+                        .map(|folder| {
+                            (folder.id.as_str(), folder.name.as_str())
+                        })
+                        .collect();
+                    sync_res
+                        .ciphers
+                        .iter()
+                        .filter_map(|cipher| cipher.to_entry(&folders))
+                        .collect()
+                };
+                let folders = sync_res.folders;
                 let org_keys = sync_res
                     .profile
                     .organizations
@@ -1597,6 +1838,13 @@ impl Client {
                     sync_res.profile.private_key,
                     org_keys,
                     ciphers,
+                    folders
+                        .into_iter()
+                        .map(|folder| crate::db::Folder {
+                            id: folder.id,
+                            name: folder.name,
+                        })
+                        .collect(),
                     sync_res.profile.id,
                 ))
             }
@@ -1618,9 +1866,11 @@ impl Client {
         fields: &[crate::db::Field],
         notes: Option<&str>,
         folder_id: Option<&str>,
-    ) -> Result<()> {
-        let req =
-            ciphers_post_req(user_id, name, data, fields, notes, folder_id);
+        favorite: bool,
+    ) -> Result<SavedCipher> {
+        let req = ciphers_post_req(
+            user_id, name, data, fields, notes, folder_id, favorite,
+        );
         let client = self.blocking_reqwest_client()?;
         let res = client
             .post(self.api_url("/ciphers"))
@@ -1629,7 +1879,9 @@ impl Client {
             .send()
             .map_err(|source| Error::Reqwest { source })?;
         match res.status() {
-            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::OK => {
+                Ok(SavedCipher::from_response(&res.json_with_path()?))
+            }
             reqwest::StatusCode::UNAUTHORIZED => {
                 Err(Error::RequestUnauthorized)
             }
@@ -1675,18 +1927,21 @@ impl Client {
         folder_uuid: Option<&str>,
         history: &[crate::db::HistoryEntry],
         key: Option<&str>,
-    ) -> Result<()> {
-        let (login, card, identity, secure_note) = cipher_req_data(data);
+        last_known_revision_date: Option<&str>,
+        favorite: Option<bool>,
+    ) -> Result<SavedCipher> {
+        let data_req = cipher_req_data(data);
         let req = CiphersPutReq {
             ty: cipher_type(data),
             folder_id: folder_uuid.map(std::string::ToString::to_string),
             organization_id: org_id.map(std::string::ToString::to_string),
             name: name.to_string(),
             notes: notes.map(std::string::ToString::to_string),
-            login,
-            card,
-            identity,
-            secure_note,
+            login: data_req.login,
+            card: data_req.card,
+            identity: data_req.identity,
+            secure_note: data_req.secure_note,
+            ssh_key: data_req.ssh_key,
             fields: cipher_fields(fields),
             password_history: history
                 .iter()
@@ -1706,6 +1961,22 @@ impl Client {
             &server,
             &format_rfc3339(std::time::SystemTime::now()),
         );
+        if let (Some(favorite), Some(req)) = (favorite, req.as_object_mut()) {
+            req.retain(|k, _| !k.eq_ignore_ascii_case("favorite"));
+            req.insert(
+                "favorite".to_string(),
+                serde_json::Value::Bool(favorite),
+            );
+        }
+        if let (Some(revision_date), Some(req)) =
+            (last_known_revision_date, req.as_object_mut())
+        {
+            // the server refuses the edit if the cipher changed since
+            req.insert(
+                "lastKnownRevisionDate".to_string(),
+                serde_json::Value::String(revision_date.to_string()),
+            );
+        }
         let client = self.blocking_reqwest_client()?;
         let res = client
             .put(self.api_url(&format!("/ciphers/{id}")))
@@ -1714,9 +1985,19 @@ impl Client {
             .send()
             .map_err(|source| Error::Reqwest { source })?;
         match res.status() {
-            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::OK => {
+                Ok(SavedCipher::from_response(&res.json_with_path()?))
+            }
             reqwest::StatusCode::UNAUTHORIZED => {
                 Err(Error::RequestUnauthorized)
+            }
+            reqwest::StatusCode::BAD_REQUEST => {
+                let body = res.text().unwrap_or_default();
+                if is_out_of_date(&body) {
+                    Err(Error::CipherOutOfDate)
+                } else {
+                    Err(Error::RequestFailed { status: 400 })
+                }
             }
             _ => Err(Error::RequestFailed {
                 status: res.status().as_u16(),
@@ -1740,6 +2021,145 @@ impl Client {
                 status: res.status().as_u16(),
             }),
         }
+    }
+
+    // moves the cipher to the trash, as the official clients do
+    pub fn trash(&self, access_token: &str, id: &str) -> Result<()> {
+        let client = self.blocking_reqwest_client()?;
+        let res = client
+            .put(self.api_url(&format!("/ciphers/{id}/delete")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        match res.status() {
+            reqwest::StatusCode::OK | reqwest::StatusCode::NO_CONTENT => {
+                Ok(())
+            }
+            reqwest::StatusCode::UNAUTHORIZED => {
+                Err(Error::RequestUnauthorized)
+            }
+            _ => Err(Error::RequestFailed {
+                status: res.status().as_u16(),
+            }),
+        }
+    }
+
+    // Bitwarden's partial update: the folder and favorite flag, which are
+    // the account's own and not part of the encrypted entry, so it works
+    // for entries the account can only read too.
+    pub fn partial(
+        &self,
+        access_token: &str,
+        id: &str,
+        change: &PartialChange,
+    ) -> Result<()> {
+        let req =
+            CiphersPartialReq::new(&self.cipher(access_token, id)?, change);
+        let client = self.blocking_reqwest_client()?;
+        let res = client
+            .put(self.api_url(&format!("/ciphers/{id}/partial")))
+            .header("Authorization", format!("Bearer {access_token}"))
+            .json(&req)
+            .send()
+            .map_err(|source| Error::Reqwest { source })?;
+        match res.status() {
+            reqwest::StatusCode::OK => Ok(()),
+            reqwest::StatusCode::UNAUTHORIZED => {
+                Err(Error::RequestUnauthorized)
+            }
+            _ => Err(Error::RequestFailed {
+                status: res.status().as_u16(),
+            }),
+        }
+    }
+
+    // The icon service's image for a host, or None when it has none. Like
+    // the official clients' request, it carries the host name only: no
+    // token and no Bitwarden headers. It follows redirects itself: within
+    // the server's origin with the extra headers and client certificate
+    // that reaching the server takes, and elsewhere without them, only over
+    // https and to no address of this computer or its network. A redirect
+    // it won't follow means no icon.
+    pub fn icon(
+        &self,
+        icons_url: &str,
+        host: &str,
+    ) -> Result<Option<Vec<u8>>> {
+        let mut url =
+            url::Url::parse(&format!("{icons_url}/{host}/icon.png"))
+                .map_err(|source| Error::InvalidUrl { source })?;
+        let server = url.origin();
+        let to_server = self.blocking_reqwest_client_with(
+            self.extra_headers.clone(),
+            reqwest::redirect::Policy::none(),
+        )?;
+        // made only for a redirect off the server, which most icons don't
+        // take: building a client loads the system's root certificates
+        let mut elsewhere = None;
+        let deadline = std::time::Instant::now() + ICON_TIMEOUT;
+        for _ in 0..=ICON_REDIRECTS {
+            let client = if url.origin() == server {
+                &to_server
+            } else if let Some(elsewhere) = &elsewhere {
+                elsewhere
+            } else {
+                elsewhere.insert(
+                    reqwest::blocking::Client::builder()
+                        .user_agent(Self::user_agent())
+                        .redirect(reqwest::redirect::Policy::none())
+                        .connect_timeout(CONNECT_TIMEOUT)
+                        .build()
+                        .map_err(|source| Error::CreateReqwestClient {
+                            source,
+                        })?,
+                )
+            };
+            let res = client
+                .get(url.clone())
+                .timeout(
+                    deadline
+                        .saturating_duration_since(std::time::Instant::now()),
+                )
+                .send()
+                .map_err(|source| Error::Reqwest { source })?;
+            match res.status() {
+                reqwest::StatusCode::OK => {
+                    let mut icon = vec![];
+                    std::io::Read::read_to_end(
+                        &mut std::io::Read::take(res, ICON_SIZE_LIMIT + 1),
+                        &mut icon,
+                    )
+                    .map_err(|source| Error::IconRead { source })?;
+                    if icon.len() as u64 > ICON_SIZE_LIMIT {
+                        return Err(Error::IconTooLarge);
+                    }
+                    return Ok(Some(icon));
+                }
+                reqwest::StatusCode::NOT_FOUND => return Ok(None),
+                status if status.is_redirection() => {
+                    let next = res
+                        .headers()
+                        .get(reqwest::header::LOCATION)
+                        .and_then(|location| location.to_str().ok())
+                        .and_then(|location| url.join(location).ok());
+                    match next {
+                        Some(next)
+                            if next.origin() == server
+                                || icon_redirect_allowed(&next) =>
+                        {
+                            url = next;
+                        }
+                        _ => return Ok(None),
+                    }
+                }
+                status => {
+                    return Err(Error::RequestFailed {
+                        status: status.as_u16(),
+                    })
+                }
+            }
+        }
+        Ok(None)
     }
 
     pub fn folders(
@@ -1974,6 +2394,16 @@ fn sso_query_code(
     Ok(sso_code.clone())
 }
 
+// Whether the identity server's answer says that there is none at its
+// address: the path doesn't exist, or doesn't take a POST.
+fn not_identity(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+    )
+}
+
 /// Classify a failed response from the `refresh_token` grant.
 ///
 /// `invalid_grant` is unambiguous here in a way it is not during login: no
@@ -1984,6 +2414,9 @@ fn classify_refresh_error_res(
     code: u16,
     body: std::result::Result<String, reqwest::Error>,
 ) -> Error {
+    if reqwest::StatusCode::from_u16(code).is_ok_and(not_identity) {
+        return Error::WrongServer;
+    }
     let Ok(body) = body else {
         return Error::RequestFailed { status: code };
     };
@@ -2077,6 +2510,9 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
                     | "TOTP code is not a number" => {
                         return Error::IncorrectPassword { message };
                     }
+                    "Incorrect client_secret" | "Invalid client_id" => {
+                        return Error::IncorrectApiKey;
+                    }
                     s => {
                         if s.starts_with("Invalid TOTP code! Server time: ") {
                             return Error::IncorrectPassword { message };
@@ -2092,9 +2528,101 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
     Error::RequestFailed { status: code }
 }
 
+// Whether an icon may come from this address outside the server: an https
+// one whose host isn't this computer or an address of a private network.
+// A name can still resolve to such an address, but the server chose to send
+// it there.
+fn icon_redirect_allowed(url: &url::Url) -> bool {
+    let public_v4 = |ip: std::net::Ipv4Addr| {
+        let [a, b, ..] = ip.octets();
+        !(ip.is_loopback()
+            || ip.is_private()
+            || ip.is_link_local()
+            || ip.is_unspecified()
+            || ip.is_broadcast()
+            || ip.is_documentation()
+            // shared address space, which carrier-grade NAT and Tailscale use
+            || (a == 100 && (64..128).contains(&b)))
+    };
+    url.scheme() == "https"
+        && match url.host() {
+            Some(url::Host::Domain(domain)) => {
+                let domain = domain.trim_end_matches('.').to_lowercase();
+                domain != "localhost" && !domain.ends_with(".localhost")
+            }
+            Some(url::Host::Ipv4(ip)) => public_v4(ip),
+            Some(url::Host::Ipv6(ip)) => ip.to_ipv4_mapped().map_or_else(
+                || {
+                    let first = ip.segments()[0];
+                    !(ip.is_loopback()
+                        || ip.is_unspecified()
+                        // unique local and link-local addresses
+                        || (first & 0xfe00) == 0xfc00
+                        || (first & 0xffc0) == 0xfe80)
+                },
+                public_v4,
+            ),
+            None => false,
+        }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn synced_entries_find_their_folder_by_id() {
+        let cipher = |folder_id: &str| -> SyncResCipher {
+            serde_json::from_str(&format!(
+                r#"{{"id":"c","name":"2.n","reprompt":0,"folderId":{folder_id},"secureNote":{{"type":0}}}}"#
+            ))
+            .unwrap()
+        };
+        let folders: std::collections::HashMap<&str, &str> =
+            [("f1", "2.one"), ("f2", "2.two")].into_iter().collect();
+        let entry = cipher(r#""f2""#).to_entry(&folders).unwrap();
+        assert_eq!(entry.folder.as_deref(), Some("2.two"));
+        assert_eq!(entry.folder_id.as_deref(), Some("f2"));
+        let entry = cipher(r#""gone""#).to_entry(&folders).unwrap();
+        assert_eq!(entry.folder, None);
+        assert_eq!(entry.folder_id.as_deref(), Some("gone"));
+        let entry = cipher("null").to_entry(&folders).unwrap();
+        assert_eq!((entry.folder, entry.folder_id), (None, None));
+    }
+
+    #[test]
+    fn a_shared_http_client_is_for_the_same_settings_only() {
+        let client = |cert: Option<&str>, header: Option<&'static str>| {
+            let mut headers = axum::http::HeaderMap::new();
+            if let Some(value) = header {
+                headers.insert(
+                    "x-token",
+                    axum::http::HeaderValue::from_static(value),
+                );
+            }
+            Client::new(
+                "https://example.com/api",
+                "https://example.com/identity",
+                "https://example.com",
+                cert.map(std::path::Path::new),
+                headers,
+            )
+        };
+        let mut cache = ClientCache(None);
+        let plain = client(None, None);
+        assert!(cache.get(&plain).is_none());
+        cache.put(&plain, reqwest::Client::new());
+        assert!(cache.get(&plain).is_some());
+        assert!(cache.get(&client(None, None)).is_some());
+        assert!(cache.get(&client(Some("/cert.pem"), None)).is_none());
+        assert!(cache.get(&client(None, Some("a"))).is_none());
+
+        let with_header = client(None, Some("a"));
+        cache.put(&with_header, reqwest::Client::new());
+        assert!(cache.get(&with_header).is_some());
+        assert!(cache.get(&client(None, Some("b"))).is_none());
+        assert!(cache.get(&plain).is_none());
+    }
 
     fn device_error(message: &str) -> Error {
         let body = format!(
@@ -2165,6 +2693,142 @@ mod tests {
         // the headers rbw needs are still there
         assert!(head.contains("\r\nbitwarden-client-name: cli\r\n"));
         assert!(head.contains("\r\ndevice-type: 8\r\n"));
+    }
+
+    // An icon server: answers each path with a status, a Location and a
+    // body, and hands over the head of each request it gets.
+    fn mock_icons(
+        answers: Vec<(&'static str, u16, String, &'static [u8])>,
+    ) -> (String, std::sync::mpsc::Receiver<String>) {
+        use std::io::{Read as _, Write as _};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let (head_tx, head_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0; 1024];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..n]);
+                }
+                let head = String::from_utf8_lossy(&request).to_string();
+                let path = head.split(' ').nth(1).unwrap_or_default();
+                let (_, status, location, body) = answers
+                    .iter()
+                    .find(|(known, ..)| *known == path)
+                    .unwrap();
+                let location = if location.is_empty() {
+                    String::new()
+                } else {
+                    format!("Location: {location}\r\n")
+                };
+                let response = format!(
+                    "HTTP/1.1 {status} X\r\nContent-Length: {}\r\n\
+                     Connection: close\r\n{location}\r\n",
+                    body.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.write_all(body).unwrap();
+                let _ = head_tx.send(head);
+            }
+        });
+        (url, head_rx)
+    }
+
+    #[test]
+    fn icons_follow_redirects_on_the_server_with_its_headers() {
+        let (url, heads) = mock_icons(vec![
+            ("/icons/a.example/icon.png", 302, "/cache/a.png".into(), b""),
+            ("/cache/a.png", 200, String::new(), b"\x89PNG"),
+        ]);
+        let client =
+            Client::new(&url, &url, &url, None, cloudflare_headers());
+        assert_eq!(
+            client.icon(&format!("{url}/icons"), "a.example").unwrap(),
+            Some(b"\x89PNG".to_vec())
+        );
+        for _ in 0..2 {
+            let head = heads.recv().unwrap().to_lowercase();
+            assert!(head.contains("\r\ncf-access-client-secret: secret\r\n"));
+        }
+    }
+
+    #[test]
+    fn icons_dont_follow_redirects_to_the_local_network() {
+        let (elsewhere, elsewhere_heads) =
+            mock_icons(vec![("/a.png", 200, String::new(), b"\x89PNG")]);
+        let (url, _) = mock_icons(vec![(
+            "/icons/a.example/icon.png",
+            307,
+            format!("{elsewhere}/a.png"),
+            b"",
+        )]);
+        let client =
+            Client::new(&url, &url, &url, None, axum::http::HeaderMap::new());
+        assert_eq!(
+            client.icon(&format!("{url}/icons"), "a.example").unwrap(),
+            None
+        );
+        assert!(elsewhere_heads.try_recv().is_err());
+    }
+
+    #[test]
+    fn icons_come_from_public_https_addresses_only() {
+        for (url, allowed) in [
+            ("https://icons.duckduckgo.com/ip3/a.example.ico", true),
+            ("https://www.google.com/s2/favicons?domain=a.example", true),
+            ("https://8.8.8.8/a.png", true),
+            ("https://[2606:4700::1111]/a.png", true),
+            ("http://icons.example/a.png", false),
+            ("https://localhost/a.png", false),
+            ("https://icons.localhost./a.png", false),
+            ("https://127.0.0.1/a.png", false),
+            ("https://10.0.0.1/a.png", false),
+            ("https://192.168.1.1/a.png", false),
+            ("https://169.254.169.254/latest/meta-data", false),
+            ("https://100.100.100.100/a.png", false),
+            ("https://[::1]/a.png", false),
+            ("https://[fd00::1]/a.png", false),
+            ("https://[fe80::1]/a.png", false),
+            ("https://[::ffff:127.0.0.1]/a.png", false),
+        ] {
+            let url = url::Url::parse(url).unwrap();
+            assert_eq!(icon_redirect_allowed(&url), allowed, "{url}");
+        }
+    }
+
+    #[test]
+    fn a_refresh_from_an_address_without_a_server_names_it() {
+        let not_found = mock_identity(404, "");
+        assert!(matches!(
+            not_found.exchange_refresh_token("old"),
+            Err(Error::WrongServer)
+        ));
+        let error = anyhow::Error::new(Error::WrongServer);
+        assert_eq!(
+            crate::error::code(&error),
+            crate::protocol::ErrorCode::WrongServer
+        );
+    }
+
+    #[tokio::test]
+    async fn an_address_that_isnt_a_bitwarden_server_is_named() {
+        let web_page = mock_identity(200, "<!doctype html><html></html>");
+        assert!(matches!(
+            web_page.prelogin("me@example.com").await,
+            Err(Error::WrongServer)
+        ));
+        let static_site = mock_identity(405, "Method Not Allowed");
+        assert!(matches!(
+            static_site.prelogin("me@example.com").await,
+            Err(Error::WrongServer)
+        ));
     }
 
     #[test]
@@ -2241,6 +2905,34 @@ mod tests {
     }
 
     #[test]
+    fn vaultwarden_refuses_a_wrong_api_key_in_its_error_model() {
+        let res: ConnectErrorRes = serde_json::from_str(
+            r#"{"error":"","error_description":"","errorModel":{"message":"Incorrect client_secret","object":"error"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_login_error(&res, 400),
+            Error::IncorrectApiKey
+        ));
+    }
+
+    #[test]
+    fn a_captcha_means_registering_with_the_api_key() {
+        // what Bitwarden servers before mid-2025 answered to a password
+        // login from a device they didn't know
+        let res: ConnectErrorRes = serde_json::from_str(
+            r#"{"error":"invalid_grant","error_description":"Captcha required.","HCaptcha_SiteKey":"x"}"#,
+        )
+        .unwrap();
+        let error = classify_login_error(&res, 400);
+        assert!(matches!(error, Error::RegistrationRequired));
+        assert_eq!(
+            crate::error::code(&anyhow::Error::new(error)),
+            crate::protocol::ErrorCode::RegistrationRequired
+        );
+    }
+
+    #[test]
     fn device_errors_are_told_apart() {
         assert!(matches!(
             device_error("new device verification required"),
@@ -2255,6 +2947,42 @@ mod tests {
             Error::DeviceRejected { message }
                 if message == "no device information provided"
         ));
+    }
+
+    #[test]
+    fn partial_update_sends_only_the_folder_and_flag() {
+        let req = CiphersPartialReq {
+            folder_id: None,
+            favorite: true,
+        };
+        assert_eq!(
+            serde_json::to_value(&req).unwrap(),
+            serde_json::json!({ "folderId": null, "favorite": true })
+        );
+    }
+
+    #[test]
+    fn partial_update_keeps_the_servers_other_value() {
+        let server = serde_json::json!({
+            "id": "a", "folderId": "on-the-server", "favorite": true,
+        });
+        let req =
+            CiphersPartialReq::new(&server, &PartialChange::Favorite(false));
+        assert_eq!(req.folder_id.as_deref(), Some("on-the-server"));
+        assert!(!req.favorite);
+        let req = CiphersPartialReq::new(
+            &server,
+            &PartialChange::Folder(Some("new".to_string())),
+        );
+        assert_eq!(req.folder_id.as_deref(), Some("new"));
+        assert!(req.favorite);
+        let old_vaultwarden =
+            serde_json::json!({ "FolderId": "f", "Favorite": true });
+        let req = CiphersPartialReq::new(
+            &old_vaultwarden,
+            &PartialChange::Folder(None),
+        );
+        assert_eq!((req.folder_id, req.favorite), (None, true));
     }
 
     #[test]
@@ -2454,6 +3182,7 @@ mod tests {
             &fields,
             Some("2.notes"),
             Some("folder-id"),
+            false,
         );
         assert_eq!(
             serde_json::to_value(&req).unwrap(),
@@ -2466,6 +3195,8 @@ mod tests {
                 "card": null,
                 "identity": null,
                 "secureNote": { "type": 0 },
+                "sshKey": null,
+                "favorite": false,
                 "encryptedFor": "user-id",
                 "fields": [{
                     "Type": 1,
@@ -2492,9 +3223,11 @@ mod tests {
             &[],
             None,
             None,
+            true,
         );
         let req = serde_json::to_value(&req).unwrap();
         assert_eq!(req["type"], 1);
+        assert_eq!(req["favorite"], true);
         assert_eq!(req["secureNote"], serde_json::Value::Null);
         assert_eq!(req["fields"], serde_json::json!([]));
         assert_eq!(

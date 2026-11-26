@@ -87,6 +87,28 @@ pub fn unlock<S: std::hash::BuildHasher>(
     crate::locked::Keys,
     std::collections::HashMap<String, crate::locked::Keys>,
 )> {
+    let key = vault_key(
+        email,
+        password,
+        kdf,
+        iterations,
+        memory,
+        parallelism,
+        protected_key,
+    )?;
+    unlock_with_key(key, protected_private_key, protected_org_keys)
+}
+
+// The vault key that the master password decrypts from the protected key.
+pub fn vault_key(
+    email: &str,
+    password: &crate::locked::Password,
+    kdf: crate::api::KdfType,
+    iterations: u32,
+    memory: Option<u32>,
+    parallelism: Option<u32>,
+    protected_key: &str,
+) -> Result<crate::locked::Keys> {
     let identity = crate::identity::Identity::new(
         email,
         password,
@@ -98,17 +120,13 @@ pub fn unlock<S: std::hash::BuildHasher>(
 
     let protected_key =
         crate::cipherstring::CipherString::new(protected_key)?;
-    let key = match protected_key.decrypt_locked_symmetric(&identity.keys) {
-        Ok(master_keys) => crate::locked::Keys::new(master_keys),
-        Err(Error::InvalidMac) => {
-            return Err(Error::IncorrectPassword {
-                message: "Password is incorrect. Try again.".to_string(),
-            })
-        }
-        Err(e) => return Err(e),
-    };
-
-    unlock_with_key(key, protected_private_key, protected_org_keys)
+    match protected_key.decrypt_locked_symmetric(&identity.keys) {
+        Ok(master_keys) => Ok(crate::locked::Keys::new(master_keys)),
+        Err(Error::InvalidMac) => Err(Error::IncorrectPassword {
+            message: "Password is incorrect. Try again.".to_string(),
+        }),
+        Err(e) => Err(e),
+    }
 }
 
 pub fn unlock_with_key<S: std::hash::BuildHasher>(
@@ -148,6 +166,7 @@ pub async fn sync(
         String,
         std::collections::HashMap<String, String>,
         Vec<crate::db::Entry>,
+        Vec<crate::db::Folder>,
         String,
     ),
 )> {
@@ -169,6 +188,7 @@ async fn sync_once(
     String,
     std::collections::HashMap<String, String>,
     Vec<crate::db::Entry>,
+    Vec<crate::db::Folder>,
     String,
 )> {
     let (client, _) = api_client_async().await?;
@@ -184,9 +204,19 @@ pub fn add(
     fields: &[crate::db::Field],
     notes: Option<&str>,
     folder_id: Option<&str>,
-) -> Result<(Option<RefreshedTokens>, ())> {
+    favorite: bool,
+) -> Result<(Option<RefreshedTokens>, crate::api::SavedCipher)> {
     with_exchange_refresh_token(access_token, refresh_token, |access_token| {
-        add_once(access_token, user_id, name, data, fields, notes, folder_id)
+        add_once(
+            access_token,
+            user_id,
+            name,
+            data,
+            fields,
+            notes,
+            folder_id,
+            favorite,
+        )
     })
 }
 
@@ -198,7 +228,8 @@ fn add_once(
     fields: &[crate::db::Field],
     notes: Option<&str>,
     folder_id: Option<&str>,
-) -> Result<()> {
+    favorite: bool,
+) -> Result<crate::api::SavedCipher> {
     let (client, _) = api_client()?;
     client.add(
         access_token,
@@ -208,8 +239,8 @@ fn add_once(
         fields,
         notes,
         folder_id,
-    )?;
-    Ok(())
+        favorite,
+    )
 }
 
 pub fn edit(
@@ -225,7 +256,9 @@ pub fn edit(
     folder_uuid: Option<&str>,
     history: &[crate::db::HistoryEntry],
     key: Option<&str>,
-) -> Result<(Option<RefreshedTokens>, ())> {
+    last_known_revision_date: Option<&str>,
+    favorite: Option<bool>,
+) -> Result<(Option<RefreshedTokens>, crate::api::SavedCipher)> {
     with_exchange_refresh_token(access_token, refresh_token, |access_token| {
         edit_once(
             access_token,
@@ -239,6 +272,8 @@ pub fn edit(
             folder_uuid,
             history,
             key,
+            last_known_revision_date,
+            favorite,
         )
     })
 }
@@ -255,7 +290,9 @@ fn edit_once(
     folder_uuid: Option<&str>,
     history: &[crate::db::HistoryEntry],
     key: Option<&str>,
-) -> Result<()> {
+    last_known_revision_date: Option<&str>,
+    favorite: Option<bool>,
+) -> Result<crate::api::SavedCipher> {
     let (client, _) = api_client()?;
     client.edit(
         access_token,
@@ -269,8 +306,9 @@ fn edit_once(
         folder_uuid,
         history,
         key,
-    )?;
-    Ok(())
+        last_known_revision_date,
+        favorite,
+    )
 }
 
 pub fn remove(
@@ -287,6 +325,34 @@ fn remove_once(access_token: &str, id: &str) -> Result<()> {
     let (client, _) = api_client()?;
     client.remove(access_token, id)?;
     Ok(())
+}
+
+pub fn trash(
+    access_token: &str,
+    refresh_token: &str,
+    id: &str,
+) -> Result<(Option<RefreshedTokens>, ())> {
+    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
+        let (client, _) = api_client()?;
+        client.trash(access_token, id)
+    })
+}
+
+pub fn partial(
+    access_token: &str,
+    refresh_token: &str,
+    id: &str,
+    change: &crate::api::PartialChange,
+) -> Result<(Option<RefreshedTokens>, ())> {
+    with_exchange_refresh_token(access_token, refresh_token, |access_token| {
+        let (client, _) = api_client()?;
+        client.partial(access_token, id, change)
+    })
+}
+
+pub fn icon(host: &str) -> Result<Option<Vec<u8>>> {
+    let (client, config) = api_client()?;
+    client.icon(&config.icons_url(), host)
 }
 
 pub fn list_folders(

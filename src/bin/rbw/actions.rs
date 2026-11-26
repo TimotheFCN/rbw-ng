@@ -1,7 +1,5 @@
 use std::{io::Read as _, os::unix::ffi::OsStringExt as _};
 
-use anyhow::Context as _;
-
 pub fn register() -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::Register)
 }
@@ -25,8 +23,8 @@ pub fn unlocked() -> anyhow::Result<()> {
             let res = sock.recv()?;
             match res {
                 rbw::protocol::Response::Ack => Ok(()),
-                rbw::protocol::Response::Error { error } => {
-                    Err(anyhow::anyhow!("{error}"))
+                rbw::protocol::Response::Error { error, code } => {
+                    Err(agent_error(error, code))
                 }
                 _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
             }
@@ -84,7 +82,7 @@ pub fn quit() -> anyhow::Result<()> {
 // item succeeds or fails individually
 pub fn decrypt_many(
     items: Vec<rbw::protocol::DecryptItem>,
-) -> anyhow::Result<Vec<Result<String, String>>> {
+) -> anyhow::Result<Vec<Result<String, rbw::protocol::DecryptError>>> {
     if items.is_empty() {
         return Ok(vec![]);
     }
@@ -98,8 +96,11 @@ pub fn decrypt_many(
 
     let res = sock.recv()?;
     match res {
-        rbw::protocol::Response::DecryptMany { plaintexts } => Ok(plaintexts),
-        rbw::protocol::Response::Error { error }
+        rbw::protocol::Response::DecryptMany { plaintexts } => Ok(plaintexts
+            .into_iter()
+            .map(|plaintext| plaintext.map(into_string))
+            .collect()),
+        rbw::protocol::Response::Error { error, .. }
             if error.contains("unknown variant `DecryptMany`") =>
         {
             // an agent from before batch decryption with the same protocol
@@ -114,8 +115,8 @@ pub fn decrypt_many(
             };
             items.iter().map(decrypt_one).collect()
         }
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("failed to decrypt: {error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code).context("failed to decrypt"))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
@@ -126,7 +127,7 @@ pub fn decrypt_many(
 // inner Err, matching one item of decrypt_many.
 fn decrypt_one(
     item: &rbw::protocol::DecryptItem,
-) -> anyhow::Result<Result<String, String>> {
+) -> anyhow::Result<Result<String, rbw::protocol::DecryptError>> {
     let mut sock = connect()?;
     sock.send(&rbw::protocol::Request::new(
         get_environment(),
@@ -139,10 +140,20 @@ fn decrypt_one(
 
     let res = sock.recv()?;
     match res {
-        rbw::protocol::Response::Decrypt { plaintext } => Ok(Ok(plaintext)),
-        rbw::protocol::Response::Error { error } => Ok(Err(error)),
+        rbw::protocol::Response::Decrypt { plaintext } => {
+            Ok(Ok(into_string(plaintext)))
+        }
+        rbw::protocol::Response::Error { error, code } => {
+            Ok(Err(rbw::protocol::DecryptError { error, code }))
+        }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
+}
+
+// The plaintexts go into what rbw prints, so it takes the strings without
+// a copy.
+fn into_string(mut secret: rbw::protocol::Secret) -> String {
+    std::mem::take(&mut *secret)
 }
 
 pub fn encrypt(
@@ -154,7 +165,7 @@ pub fn encrypt(
     sock.send(&rbw::protocol::Request::new(
         get_environment(),
         rbw::protocol::Action::Encrypt {
-            plaintext: plaintext.to_string(),
+            plaintext: plaintext.to_string().into(),
             entry_key: entry_key.map(std::string::ToString::to_string),
             org_id: org_id.map(std::string::ToString::to_string),
         },
@@ -163,8 +174,8 @@ pub fn encrypt(
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::Encrypt { cipherstring } => Ok(cipherstring),
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("failed to encrypt: {error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code).context("failed to encrypt"))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
@@ -172,7 +183,7 @@ pub fn encrypt(
 
 pub fn clipboard_store(text: &str) -> anyhow::Result<()> {
     simple_action(rbw::protocol::Action::ClipboardStore {
-        text: text.to_string(),
+        text: text.to_string().into(),
     })
 }
 
@@ -186,8 +197,109 @@ pub fn version() -> anyhow::Result<u32> {
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::Version { version } => Ok(version),
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("failed to get version: {error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code).context("failed to get version"))
+        }
+        _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
+    }
+}
+
+pub fn login_with(
+    password: rbw::protocol::Secret,
+    code: Option<rbw::protocol::LoginCode>,
+    session: bool,
+) -> anyhow::Result<Option<rbw::protocol::Secret>> {
+    session_action(rbw::protocol::Action::LoginWith {
+        password,
+        code,
+        session,
+    })
+}
+
+pub fn register_with(
+    client_id: String,
+    client_secret: rbw::protocol::Secret,
+) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::RegisterWith {
+        client_id,
+        client_secret,
+    })
+}
+
+pub fn unlock_with(
+    password: rbw::protocol::Secret,
+    session: bool,
+) -> anyhow::Result<Option<rbw::protocol::Secret>> {
+    session_action(rbw::protocol::Action::UnlockWith { password, session })
+}
+
+pub fn unlock_entry(
+    id: String,
+    password: Option<rbw::protocol::Secret>,
+) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::UnlockEntry { id, password })
+}
+
+pub fn reload_config() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::ReloadConfig)
+}
+
+#[cfg(target_os = "macos")]
+pub fn serve_service_socket() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::ServeServiceSocket)
+}
+
+pub fn unlock_touch_id() -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::UnlockTouchId)
+}
+
+// Whether the vault is unlocked, and whether Touch ID can unlock it.
+pub fn status() -> anyhow::Result<(bool, bool)> {
+    status_from(connect()?)
+}
+
+// The same for the agent of another profile, at its socket; an agent that
+// doesn't run isn't started.
+pub fn profile_status(
+    socket: &std::path::Path,
+) -> anyhow::Result<(bool, bool)> {
+    status_from(crate::sock::Sock::connect_to(socket)?)
+}
+
+fn status_from(mut sock: crate::sock::Sock) -> anyhow::Result<(bool, bool)> {
+    sock.send(&rbw::protocol::Request::new(
+        get_environment(),
+        rbw::protocol::Action::Status,
+    ))?;
+    match sock.recv()? {
+        rbw::protocol::Response::Status { unlocked, touch_id } => {
+            Ok((unlocked, touch_id))
+        }
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code))
+        }
+        res => Err(anyhow::anyhow!("unexpected message: {res:?}")),
+    }
+}
+
+pub fn unlock_session(session: rbw::protocol::Secret) -> anyhow::Result<()> {
+    simple_action(rbw::protocol::Action::UnlockSession { session })
+}
+
+// An action that answers with a session key when it made one.
+fn session_action(
+    action: rbw::protocol::Action,
+) -> anyhow::Result<Option<rbw::protocol::Secret>> {
+    let mut sock = connect()?;
+
+    sock.send(&rbw::protocol::Request::new(get_environment(), action))?;
+
+    let res = sock.recv()?;
+    match res {
+        rbw::protocol::Response::Ack => Ok(None),
+        rbw::protocol::Response::Session { session } => Ok(Some(session)),
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
@@ -201,21 +313,32 @@ fn simple_action(action: rbw::protocol::Action) -> anyhow::Result<()> {
     let res = sock.recv()?;
     match res {
         rbw::protocol::Response::Ack => Ok(()),
-        rbw::protocol::Response::Error { error } => {
-            Err(anyhow::anyhow!("{error}"))
+        rbw::protocol::Response::Error { error, code } => {
+            Err(agent_error(error, code))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
 }
 
+// An error the agent answered with, with its code.
+fn agent_error(
+    error: String,
+    code: Option<rbw::protocol::ErrorCode>,
+) -> anyhow::Error {
+    rbw::error::coded(code.unwrap_or(rbw::protocol::ErrorCode::Other), error)
+}
+
 fn connect() -> anyhow::Result<crate::sock::Sock> {
-    crate::sock::Sock::connect().with_context(|| {
+    crate::sock::Sock::connect().map_err(|e| {
         let log = rbw::dirs::agent_stderr_file();
-        format!(
-            "failed to connect to rbw-agent \
-            (this often means that the agent failed to start; \
-            check {} for agent logs)",
-            log.display()
+        rbw::error::coded(
+            rbw::protocol::ErrorCode::Agent,
+            format!(
+                "failed to connect to rbw-agent \
+                (this often means that the agent failed to start; \
+                check {} for agent logs): {e}",
+                log.display()
+            ),
         )
     })
 }

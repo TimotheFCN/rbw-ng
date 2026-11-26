@@ -1,4 +1,68 @@
-use sha2::Digest as _;
+// How long an entry with master password reprompt stays open after it was
+// unlocked or last read. The official clients ask again each time such an
+// entry is opened and keep it open while it is shown; a program that shows
+// one keeps reading it, at least to refresh its code every period.
+const ENTRY_UNLOCK_IDLE: std::time::Duration =
+    std::time::Duration::from_secs(120);
+
+// A use measured on both clocks, so that neither a sleep (which the
+// monotonic clock skips) nor a clock change (which the wall clock follows)
+// keeps an entry open longer.
+#[derive(Clone, Copy)]
+pub struct LastUse {
+    instant: std::time::Instant,
+    time: std::time::SystemTime,
+}
+
+impl LastUse {
+    fn now() -> Self {
+        Self {
+            instant: std::time::Instant::now(),
+            time: std::time::SystemTime::now(),
+        }
+    }
+
+    fn expired(self) -> bool {
+        self.instant.elapsed() >= ENTRY_UNLOCK_IDLE
+            || self
+                .time
+                .elapsed()
+                .map_or(true, |elapsed| elapsed >= ENTRY_UNLOCK_IDLE)
+    }
+}
+
+// Runs one sync at a time, and spares a caller that waited for one its own
+// sync when one that started after the caller asked has succeeded since:
+// that one is at least as fresh. A sync that started before the caller
+// asked may miss a change the caller just made, so the caller doesn't take
+// its result.
+#[derive(Default)]
+pub struct SyncFlight {
+    running: tokio::sync::Mutex<()>,
+    // syncs started, numbered from 1
+    started: std::sync::atomic::AtomicU64,
+    // the number of the last one that succeeded
+    succeeded: std::sync::atomic::AtomicU64,
+}
+
+impl SyncFlight {
+    pub async fn run<F>(&self, sync: F) -> anyhow::Result<()>
+    where
+        F: std::future::Future<Output = anyhow::Result<()>>,
+    {
+        use std::sync::atomic::Ordering;
+
+        let asked = self.started.load(Ordering::SeqCst);
+        let _running = self.running.lock().await;
+        if self.succeeded.load(Ordering::SeqCst) > asked {
+            return Ok(());
+        }
+        let number = self.started.fetch_add(1, Ordering::SeqCst) + 1;
+        sync.await?;
+        self.succeeded.store(number, Ordering::SeqCst);
+        Ok(())
+    }
+}
 
 pub struct State {
     pub priv_key: Option<rbw::locked::Keys>,
@@ -9,15 +73,24 @@ pub struct State {
     pub sync_timeout: crate::timeout::Timeout,
     pub sync_timeout_duration: std::time::Duration,
     pub notifications_handler: crate::notifications::Handler,
-    pub master_password_reprompt: std::collections::HashSet<[u8; 32]>,
-    pub master_password_reprompt_initialized: bool,
+    // the values that need the master password again (see reprompt.rs),
+    // or None until the agent knows them from a sync or from a local copy
+    // of the vault that carries its MAC
+    pub master_password_reprompt: Option<crate::reprompt::Protected>,
+    // entries that rbw item unlock opened, by id, with when they were
+    // last read
+    pub unlocked_entries: std::collections::HashMap<String, LastUse>,
     pub unlock_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+    pub sync_flight: std::sync::Arc<SyncFlight>,
     #[cfg(target_os = "macos")]
-    // Configuration changes stop the agent, so this startup snapshot avoids
-    // rereading config on every successful password unlock.
+    // Read at startup and when `rbw config` changes it, so that a password
+    // unlock doesn't reread the config.
     pub touch_id_unlock: bool,
-    // Ask before every SSH signature, also a startup snapshot.
+    // Ask before every SSH signature, kept the same way.
     pub ssh_confirm: bool,
+    // whether the agent serves SSH at the macOS service's socket too, while
+    // the service waits for it to stop
+    pub serves_service_socket: bool,
     #[cfg(target_os = "macos")]
     pub biometric_unlock: Option<std::sync::Arc<crate::biometric::Session>>,
 
@@ -63,7 +136,30 @@ impl State {
     pub fn clear(&mut self) {
         self.priv_key = None;
         self.org_keys = None;
+        self.unlocked_entries.clear();
         self.timeout.clear();
+    }
+
+    pub fn unlock_entry(&mut self, id: &str) {
+        self.unlocked_entries
+            .insert(id.to_ascii_lowercase(), LastUse::now());
+    }
+
+    // Whether rbw item unlock opened the entry and it is still open; reading
+    // it keeps it open.
+    pub fn use_unlocked_entry(&mut self, id: &str) -> bool {
+        let id = id.to_ascii_lowercase();
+        match self.unlocked_entries.get(&id) {
+            Some(last_use) if !last_use.expired() => {
+                self.unlocked_entries.insert(id, LastUse::now());
+                true
+            }
+            Some(_) => {
+                self.unlocked_entries.remove(&id);
+                false
+            }
+            None => false,
+        }
     }
 
     pub fn clear_all(&mut self) {
@@ -78,84 +174,37 @@ impl State {
         self.sync_timeout.set(self.sync_timeout_duration);
     }
 
-    // the way we structure the client/agent split in rbw makes the master
-    // password reprompt feature a bit complicated to implement - it would be
-    // a lot easier to just have the client do the prompting, but that would
-    // leave it open to someone reading the cipherstring from the local
-    // database and passing it to the agent directly, bypassing the client.
-    // the agent is the thing that holds the unlocked secrets, so it also
-    // needs to be the thing guarding access to master password reprompt
-    // entries. we only pass individual cipherstrings to the agent though, so
-    // the agent needs to be able to recognize the cipherstrings that need
-    // reprompting, without the additional context of the entry they came
-    // from. in addition, because the reprompt state is stored in the sync db
-    // in plaintext, we can't just read it from the db directly, because
-    // someone could just edit the file on disk before making the request.
-    //
-    // therefore, the solution we choose here is to keep an in-memory set of
-    // cipherstrings that we know correspond to entries with master password
-    // reprompt enabled. this set is only updated when the agent itself does
-    // a sync, so it can't be bypassed by editing the on-disk file directly.
-    // if the agent gets a request for any of those cipherstrings that it saw
-    // marked as master password reprompt during the most recent sync, it
-    // forces a reprompt.
+    // Learns which values need the master password again from entries the
+    // agent synced from the server.
     pub fn set_master_password_reprompt(
         &mut self,
         entries: &[rbw::db::Entry],
     ) {
-        self.master_password_reprompt.clear();
-
-        let mut hasher = sha2::Sha256::new();
-        let mut insert = |s: Option<&str>| {
-            if let Some(s) = s {
-                if !s.is_empty() {
-                    hasher.update(s);
-                    self.master_password_reprompt
-                        .insert(hasher.finalize_reset().into());
-                }
-            }
-        };
-
-        for entry in entries {
-            if !entry.master_password_reprompt() {
-                continue;
-            }
-
-            match &entry.data {
-                rbw::db::EntryData::Login { password, totp, .. } => {
-                    insert(password.as_deref());
-                    insert(totp.as_deref());
-                }
-                rbw::db::EntryData::Card { number, code, .. } => {
-                    insert(number.as_deref());
-                    insert(code.as_deref());
-                }
-                rbw::db::EntryData::Identity {
-                    ssn,
-                    passport_number,
-                    ..
-                } => {
-                    insert(ssn.as_deref());
-                    insert(passport_number.as_deref());
-                }
-                rbw::db::EntryData::SecureNote => {}
-                rbw::db::EntryData::SshKey { private_key, .. } => {
-                    insert(private_key.as_deref());
-                }
-            }
-
-            for field in &entry.fields {
-                if field.ty == Some(rbw::api::FieldType::Hidden) {
-                    insert(field.value.as_deref());
-                }
-            }
-        }
-
-        self.master_password_reprompt_initialized = true;
+        self.master_password_reprompt =
+            Some(crate::reprompt::protected(entries));
     }
 
-    pub fn master_password_reprompt_initialized(&self) -> bool {
-        self.master_password_reprompt_initialized
+    // Learns them from the local copy of the vault, if it carries the
+    // agent's MAC of them under the vault key, so that no other program
+    // changed them.
+    pub fn trust_master_password_reprompt(&mut self, db: &rbw::db::Db) {
+        let (Some(keys), Some(mac)) = (&self.priv_key, &db.reprompt_mac)
+        else {
+            return;
+        };
+        let protected = crate::reprompt::protected(&db.entries);
+        if crate::reprompt::verify(keys, &protected, mac) {
+            self.master_password_reprompt = Some(protected);
+        }
+    }
+
+    // The MAC that lets a later agent trust the local copy of the vault,
+    // when the vault is unlocked and the agent knows the protected values.
+    pub fn master_password_reprompt_mac(&self) -> Option<String> {
+        Some(crate::reprompt::mac(
+            self.priv_key.as_ref()?,
+            self.master_password_reprompt.as_ref()?,
+        ))
     }
 
     pub fn last_environment(&self) -> &rbw::protocol::Environment {
@@ -167,5 +216,88 @@ impl State {
         environment: rbw::protocol::Environment,
     ) {
         self.last_environment = environment;
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[tokio::test]
+    async fn waiting_syncs_share_the_next_one() {
+        let flight = std::sync::Arc::new(SyncFlight::default());
+        let runs = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+
+        // a first sync, held until released
+        let first = tokio::spawn({
+            let (flight, runs) = (flight.clone(), runs.clone());
+            async move {
+                flight
+                    .run(async {
+                        runs.fetch_add(
+                            1,
+                            std::sync::atomic::Ordering::SeqCst,
+                        );
+                        released.await.unwrap();
+                        Ok(())
+                    })
+                    .await
+            }
+        });
+        while runs.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+        // asked while it runs: they may miss what it fetched already, so
+        // they need a sync of their own, and share one
+        let waiting: Vec<_> = (0..3)
+            .map(|_| {
+                let (flight, runs) = (flight.clone(), runs.clone());
+                tokio::spawn(async move {
+                    flight
+                        .run(async {
+                            runs.fetch_add(
+                                1,
+                                std::sync::atomic::Ordering::SeqCst,
+                            );
+                            Ok(())
+                        })
+                        .await
+                })
+            })
+            .collect();
+        tokio::task::yield_now().await;
+        release.send(()).unwrap();
+        first.await.unwrap().unwrap();
+        for sync in waiting {
+            sync.await.unwrap().unwrap();
+        }
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // a failed sync is no result to share
+        assert!(flight
+            .run(async { Err(anyhow::anyhow!("offline")) })
+            .await
+            .is_err());
+        flight.run(async { Ok(()) }).await.unwrap();
+    }
+
+    #[test]
+    fn an_unlocked_entry_closes_once_unread_on_either_clock() {
+        assert!(!LastUse::now().expired());
+        let now = LastUse::now();
+        let slept = LastUse {
+            time: now.time - ENTRY_UNLOCK_IDLE,
+            ..now
+        };
+        assert!(slept.expired());
+        let clock_set_back = LastUse {
+            time: now.time + ENTRY_UNLOCK_IDLE,
+            ..now
+        };
+        assert!(clock_set_back.expired());
+        if let Some(instant) = now.instant.checked_sub(ENTRY_UNLOCK_IDLE) {
+            assert!(LastUse { instant, ..now }.expired());
+        }
     }
 }

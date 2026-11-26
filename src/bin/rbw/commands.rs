@@ -1,14 +1,12 @@
 use std::{
     fmt::Write as _,
     io::{IsTerminal as _, Write as _},
-    os::unix::ffi::OsStrExt as _,
 };
 
 use anyhow::Context as _;
 
 // The default number of seconds the generated TOTP
 // code lasts for before a new one must be generated
-const TOTP_DEFAULT_STEP: u64 = 30;
 
 const MISSING_CONFIG_HELP: &str =
     "Before using rbw, you must configure the email address you would like to \
@@ -289,7 +287,7 @@ impl DecryptedSearchCipher {
             }
             Needle::Uri(given_uri) => {
                 if self.uris.iter().all(|(uri, match_type)| {
-                    !matches_url(uri, *match_type, given_uri)
+                    !rbw::uri_match::matches(uri, *match_type, given_uri)
                 }) {
                     return false;
                 }
@@ -434,7 +432,7 @@ impl DecryptedCipher {
                 }
                 Ok(Field::Totp) => {
                     if let Some(totp) = totp {
-                        match generate_totp(totp) {
+                        match rbw::totp::generate_totp(totp) {
                             Ok(code) => {
                                 val_display_or_store(clipboard, &code);
                             }
@@ -1112,76 +1110,6 @@ struct DecryptedUri {
     match_type: Option<rbw::api::UriMatchType>,
 }
 
-fn matches_url(
-    url: &str,
-    match_type: Option<rbw::api::UriMatchType>,
-    given_url: &url::Url,
-) -> bool {
-    match match_type.unwrap_or(rbw::api::UriMatchType::Domain) {
-        rbw::api::UriMatchType::Domain => {
-            let Some(given_host_port) = host_port(given_url) else {
-                return false;
-            };
-            if let Ok(self_url) = url::Url::parse(url) {
-                if let Some(self_host_port) = host_port(&self_url) {
-                    if self_url.scheme() == given_url.scheme()
-                        && (self_host_port == given_host_port
-                            || given_host_port
-                                .ends_with(&format!(".{self_host_port}")))
-                    {
-                        return true;
-                    }
-                }
-            }
-            url == given_host_port
-                || given_host_port.ends_with(&format!(".{url}"))
-        }
-        rbw::api::UriMatchType::Host => {
-            let Some(given_host_port) = host_port(given_url) else {
-                return false;
-            };
-            if let Ok(self_url) = url::Url::parse(url) {
-                if let Some(self_host_port) = host_port(&self_url) {
-                    if self_url.scheme() == given_url.scheme()
-                        && self_host_port == given_host_port
-                    {
-                        return true;
-                    }
-                }
-            }
-            url == given_host_port
-        }
-        rbw::api::UriMatchType::StartsWith => {
-            given_url.to_string().starts_with(url)
-        }
-        rbw::api::UriMatchType::Exact => {
-            if given_url.path() == "/" {
-                given_url.to_string().trim_end_matches('/')
-                    == url.trim_end_matches('/')
-            } else {
-                given_url.to_string() == url
-            }
-        }
-        rbw::api::UriMatchType::RegularExpression => {
-            let Ok(rx) = regex::Regex::new(url) else {
-                return false;
-            };
-            rx.is_match(given_url.as_ref())
-        }
-        rbw::api::UriMatchType::Never => false,
-    }
-}
-
-fn host_port(url: &url::Url) -> Option<String> {
-    let host = url.host_str()?;
-    Some(
-        url.port().map_or_else(
-            || host.to_string(),
-            |port| format!("{host}:{port}"),
-        ),
-    )
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ListField {
     Id,
@@ -1315,15 +1243,33 @@ pub fn config_set(key: &str, value: &str) -> anyhow::Result<()> {
         }
     }
     config.save()?;
+    apply_config(key)
+}
 
+// Settings that change only what the agent does: a running agent takes them
+// over without locking.
+const AGENT_SETTINGS: &[&str] = &[
+    "lock_timeout",
+    "sync_interval",
+    "pinentry",
+    "pinentry_timeout",
+    "touch_id_unlock",
+    "ssh_confirm",
+    "touch_id_ssh",
+];
+
+fn apply_config(key: &str) -> anyhow::Result<()> {
+    if AGENT_SETTINGS.contains(&key)
+        && crate::actions::reload_config().is_ok()
+    {
+        return Ok(());
+    }
     // drop in-memory keys, since they will be different if the email or url
     // changed. not using lock() because we don't want to require the agent to
     // be running (since this may be the user running `rbw config set
     // base_url` as the first operation), and stop_agent() already handles the
     // agent not running case gracefully.
-    stop_agent()?;
-
-    Ok(())
+    stop_agent()
 }
 
 pub fn config_unset(key: &str) -> anyhow::Result<()> {
@@ -1355,15 +1301,7 @@ pub fn config_unset(key: &str) -> anyhow::Result<()> {
         }
     }
     config.save()?;
-
-    // drop in-memory keys, since they will be different if the email or url
-    // changed. not using lock() because we don't want to require the agent to
-    // be running (since this may be the user running `rbw config set
-    // base_url` as the first operation), and stop_agent() already handles the
-    // agent not running case gracefully.
-    stop_agent()?;
-
-    Ok(())
+    apply_config(key)
 }
 
 // `rbw config set extra_headers.NAME VALUE` sets one header.
@@ -1405,6 +1343,9 @@ pub fn login() -> anyhow::Result<()> {
 
 pub fn unlock() -> anyhow::Result<()> {
     ensure_agent()?;
+    if crate::scripting::unlock_for_program()? {
+        return Ok(());
+    }
     crate::actions::login()?;
     crate::actions::unlock()?;
 
@@ -1422,6 +1363,11 @@ pub fn unlocked() -> anyhow::Result<()> {
 
 pub fn sync() -> anyhow::Result<()> {
     ensure_agent()?;
+    if crate::scripting::noninteractive()
+        && load_db_meta().map_or(true, |db| db.needs_login())
+    {
+        anyhow::bail!("not logged in");
+    }
     crate::actions::login()?;
     crate::actions::sync()?;
 
@@ -1607,7 +1553,10 @@ pub fn code(
 
     if let DecryptedData::Login { totp, .. } = decrypted.data {
         if let Some(totp) = totp {
-            val_display_or_store(clipboard, &generate_totp(&totp)?);
+            val_display_or_store(
+                clipboard,
+                &rbw::totp::generate_totp(&totp)?,
+            );
         } else {
             return Err(anyhow::anyhow!(
                 "entry does not contain a totp secret"
@@ -1730,6 +1679,7 @@ pub fn add(
         &fields,
         notes.as_deref(),
         folder_id.as_deref(),
+        false,
     )?;
 
     crate::actions::sync()?;
@@ -1760,7 +1710,7 @@ fn uri_checksum(uri: &str) -> String {
 // encrypts a uri together with its checksum (the base64 sha256 of the uri),
 // which the official clients check before showing the uris of an entry
 // that has its own key
-fn encrypt_uri(
+pub fn encrypt_uri(
     uri: &str,
     match_type: Option<rbw::api::UriMatchType>,
     entry_key: Option<&str>,
@@ -1782,10 +1732,9 @@ pub fn generate(
     username: Option<&str>,
     uris: &[(String, Option<rbw::api::UriMatchType>)],
     folder: Option<&str>,
-    len: usize,
-    ty: rbw::pwgen::Type,
+    options: &rbw::pwgen::Options,
 ) -> anyhow::Result<()> {
-    let password = rbw::pwgen::pwgen(ty, len);
+    let password = rbw::pwgen::pwgen(options)?;
     println!("{password}");
 
     if let Some(name) = name {
@@ -1854,6 +1803,7 @@ pub fn generate(
             &[],
             None,
             folder_id.as_deref(),
+            false,
         )?;
 
         crate::actions::sync()?;
@@ -1914,6 +1864,10 @@ pub fn edit(
         entry.folder_id.as_deref(),
         &history,
         entry.key.as_deref(),
+        // the command line edits what the local copy has, like rbw always
+        // did; a newer change on the server is overwritten
+        None,
+        None,
     )?;
 
     crate::actions::sync()?;
@@ -2175,7 +2129,7 @@ fn password_change<'a>(
 // ciphertext, so that saving without changes adds nothing to the history and
 // leaves the server's password revision date alone. a changed one moves the
 // old one into the history, as the official clients do.
-fn edit_password(
+pub fn edit_password(
     entry: &rbw::db::Entry,
     encrypted: Option<&str>,
     current: Option<&str>,
@@ -2563,23 +2517,100 @@ pub fn lock() -> anyhow::Result<()> {
     Ok(())
 }
 
-pub fn purge() -> anyhow::Result<()> {
+pub fn purge(all: bool) -> anyhow::Result<()> {
+    if all {
+        crate::service::uninstall_if_installed()?;
+        stop_agent()?;
+        for dir in rbw::dirs::profile_dirs() {
+            match std::fs::remove_dir_all(&dir) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(e).with_context(|| {
+                        format!("failed to remove {}", dir.display())
+                    });
+                }
+                _ => {}
+            }
+        }
+        return Ok(());
+    }
     stop_agent()?;
 
     remove_db()?;
+    if let Err(e) = std::fs::remove_file(rbw::dirs::session_file()) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(e).context("failed to remove the session");
+        }
+    }
 
+    Ok(())
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct Profile {
+    // null for the default profile
+    profile: Option<String>,
+    user_email: Option<String>,
+    // null for bitwarden.com
+    server_url: Option<String>,
+    // with --status: status, lastSync and touchId, as rbw status --json
+    // says them
+    #[serde(flatten)]
+    status: Option<crate::scripting::VaultStatus>,
+}
+
+pub fn profiles(json: bool, status: bool) -> anyhow::Result<()> {
+    let profiles: Vec<_> = rbw::dirs::profiles()
+        .into_iter()
+        .map(|(profile, file)| {
+            let config: rbw::config::Config = std::fs::read_to_string(&file)
+                .ok()
+                .and_then(|json| serde_json::from_str(&json).ok())
+                .unwrap_or_default();
+            let status = status.then(|| {
+                crate::scripting::profile_status(profile.as_deref(), &config)
+            });
+            Profile {
+                profile,
+                user_email: config.email,
+                server_url: config.base_url,
+                status,
+            }
+        })
+        .collect();
+    if json {
+        serde_json::to_writer(std::io::stdout(), &profiles)
+            .context("failed to write the profiles")?;
+        println!();
+    } else {
+        for profile in profiles {
+            println!(
+                "{}\t{}",
+                profile.profile.as_deref().unwrap_or("(default)"),
+                profile.user_email.as_deref().unwrap_or("")
+            );
+        }
+    }
     Ok(())
 }
 
 pub fn stop_agent() -> anyhow::Result<()> {
     crate::actions::quit()?;
-
+    crate::service::activate();
     Ok(())
 }
 
-fn ensure_agent() -> anyhow::Result<()> {
+pub fn ssh_agent_install() -> anyhow::Result<()> {
+    check_config()?;
+    crate::service::install()
+}
+
+pub fn ensure_agent() -> anyhow::Result<()> {
     check_config()?;
     if matches!(check_agent_version(), Ok(())) {
+        return Ok(());
+    }
+    if crate::service::start_agent()? {
         return Ok(());
     }
     run_agent()?;
@@ -2587,11 +2618,13 @@ fn ensure_agent() -> anyhow::Result<()> {
     Ok(())
 }
 
+// RBW_AGENT, else the rbw-agent that came with this rbw, else the one in
+// PATH.
 fn run_agent() -> anyhow::Result<()> {
-    let agent_path = std::env::var_os("RBW_AGENT");
-    let agent_path = agent_path
-        .as_deref()
-        .unwrap_or_else(|| std::ffi::OsStr::from_bytes(b"rbw-agent"));
+    let agent_path = std::env::var_os("RBW_AGENT")
+        .map(std::path::PathBuf::from)
+        .or_else(own_agent)
+        .unwrap_or_else(|| "rbw-agent".into());
     let status = std::process::Command::new(agent_path)
         .status()
         .context("failed to run rbw-agent")?;
@@ -2608,6 +2641,19 @@ fn run_agent() -> anyhow::Result<()> {
     Ok(())
 }
 
+// The rbw-agent beside this rbw's executable, with links resolved: an rbw
+// reached through a link in another folder still starts the agent of its
+// own install, which speaks the same protocol version, rather than whichever
+// rbw-agent PATH finds first.
+pub fn own_agent() -> Option<std::path::PathBuf> {
+    agent_beside(&std::env::current_exe().ok()?)
+}
+
+fn agent_beside(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let exe = std::fs::canonicalize(exe).ok()?;
+    Some(exe.parent()?.join("rbw-agent")).filter(|agent| agent.is_file())
+}
+
 fn check_config() -> anyhow::Result<()> {
     rbw::config::Config::validate().map_err(|e| {
         log::error!("{MISSING_CONFIG_HELP}");
@@ -2615,7 +2661,7 @@ fn check_config() -> anyhow::Result<()> {
     })
 }
 
-fn check_agent_version() -> anyhow::Result<()> {
+pub fn check_agent_version() -> anyhow::Result<()> {
     let client_version = rbw::protocol::VERSION;
     let agent_version = version_or_quit()?;
     if agent_version != client_version {
@@ -2772,7 +2818,7 @@ impl EntryDecryptor for RecordingDecryptor {
 struct ReplayingDecryptor(
     std::collections::HashMap<
         rbw::protocol::DecryptItem,
-        Result<String, String>,
+        Result<String, rbw::protocol::DecryptError>,
     >,
 );
 
@@ -2796,7 +2842,7 @@ impl EntryDecryptor for ReplayingDecryptor {
                 )
             })?
             .clone()
-            .map_err(|e| anyhow::anyhow!("failed to decrypt: {e}"))
+            .map_err(|e| e.into_error().context("failed to decrypt"))
     }
 }
 
@@ -2817,7 +2863,7 @@ fn replay_batch<T>(
     entries: &[rbw::db::Entry],
     each: &impl Fn(&rbw::db::Entry, &dyn EntryDecryptor) -> anyhow::Result<T>,
     items: Vec<rbw::protocol::DecryptItem>,
-    results: Vec<Result<String, String>>,
+    results: Vec<Result<String, rbw::protocol::DecryptError>>,
 ) -> anyhow::Result<Vec<T>> {
     if items.len() != results.len() {
         return Err(anyhow::anyhow!(
@@ -2868,7 +2914,7 @@ fn decrypt_folder_names(
         .zip(names)
         .map(|((id, _), name)| {
             name.map(|name| (id, name))
-                .map_err(|e| anyhow::anyhow!("failed to decrypt: {e}"))
+                .map_err(|e| e.into_error().context("failed to decrypt"))
         })
         .collect()
 }
@@ -3011,9 +3057,13 @@ fn decrypt_search_cipher(
         .as_ref()
         .map(|folder| decryptor.decrypt(folder, None, None))
         .transpose()?;
+    // an entry with master password reprompt keeps its notes and fields
+    // closed, so a search doesn't look in them
+    let open = !entry.master_password_reprompt();
     let notes = entry
         .notes
         .as_ref()
+        .filter(|_| open)
         .map(|notes| {
             decryptor.decrypt(
                 notes,
@@ -3041,6 +3091,7 @@ fn decrypt_search_cipher(
     let fields = entry
         .fields
         .iter()
+        .filter(|_| open)
         .filter_map(|field| {
             if field.ty == Some(rbw::api::FieldType::Hidden) {
                 None
@@ -3467,7 +3518,7 @@ fn parse_editor(contents: &str) -> (Option<String>, Option<String>) {
     (password, notes)
 }
 
-fn user_id(db: &rbw::db::Db) -> anyhow::Result<&str> {
+pub fn user_id(db: &rbw::db::Db) -> anyhow::Result<&str> {
     db.user_id.as_deref().with_context(|| {
         "user id is missing from the db, please run `rbw sync` first"
             .to_string()
@@ -3476,7 +3527,7 @@ fn user_id(db: &rbw::db::Db) -> anyhow::Result<&str> {
 
 // Switches to tokens that a request had to refresh, for the requests after
 // it. The library has already saved them.
-fn update_tokens(
+pub fn update_tokens(
     tokens: Option<rbw::actions::RefreshedTokens>,
     access_token: &mut String,
     refresh_token: &mut String,
@@ -3487,12 +3538,24 @@ fn update_tokens(
     }
 }
 
-fn load_db() -> anyhow::Result<rbw::db::Db> {
+pub fn load_db() -> anyhow::Result<rbw::db::Db> {
     let config = rbw::config::Config::load()?;
     config.email.as_ref().map_or_else(
         || Err(anyhow::anyhow!("failed to find email address in config")),
         |email| {
             rbw::db::Db::load(&config.server_name(), email)
+                .map_err(anyhow::Error::new)
+        },
+    )
+}
+
+// What the db says of the login, without reading its entries.
+pub fn load_db_meta() -> anyhow::Result<rbw::db::DbMeta> {
+    let config = rbw::config::Config::load()?;
+    config.email.as_ref().map_or_else(
+        || Err(anyhow::anyhow!("failed to find email address in config")),
+        |email| {
+            rbw::db::Db::load_meta(&config.server_name(), email)
                 .map_err(anyhow::Error::new)
         },
     )
@@ -3509,165 +3572,6 @@ fn remove_db() -> anyhow::Result<()> {
     )
 }
 
-struct TotpParams {
-    secret: Vec<u8>,
-    algorithm: String,
-    digits: u8,
-    period: u64,
-}
-
-fn decode_totp_secret(secret: &str) -> anyhow::Result<Vec<u8>> {
-    let secret = secret.trim().replace(' ', "");
-    let alphabets = [
-        base32::Alphabet::Rfc4648 { padding: false },
-        base32::Alphabet::Rfc4648 { padding: true },
-        base32::Alphabet::Rfc4648Lower { padding: false },
-        base32::Alphabet::Rfc4648Lower { padding: true },
-    ];
-    for alphabet in alphabets {
-        if let Some(secret) = base32::decode(alphabet, &secret) {
-            return Ok(secret);
-        }
-    }
-    Err(anyhow::anyhow!("totp secret was not valid base32"))
-}
-
-fn parse_totp_secret(secret: &str) -> anyhow::Result<TotpParams> {
-    if let Ok(u) = url::Url::parse(secret) {
-        match u.scheme() {
-            "otpauth" => {
-                if u.host_str() != Some("totp") {
-                    return Err(anyhow::anyhow!(
-                        "totp secret url must have totp host"
-                    ));
-                }
-
-                let query: std::collections::HashMap<_, _> =
-                    u.query_pairs().collect();
-
-                let secret = decode_totp_secret(
-                    query.get("secret").ok_or_else(|| {
-                        anyhow::anyhow!("totp secret url must have secret")
-                    })?,
-                )?;
-                let algorithm = query.get("algorithm").map_or_else(
-                    || String::from("SHA1"),
-                    std::string::ToString::to_string,
-                );
-                let digits = match query.get("digits") {
-                    Some(dig) => dig
-                        .parse::<usize>()
-                        .map_err(|_| anyhow::anyhow!("digits parameter in totp url must be a valid integer."))?,
-                    None => 6,
-                };
-                let period = match query.get("period") {
-                    Some(dig) => {
-                        dig.parse::<u64>().map_err(|_| anyhow::anyhow!("period parameter in totp url must be a valid integer."))?
-                    }
-                    None => TOTP_DEFAULT_STEP,
-                };
-                // a code is the HOTP value modulo 10^digits, which has to
-                // fit in 32 bits
-                let digits = u8::try_from(digits)
-                    .ok()
-                    .filter(|digits| (1..=9).contains(digits))
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "digits parameter in totp url must be between 1 \
-                             and 9"
-                        )
-                    })?;
-                if period == 0 {
-                    return Err(anyhow::anyhow!(
-                        "period parameter in totp url must be greater than 0"
-                    ));
-                }
-
-                Ok(TotpParams {
-                    secret,
-                    algorithm,
-                    digits,
-                    period,
-                })
-            }
-            "steam" => {
-                let steam_secret = u.host_str().ok_or_else(|| {
-                    anyhow::anyhow!("steam totp url must have a secret")
-                })?;
-
-                Ok(TotpParams {
-                    secret: decode_totp_secret(steam_secret)?,
-                    algorithm: String::from("STEAM"),
-                    digits: 5,
-                    period: TOTP_DEFAULT_STEP,
-                })
-            }
-            _ => Err(anyhow::anyhow!(
-                "totp secret url must have 'otpauth' or 'steam' scheme"
-            )),
-        }
-    } else {
-        Ok(TotpParams {
-            secret: decode_totp_secret(secret)?,
-            algorithm: String::from("SHA1"),
-            digits: 6,
-            period: TOTP_DEFAULT_STEP,
-        })
-    }
-}
-
-// This function exists for the sake of making the generate_totp function less
-// densely packed and more readable
-fn generate_totp_algorithm_type(
-    alg: &str,
-) -> anyhow::Result<totp_rs::Algorithm> {
-    match alg {
-        "SHA1" => Ok(totp_rs::Algorithm::SHA1),
-        "SHA256" => Ok(totp_rs::Algorithm::SHA256),
-        "SHA512" => Ok(totp_rs::Algorithm::SHA512),
-        "STEAM" => Ok(totp_rs::Algorithm::Steam),
-        _ => Err(anyhow::anyhow!(format!("{alg} is not a valid algorithm"))),
-    }
-}
-
-fn generate_totp(secret: &str) -> anyhow::Result<String> {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .context("the system clock is set before 1970")?
-        .as_secs();
-    generate_totp_at(parse_totp_secret(secret)?, now)
-}
-
-// The code for the given Unix time, in seconds.
-fn generate_totp_at(
-    totp_params: TotpParams,
-    time: u64,
-) -> anyhow::Result<String> {
-    let alg = totp_params.algorithm.as_str();
-
-    match alg {
-        "SHA1" | "SHA256" | "SHA512" => Ok(totp_rs::Builder::new()
-            .with_algorithm(generate_totp_algorithm_type(alg)?)
-            .with_digits(totp_params.digits)
-            .with_skew(1) // the library docs say this should be a 1
-            .with_step_duration(totp_params.period)
-            .with_secret(totp_params.secret)
-            .build_noncompliant()
-            .generate(time)
-            .to_string()),
-        // build() would refuse secrets shorter than 128 bits, which
-        // totp-rs 5 accepted
-        "STEAM" => Ok(totp_rs::Builder::new_steam()
-            .with_secret(totp_params.secret)
-            .build_noncompliant()
-            .generate(time)
-            .to_string()),
-        _ => Err(anyhow::anyhow!(format!(
-            "{alg} is not a valid totp algorithm"
-        ))),
-    }
-}
-
 fn display_field(name: &str, field: Option<&str>, clipboard: bool) -> bool {
     field.map_or_else(
         || false,
@@ -3678,6 +3582,26 @@ fn display_field(name: &str, field: Option<&str>, clipboard: bool) -> bool {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn the_agent_beside_rbw_is_found_through_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let install = dir.path().join("install");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&install).unwrap();
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(install.join("rbw"), "").unwrap();
+        std::os::unix::fs::symlink(install.join("rbw"), bin.join("rbw"))
+            .unwrap();
+        // an agent beside the link belongs to another install
+        std::fs::write(bin.join("rbw-agent"), "").unwrap();
+        assert_eq!(agent_beside(&bin.join("rbw")), None);
+
+        std::fs::write(install.join("rbw-agent"), "").unwrap();
+        let own = std::fs::canonicalize(&install).unwrap().join("rbw-agent");
+        assert_eq!(agent_beside(&bin.join("rbw")), Some(own.clone()));
+        assert_eq!(agent_beside(&install.join("rbw")), Some(own));
+    }
 
     #[test]
     fn test_uri_checksum() {
@@ -5084,203 +5008,6 @@ mod test {
         );
     }
 
-    #[test]
-    fn test_decode_totp_secret() {
-        let decoded = decode_totp_secret("NBSW Y3DP EB3W 64TM MQQQ").unwrap();
-        let want = b"hello world!".to_vec();
-        assert!(decoded == want, "strips spaces");
-    }
-
-    #[track_caller]
-    fn totp_at(secret: &str, time: u64) -> String {
-        generate_totp_at(parse_totp_secret(secret).unwrap(), time).unwrap()
-    }
-
-    // The test vectors of RFC 6238, appendix B: the ASCII secret
-    // "12345678901234567890" repeated to the hash's block size, 8 digits,
-    // 30 second steps.
-    const RFC6238_SHA1: &str = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ";
-    const RFC6238_SHA256: &str =
-        "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA";
-    const RFC6238_SHA512: &str =
-        "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ\
-         GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNA";
-    const RFC6238_VECTORS: &[(u64, &str, &str, &str)] = &[
-        (59, "94287082", "46119246", "90693936"),
-        (1_111_111_109, "07081804", "68084774", "25091201"),
-        (1_111_111_111, "14050471", "67062674", "99943326"),
-        (1_234_567_890, "89005924", "91819424", "93441116"),
-        (2_000_000_000, "69279037", "90698825", "38618901"),
-        (20_000_000_000, "65353130", "77737706", "47863826"),
-    ];
-
-    #[test]
-    fn test_totp_rfc6238_vectors() {
-        for &(time, sha1, sha256, sha512) in RFC6238_VECTORS {
-            let url = |alg: &str, secret: &str| {
-                format!(
-                    "otpauth://totp/rbw?secret={secret}&algorithm={alg}\
-                     &digits=8&period=30"
-                )
-            };
-            assert_eq!(totp_at(&url("SHA1", RFC6238_SHA1), time), sha1);
-            assert_eq!(totp_at(&url("SHA256", RFC6238_SHA256), time), sha256);
-            assert_eq!(totp_at(&url("SHA512", RFC6238_SHA512), time), sha512);
-        }
-    }
-
-    #[test]
-    fn test_totp_plain_secret_forms() {
-        // a bare secret means SHA1, 6 digits and 30 second steps, which
-        // are the last 6 digits of the 8 digit SHA1 vectors
-        for &(time, sha1, _, _) in RFC6238_VECTORS {
-            let want = &sha1[2..];
-            for secret in [
-                "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ",
-                "gezdgnbvgy3tqojqgezdgnbvgy3tqojq",
-                "GEZD GNBV GY3T QOJQ GEZD GNBV GY3T QOJQ",
-                "  gezd gnbv gy3t qojq gezd gnbv gy3t qojq\n",
-            ] {
-                assert_eq!(totp_at(secret, time), want, "{secret:?}");
-            }
-        }
-
-        // padded and unpadded base32
-        let time = 1_234_567_890;
-        let padded =
-            "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQGEZA====";
-        assert_eq!(totp_at(padded, time), "012961");
-        assert_eq!(totp_at(padded.trim_end_matches('='), time), "012961");
-        assert_eq!(
-            totp_at(&padded.to_lowercase(), time),
-            totp_at(padded, time)
-        );
-
-        // secrets shorter than the 128 bits RFC 4226 asks for still work
-        assert_eq!(totp_at("GAYTEMZUGU3DOOBZ", time), "625421");
-        // and so does an empty one
-        assert_eq!(totp_at("", time), "712049");
-    }
-
-    #[test]
-    fn test_totp_otpauth_parameters() {
-        let time = 1_234_567_890;
-        // defaults: SHA1, 6 digits, 30 seconds
-        assert_eq!(
-            totp_at(
-                &format!("otpauth://totp/rbw?secret={RFC6238_SHA1}"),
-                time
-            ),
-            "005924"
-        );
-        // lowercase secret, label with an issuer, other parameters
-        assert_eq!(
-            totp_at(
-                "otpauth://totp/Example:alice@example.com?\
-                 secret=gezdgnbvgy3tqojqgezdgnbvgy3tqojq&issuer=Example",
-                time
-            ),
-            "005924"
-        );
-        // 7 and 9 digits, 60 second steps
-        assert_eq!(
-            totp_at(
-                &format!(
-                    "otpauth://totp/rbw?secret={RFC6238_SHA256}\
-                     &algorithm=SHA256&digits=7&period=60"
-                ),
-                time
-            ),
-            "6450756"
-        );
-        assert_eq!(
-            totp_at(
-                &format!("otpauth://totp/rbw?secret={RFC6238_SHA1}&digits=9"),
-                time
-            ),
-            "689005924"
-        );
-        // a 60 second step is the 30 second code of half the time
-        assert_eq!(
-            totp_at(
-                &format!(
-                    "otpauth://totp/rbw?secret={RFC6238_SHA1}&digits=8\
-                     &period=60"
-                ),
-                118
-            ),
-            "94287082"
-        );
-        // spaces in the secret, encoded as + or %20
-        assert_eq!(
-            totp_at(
-                "otpauth://totp/rbw?secret=GEZD+GNBV%20GY3T+QOJQ\
-                 +GEZDGNBVGY3TQOJQ",
-                time
-            ),
-            "005924"
-        );
-    }
-
-    #[test]
-    fn test_totp_steam() {
-        // computed independently: the SHA1 HOTP value written in Steam's
-        // 26 character alphabet, 5 characters
-        let steam = [
-            (59, "PV9M4"),
-            (1_111_111_109, "PY4YB"),
-            (1_111_111_111, "5PP3V"),
-            (1_234_567_890, "VHHQY"),
-            (2_000_000_000, "9N776"),
-            (20_000_000_000, "R5DMB"),
-        ];
-        // a secret shorter than RFC 4226 asks for, as for the other
-        // algorithms
-        assert_eq!(totp_at("steam://GAYTEMZUGU3DOOBZ", 59), "CDH7P");
-        for (time, want) in steam {
-            assert_eq!(
-                totp_at(&format!("steam://{RFC6238_SHA1}"), time),
-                want
-            );
-            assert_eq!(
-                totp_at(
-                    &format!(
-                        "otpauth://totp/Steam:alice?secret={RFC6238_SHA1}\
-                         &algorithm=STEAM"
-                    ),
-                    time
-                ),
-                want
-            );
-        }
-    }
-
-    #[test]
-    fn test_totp_rejected_secrets() {
-        for secret in [
-            "not base32!",
-            "otpauth://hotp/rbw?secret=GEZDGNBV",
-            "otpauth://totp/rbw",
-            "otpauth://totp/rbw?secret=GEZDGNBV&digits=six",
-            "otpauth://totp/rbw?secret=GEZDGNBV&period=-30",
-            "otpauth://totp/rbw?secret=GEZDGNBV&algorithm=MD5",
-            "https://example.com/?secret=GEZDGNBV",
-            // these used to panic or give a code of the wrong length
-            "otpauth://totp/rbw?secret=GEZDGNBV&digits=0",
-            "otpauth://totp/rbw?secret=GEZDGNBV&digits=10",
-            "otpauth://totp/rbw?secret=GEZDGNBV&digits=300",
-            "otpauth://totp/rbw?secret=GEZDGNBV&period=0",
-            "steam:GEZDGNBV",
-        ] {
-            assert!(
-                parse_totp_secret(secret)
-                    .and_then(|params| generate_totp_at(params, 59))
-                    .is_err(),
-                "{secret:?}"
-            );
-        }
-    }
-
     #[track_caller]
     fn one_match(
         entries: &[(rbw::db::Entry, DecryptedSearchCipher)],
@@ -5406,6 +5133,10 @@ mod test {
             }],
             key: Some("entry key".to_string()),
             master_password_reprompt: rbw::api::CipherRepromptType::None,
+            revision_date: None,
+            favorite: false,
+            archived: false,
+            read_only: false,
         }
     }
 
@@ -5414,12 +5145,18 @@ mod test {
     fn fake_agent(
         items: &[rbw::protocol::DecryptItem],
         fail: impl Fn(&str) -> bool,
-    ) -> Vec<Result<String, String>> {
+    ) -> Vec<Result<String, rbw::protocol::DecryptError>> {
         items
             .iter()
             .map(|item| {
                 if fail(&item.cipherstring) {
-                    Err(format!("cannot decrypt {}", item.cipherstring))
+                    Err(rbw::protocol::DecryptError {
+                        error: format!(
+                            "cannot decrypt {}",
+                            item.cipherstring
+                        ),
+                        code: None,
+                    })
                 } else {
                     Ok(format!("plain {}", item.cipherstring))
                 }
@@ -5619,6 +5356,30 @@ mod test {
     }
 
     #[test]
+    fn searches_leave_the_closed_values_of_reprompt_entries_alone() {
+        let mut entry = make_full_entry("a");
+        entry.master_password_reprompt =
+            rbw::api::CipherRepromptType::Password;
+        let protected = entry.protected_values();
+        let asked = record_batch(
+            std::slice::from_ref(&entry),
+            &|entry, decryptor| decrypt_search_cipher(entry, decryptor),
+        );
+        assert!(asked
+            .iter()
+            .all(|item| !protected.contains(&item.cipherstring.as_str())));
+        let found = replay_with(
+            std::slice::from_ref(&entry),
+            |entry, decryptor| decrypt_search_cipher(entry, decryptor),
+            |c| protected.contains(&c),
+        )
+        .unwrap();
+        assert_eq!(found[0].name, "plain a name");
+        assert_eq!(found[0].notes, None);
+        assert_eq!(found[0].fields, Vec::<String>::new());
+    }
+
+    #[test]
     fn test_batch_decrypt_rejects_unrecorded_requests() {
         let entries = vec![make_full_entry("a")];
         let each = |entry: &rbw::db::Entry,
@@ -5702,6 +5463,10 @@ mod test {
                 history: vec![],
                 key: None,
                 master_password_reprompt: rbw::api::CipherRepromptType::None,
+                revision_date: None,
+                favorite: false,
+                archived: false,
+                read_only: false,
             },
             DecryptedSearchCipher {
                 id: id.to_string(),

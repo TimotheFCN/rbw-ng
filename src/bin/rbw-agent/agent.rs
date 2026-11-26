@@ -95,6 +95,7 @@ impl Agent {
                             if let Err(send_err) = sock
                                 .send(&rbw::protocol::Response::Error {
                                     error: format!("{e:#}"),
+                                    code: Some(rbw::error::code(&e)),
                                 })
                                 .await
                             {
@@ -138,7 +139,11 @@ async fn handle_request(
     let req = match req {
         Ok(msg) => msg,
         Err(error) => {
-            sock.send(&rbw::protocol::Response::Error { error }).await?;
+            sock.send(&rbw::protocol::Response::Error {
+                error,
+                code: Some(rbw::protocol::ErrorCode::InvalidInput),
+            })
+            .await?;
             return Ok(());
         }
     };
@@ -225,6 +230,75 @@ async fn handle_request(
                 .await?;
             true
         }
+        rbw::protocol::Action::LoginWith {
+            password,
+            code,
+            session,
+        } => {
+            crate::scripted::login_with(
+                sock,
+                state.clone(),
+                password,
+                code.as_ref(),
+                *session,
+            )
+            .await?;
+            true
+        }
+        rbw::protocol::Action::RegisterWith {
+            client_id,
+            client_secret,
+        } => {
+            crate::scripted::register_with(sock, client_id, client_secret)
+                .await?;
+            true
+        }
+        rbw::protocol::Action::UnlockWith { password, session } => {
+            crate::scripted::unlock_with(
+                sock,
+                state.clone(),
+                password,
+                *session,
+            )
+            .await?;
+            true
+        }
+        rbw::protocol::Action::UnlockSession { session } => {
+            crate::scripted::unlock_session(sock, state.clone(), session)
+                .await?;
+            true
+        }
+        rbw::protocol::Action::UnlockEntry { id, password } => {
+            crate::actions::unlock_entry(
+                sock,
+                state.clone(),
+                &environment,
+                id,
+                password.as_ref().map(|password| password.as_str()),
+            )
+            .await?;
+            true
+        }
+        rbw::protocol::Action::UnlockTouchId => {
+            crate::actions::unlock_touch_id(sock, state.clone()).await?;
+            true
+        }
+        rbw::protocol::Action::ReloadConfig => {
+            crate::actions::reload_config(sock, state.clone()).await?;
+            false
+        }
+        rbw::protocol::Action::ServeServiceSocket => {
+            crate::actions::serve_service_socket(sock, state.clone()).await?;
+            false
+        }
+        rbw::protocol::Action::Status => {
+            crate::actions::status(sock, state.clone()).await?;
+            false
+        }
+        rbw::protocol::Action::ForgetSession => {
+            crate::scripted::forget_session(sock).await?;
+            false
+        }
         rbw::protocol::Action::Quit => std::process::exit(0),
         rbw::protocol::Action::Version => {
             crate::actions::version(sock).await?;
@@ -233,10 +307,81 @@ async fn handle_request(
     };
 
     let mut state = state.lock().await;
-    state.set_last_environment(environment);
+    if keeps_environment(&action, &environment) {
+        state.set_last_environment(environment);
+    }
     if set_timeout {
         state.set_timeout();
     }
 
     Ok(())
+}
+
+// Whether the SSH agent may reuse a request's environment for its prompts
+// (see State::last_environment). A program that polls the agent without a
+// terminal or a display, such as a desktop app that runs rbw status every
+// few seconds with RBW_NONINTERACTIVE, must not replace the environment of
+// the last person who used rbw, or the SSH agent could no longer ask for
+// the master password or confirm a signature.
+fn keeps_environment(
+    action: &rbw::protocol::Action,
+    environment: &rbw::protocol::Environment,
+) -> bool {
+    !environment.is_noninteractive()
+        && !matches!(
+            action,
+            rbw::protocol::Action::Status
+                | rbw::protocol::Action::CheckLock
+                | rbw::protocol::Action::Version
+        )
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    fn environment(vars: &[(&str, &str)]) -> rbw::protocol::Environment {
+        rbw::protocol::Environment::new(
+            Some("/dev/pts/3".into()),
+            vars.iter()
+                .map(|(name, value)| ((*name).into(), (*value).into()))
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn polls_dont_replace_the_environment_of_ssh_prompts() {
+        let interactive = environment(&[("DISPLAY", ":0")]);
+        let program = environment(&[("RBW_NONINTERACTIVE", "1")]);
+
+        assert!(keeps_environment(
+            &rbw::protocol::Action::Unlock,
+            &interactive
+        ));
+        assert!(!keeps_environment(&rbw::protocol::Action::Unlock, &program));
+        for action in [
+            rbw::protocol::Action::Status,
+            rbw::protocol::Action::CheckLock,
+            rbw::protocol::Action::Version,
+        ] {
+            assert!(!keeps_environment(&action, &interactive));
+        }
+        assert!(keeps_environment(
+            &rbw::protocol::Action::Unlock,
+            &environment(&[("RBW_NONINTERACTIVE", "0")])
+        ));
+
+        // what the SSH agent prompts with stays the interactive one
+        let mut last = interactive.clone();
+        for (action, environment) in [
+            (rbw::protocol::Action::Status, program.clone()),
+            (rbw::protocol::Action::Sync, program),
+        ] {
+            if keeps_environment(&action, &environment) {
+                last = environment;
+            }
+        }
+        assert!(!last.is_noninteractive());
+        assert_eq!(last.tty(), interactive.tty());
+    }
 }

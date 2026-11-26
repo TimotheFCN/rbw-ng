@@ -138,6 +138,9 @@ fn spawn(
     environment: &crate::protocol::Environment,
     grab: bool,
 ) -> Result<tokio::process::Child> {
+    if environment.is_noninteractive() {
+        return Err(Error::InteractionRequired);
+    }
     let mut opts = tokio::process::Command::new(&pinentry.program);
     opts.stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())

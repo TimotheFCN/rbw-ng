@@ -1,5 +1,4 @@
 use anyhow::Context as _;
-use sha2::Digest as _;
 
 pub async fn register(
     sock: &mut crate::sock::Sock,
@@ -382,7 +381,7 @@ async fn login_with_code(
     unreachable!()
 }
 
-async fn login_success(
+pub async fn login_success(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     access_token: String,
     refresh_token: String,
@@ -476,71 +475,15 @@ async fn unlock_state(
         })?;
 
         #[cfg(target_os = "macos")]
+        if unlock_with_touch_id(
+            &state,
+            &db,
+            protected_key,
+            protected_private_key,
+        )
+        .await?
         {
-            let biometric_unlock = {
-                let state = state.lock().await;
-                if state.touch_id_unlock {
-                    state.biometric_unlock.clone()
-                } else {
-                    None
-                }
-            };
-            if let Some(biometric_unlock) = biometric_unlock {
-                if biometric_unlock.matches(protected_key) {
-                    let biometric_unlock_for_task = biometric_unlock.clone();
-                    let biometric_key =
-                        tokio::task::spawn_blocking(move || {
-                            biometric_unlock_for_task.unlock()
-                        })
-                        .await
-                        .context("failed to join Touch ID task")?;
-                    match biometric_key {
-                        Ok(key) => match rbw::actions::unlock_with_key(
-                            key,
-                            protected_private_key,
-                            &db.protected_org_keys,
-                        ) {
-                            Ok((keys, org_keys)) => {
-                                if set_biometric_unlocked(
-                                    state,
-                                    &biometric_unlock,
-                                    keys,
-                                    org_keys,
-                                )
-                                .await
-                                {
-                                    return Ok(());
-                                }
-                                return Err(anyhow::anyhow!(
-                                    "Touch ID session was revoked"
-                                ));
-                            }
-                            Err(error) => {
-                                log::warn!(
-                                    "failed to unlock with cached vault key: \
-                                    {error}"
-                                );
-                                state.lock().await.biometric_unlock = None;
-                            }
-                        },
-                        Err(crate::biometric::UnlockError::Canceled) => {
-                            return Err(anyhow::anyhow!(
-                                "Touch ID was canceled"
-                            ));
-                        }
-                        Err(
-                            crate::biometric::UnlockError::PasswordRequested,
-                        ) => {}
-                        Err(crate::biometric::UnlockError::Unavailable(
-                            error,
-                        )) => {
-                            log::warn!("Touch ID is unavailable: {error}");
-                        }
-                    }
-                } else {
-                    state.lock().await.biometric_unlock = None;
-                }
-            }
+            return Ok(());
         }
 
         let mut err_msg = None;
@@ -610,7 +553,222 @@ pub async fn unlock(
     Ok(())
 }
 
-async fn unlock_success(
+// Unlocks with Touch ID if it can: true once unlocked, false when only the
+// master password can unlock.
+#[cfg(target_os = "macos")]
+async fn unlock_with_touch_id(
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    db: &rbw::db::Db,
+    protected_key: &str,
+    protected_private_key: &str,
+) -> anyhow::Result<bool> {
+    let biometric_unlock = {
+        let state = state.lock().await;
+        if state.touch_id_unlock {
+            state.biometric_unlock.clone()
+        } else {
+            None
+        }
+    };
+    let Some(biometric_unlock) = biometric_unlock else {
+        return Ok(false);
+    };
+    if !biometric_unlock.matches(protected_key) {
+        state.lock().await.biometric_unlock = None;
+        return Ok(false);
+    }
+    let biometric_unlock_for_task = biometric_unlock.clone();
+    let biometric_key = tokio::task::spawn_blocking(move || {
+        biometric_unlock_for_task.unlock()
+    })
+    .await
+    .context("failed to join Touch ID task")?;
+    match biometric_key {
+        Ok(key) => match rbw::actions::unlock_with_key(
+            key,
+            protected_private_key,
+            &db.protected_org_keys,
+        ) {
+            Ok((keys, org_keys)) => {
+                if set_biometric_unlocked(
+                    state.clone(),
+                    &biometric_unlock,
+                    keys,
+                    org_keys,
+                )
+                .await
+                {
+                    Ok(true)
+                } else {
+                    Err(rbw::error::coded(
+                        rbw::protocol::ErrorCode::TouchIdUnavailable,
+                        "Touch ID session was revoked",
+                    ))
+                }
+            }
+            Err(error) => {
+                log::warn!("failed to unlock with cached vault key: {error}");
+                state.lock().await.biometric_unlock = None;
+                Ok(false)
+            }
+        },
+        Err(crate::biometric::UnlockError::Canceled) => {
+            Err(rbw::error::coded(
+                rbw::protocol::ErrorCode::TouchIdCanceled,
+                "Touch ID was canceled",
+            ))
+        }
+        Err(crate::biometric::UnlockError::PasswordRequested) => Ok(false),
+        Err(crate::biometric::UnlockError::Unavailable(error)) => {
+            log::warn!("Touch ID is unavailable: {error}");
+            Ok(false)
+        }
+    }
+}
+
+// Whether Touch ID can unlock the vault now: it is on, and the vault was
+// unlocked with the master password since the agent started.
+#[cfg(target_os = "macos")]
+async fn touch_id_ready(
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> bool {
+    let protected_key =
+        load_db_meta().await.ok().and_then(|db| db.protected_key);
+    let state = state.lock().await;
+    state.touch_id_unlock
+        && state
+            .biometric_unlock
+            .as_ref()
+            .zip(protected_key)
+            .is_some_and(|(session, key)| session.matches(&key))
+}
+
+// Unlocks with Touch ID only, never asking for the master password.
+pub async fn unlock_touch_id(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let unavailable = || {
+        rbw::error::coded(
+            rbw::protocol::ErrorCode::TouchIdUnavailable,
+            "Touch ID can't unlock the vault now; unlock with the master \
+             password first",
+        )
+    };
+    let unlock_lock = state.lock().await.unlock_lock.clone();
+    let _unlock_guard = unlock_lock.lock().await;
+    if state.lock().await.needs_unlock() {
+        #[cfg(target_os = "macos")]
+        {
+            let db = load_db().await?;
+            let (Some(protected_key), Some(protected_private_key)) = (
+                db.protected_key.as_deref(),
+                db.protected_private_key.as_deref(),
+            ) else {
+                return Err(rbw::error::coded(
+                    rbw::protocol::ErrorCode::NotLoggedIn,
+                    "not logged in",
+                ));
+            };
+            if !unlock_with_touch_id(
+                &state,
+                &db,
+                protected_key,
+                protected_private_key,
+            )
+            .await?
+            {
+                return Err(unavailable());
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        return Err(unavailable());
+    }
+    respond_ack(sock).await
+}
+
+pub async fn reload_config(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let config = rbw::config::Config::load_async().await?;
+    // the next request makes a client with the settings as they are now
+    rbw::api::forget_clients();
+    let mut state = state.lock().await;
+    state.timeout_duration =
+        std::time::Duration::from_secs(config.lock_timeout);
+    if !state.needs_unlock() {
+        state.set_timeout();
+    }
+    state.sync_timeout_duration =
+        std::time::Duration::from_secs(config.sync_interval);
+    if state.sync_timeout_duration > std::time::Duration::ZERO {
+        state.set_sync_timeout();
+    } else {
+        state.sync_timeout.clear();
+    }
+    state.ssh_confirm = config.confirms_ssh_signatures();
+    #[cfg(target_os = "macos")]
+    {
+        state.touch_id_unlock = config.touch_id_unlock;
+        if !config.touch_id_unlock {
+            state.biometric_unlock = None;
+        }
+    }
+    drop(state);
+    respond_ack(sock).await
+}
+
+// The socket stays until the agent exits: then the service, which rbw
+// loads, binds the path again.
+pub async fn serve_service_socket(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let mut locked = state.lock().await;
+    if !locked.serves_service_socket {
+        let path = rbw::dirs::service_ssh_agent_socket_file();
+        // one left by an agent that stopped; the service isn't loaded, or
+        // rbw wouldn't ask
+        if std::fs::symlink_metadata(&path).is_ok_and(|metadata| {
+            std::os::unix::fs::FileTypeExt::is_socket(&metadata.file_type())
+        }) {
+            std::fs::remove_file(&path).with_context(|| {
+                format!("failed to remove {}", path.display())
+            })?;
+        }
+        let listener =
+            tokio::net::UnixListener::bind(&path).with_context(|| {
+                format!("failed to listen on {}", path.display())
+            })?;
+        let agent = crate::ssh_agent::SshAgent::new(state.clone());
+        tokio::spawn(async move {
+            if let Err(e) =
+                ssh_agent_lib::agent::listen(listener, agent).await
+            {
+                log::warn!("the service's SSH socket stopped: {e}");
+            }
+        });
+        locked.serves_service_socket = true;
+    }
+    drop(locked);
+    respond_ack(sock).await
+}
+
+pub async fn status(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    let unlocked = !state.lock().await.needs_unlock();
+    #[cfg(target_os = "macos")]
+    let touch_id = !unlocked && touch_id_ready(&state).await;
+    #[cfg(not(target_os = "macos"))]
+    let touch_id = false;
+    sock.send(&rbw::protocol::Response::Status { unlocked, touch_id })
+        .await
+}
+
+pub async fn unlock_success(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
     keys: rbw::locked::Keys,
     org_keys: std::collections::HashMap<String, rbw::locked::Keys>,
@@ -656,7 +814,30 @@ async fn unlock_success(
     {
         state.biometric_unlock = biometric_unlock;
     }
+    let reprompt_mac = state.master_password_reprompt_mac();
+    drop(state);
+    if let Some(reprompt_mac) = reprompt_mac {
+        store_reprompt_mac(reprompt_mac).await;
+    }
     Ok(())
+}
+
+// After a sync while the vault was locked, which couldn't vouch for the
+// entries' reprompt flags. The MAC only spares a later agent a sync, so
+// failing to store it fails nothing.
+async fn store_reprompt_mac(reprompt_mac: String) {
+    let stored = async {
+        let mut db = load_db().await?;
+        if db.reprompt_mac.as_deref() != Some(reprompt_mac.as_str()) {
+            db.reprompt_mac = Some(reprompt_mac);
+            save_db(&db).await?;
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    if let Err(e) = stored {
+        log::warn!("failed to store the reprompt flags' MAC: {e:#}");
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -684,6 +865,8 @@ pub async fn lock(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
     state.lock().await.clear();
+    // like bw lock, which ends its sessions
+    crate::session::delete();
 
     respond_ack(sock).await?;
 
@@ -707,6 +890,23 @@ pub async fn sync(
     sock: Option<&mut crate::sock::Sock>,
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
 ) -> anyhow::Result<()> {
+    // a timer, a notification from the server and several programs can
+    // ask at once; one sync answers them all
+    let sync_flight = state.lock().await.sync_flight.clone();
+    // boxed: the request and the answer it parses are large, and every
+    // caller's future would carry them
+    sync_flight.run(Box::pin(sync_once(state))).await?;
+
+    if let Some(sock) = sock {
+        respond_ack(sock).await?;
+    }
+
+    Ok(())
+}
+
+async fn sync_once(
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
     let db = load_db().await?;
 
     let access_token = if let Some(access_token) = &db.access_token {
@@ -726,6 +926,7 @@ pub async fn sync(
             protected_private_key,
             protected_org_keys,
             entries,
+            folders,
             user_id,
         ),
     ) = rbw::actions::sync(&access_token, &refresh_token)
@@ -740,7 +941,11 @@ pub async fn sync(
         .protected_key
         .as_deref()
         .is_some_and(|old_protected_key| old_protected_key != protected_key);
-    state.lock().await.set_master_password_reprompt(&entries);
+    let reprompt_mac = {
+        let mut state = state.lock().await;
+        state.set_master_password_reprompt(&entries);
+        state.master_password_reprompt_mac()
+    };
     if let Some(tokens) = tokens {
         tokens.store_in(&mut db);
     }
@@ -749,6 +954,14 @@ pub async fn sync(
     db.protected_org_keys = protected_org_keys;
     db.user_id = Some(user_id);
     db.entries = entries;
+    db.folders = folders;
+    // a locked vault can't vouch for the new flags; the old MAC still does
+    // if they didn't change, as it is checked against the entries
+    if let Some(reprompt_mac) = reprompt_mac {
+        db.reprompt_mac = Some(reprompt_mac);
+    }
+    db.last_sync =
+        Some(rbw::api::format_rfc3339(std::time::SystemTime::now()));
     save_db(&db).await?;
     #[cfg(target_os = "macos")]
     if protected_key_changed {
@@ -759,12 +972,12 @@ pub async fn sync(
         state.lock().await.biometric_unlock = None;
     }
 
-    if let Err(e) = subscribe_to_notifications(state.clone()).await {
-        eprintln!("failed to subscribe to notifications: {e}");
-    }
-
-    if let Some(sock) = sock {
-        respond_ack(sock).await?;
+    if let Some(access_token) = db.access_token {
+        if let Err(e) =
+            subscribe_to_notifications(state.clone(), access_token).await
+        {
+            eprintln!("failed to subscribe to notifications: {e}");
+        }
     }
 
     Ok(())
@@ -776,125 +989,299 @@ async fn decrypt_cipher(
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
-) -> anyhow::Result<String> {
-    decrypt_cipher_in_request(
-        state,
+) -> anyhow::Result<rbw::protocol::Secret> {
+    learn_master_password_reprompt(&state).await?;
+    let mut state = state.lock().await;
+    decrypt_in_request(
+        &mut state,
         environment,
         cipherstring,
         entry_key,
         org_id,
-        &mut false,
+        &mut DecryptRequest::default(),
     )
     .await
 }
 
-// Decrypts one cipherstring as part of a request that may decrypt several.
-// If the user cancels or fails a master password reprompt, the request sets
-// reprompt_declined, and the remaining reprompt-protected values in the same
-// request fail without asking again. Values are never decrypted without a
-// successful prompt of their own.
-async fn decrypt_cipher_in_request(
-    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+// What a request that decrypts several values keeps from one to the next.
+#[derive(Default)]
+struct DecryptRequest<'a> {
+    // If the user cancels or fails a master password reprompt, the remaining
+    // reprompt-protected values in the same request fail without asking
+    // again.
+    reprompt_declined: bool,
+    // whether pinentry asked for the master password, which can take
+    // minutes, since the request last checked the lock timeout
+    prompted: bool,
+    // the individual keys of the entries, by organization and encrypted
+    // key, so that an entry's values don't each decrypt it again
+    entry_keys: std::collections::HashMap<
+        (Option<&'a str>, &'a str),
+        rbw::locked::Keys,
+    >,
+}
+
+// Decrypts one cipherstring as part of a request that may decrypt several,
+// with the state locked. A password given to a master password reprompt
+// that checks out opens the entry, as rbw item unlock does.
+async fn decrypt_in_request<'a>(
+    state: &mut crate::state::State,
     environment: &rbw::protocol::Environment,
     cipherstring: &str,
-    entry_key: Option<&str>,
-    org_id: Option<&str>,
-    reprompt_declined: &mut bool,
-) -> anyhow::Result<String> {
-    let mut state = state.lock().await;
-    if !state.master_password_reprompt_initialized() {
-        let db = load_db().await?;
-        state.set_master_password_reprompt(&db.entries);
+    entry_key: Option<&'a str>,
+    org_id: Option<&'a str>,
+    request: &mut DecryptRequest<'a>,
+) -> anyhow::Result<rbw::protocol::Secret> {
+    let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
+        .context("failed to parse encrypted secret")?;
+
+    if state.needs_unlock() {
+        return Err(anyhow::anyhow!(
+            "failed to find decryption keys in in-memory state"
+        ));
     }
+    let Some(protected) = &state.master_password_reprompt else {
+        return Err(anyhow::anyhow!(
+            "the agent doesn't know yet which entries ask for the master \
+             password again; try again"
+        ));
+    };
+    // most vaults have no entry with reprompt, which spares the hash
+    let entry_id = if protected.is_empty() {
+        None
+    } else {
+        protected.get(&cipherstring.fingerprint()).cloned()
+    };
+    if let Some(entry_id) = entry_id {
+        if !state.use_unlocked_entry(&entry_id) {
+            if environment.is_noninteractive() {
+                return Err(rbw::error::coded(
+                    rbw::protocol::ErrorCode::RepromptRequired,
+                    format!(
+                        "the entry {entry_id} asks for the master password \
+                         again; open it with rbw item unlock"
+                    ),
+                ));
+            }
+            if request.reprompt_declined {
+                return Err(anyhow::anyhow!(
+                    "master password reprompt was declined earlier in this \
+                     request"
+                ));
+            }
+            // other requests wait for the state until pinentry is answered
+            request.prompted = true;
+            let account = PasswordCheck::load(state).await?;
+            if let Err(e) =
+                confirm_master_password(environment, &account).await
+            {
+                request.reprompt_declined = true;
+                return Err(e);
+            }
+            state.unlock_entry(&entry_id);
+        }
+    }
+
     let Some(keys) = state.key(org_id) else {
         return Err(anyhow::anyhow!(
             "failed to find decryption keys in in-memory state"
         ));
     };
     let entry_key = if let Some(entry_key) = entry_key {
-        let key_cipherstring =
-            rbw::cipherstring::CipherString::new(entry_key)
-                .context("failed to parse individual item encryption key")?;
-        Some(rbw::locked::Keys::new(
-            key_cipherstring.decrypt_locked_symmetric(keys).context(
-                "failed to decrypt individual item encryption key",
-            )?,
-        ))
+        if let std::collections::hash_map::Entry::Vacant(vacant) =
+            request.entry_keys.entry((org_id, entry_key))
+        {
+            let key_cipherstring = rbw::cipherstring::CipherString::new(
+                entry_key,
+            )
+            .context("failed to parse individual item encryption key")?;
+            vacant.insert(rbw::locked::Keys::new(
+                key_cipherstring.decrypt_locked_symmetric(keys).context(
+                    "failed to decrypt individual item encryption key",
+                )?,
+            ));
+        }
+        request.entry_keys.get(&(org_id, entry_key))
     } else {
         None
     };
 
-    let mut sha256 = sha2::Sha256::new();
-    sha256.update(cipherstring);
-    let master_password_reprompt: [u8; 32] = sha256.finalize().into();
-    if state
-        .master_password_reprompt
-        .contains(&master_password_reprompt)
-    {
-        if *reprompt_declined {
-            return Err(anyhow::anyhow!(
-                "master password reprompt was declined earlier in this request"
-            ));
-        }
-        if let Err(e) = confirm_master_password(environment).await {
-            *reprompt_declined = true;
-            return Err(e);
-        }
-    }
-
-    let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
-        .context("failed to parse encrypted secret")?;
     let plaintext = String::from_utf8(
         cipherstring
-            .decrypt_symmetric(keys, entry_key.as_ref())
+            .decrypt_symmetric(keys, entry_key)
             .context("failed to decrypt encrypted secret")?,
     )
-    .context("failed to parse decrypted secret")?;
+    .map_err(|e| {
+        // the bytes are the secret, even if they aren't text
+        zeroize::Zeroize::zeroize(&mut e.into_bytes());
+        anyhow::anyhow!("failed to parse decrypted secret")
+    })?;
 
-    Ok(plaintext)
+    Ok(rbw::protocol::Secret::new(plaintext))
 }
 
-// Asks for the master password before revealing a value from an entry with
-// master password reprompt enabled. The caller holds the state lock for the
-// whole prompt, so other requests wait until it is answered.
+// Before the agent decrypts anything, it learns which values need the
+// master password again (see reprompt.rs): from the local copy of the vault
+// if it carries the agent's MAC, or else from a sync.
+async fn learn_master_password_reprompt(
+    state: &std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+) -> anyhow::Result<()> {
+    {
+        let mut state = state.lock().await;
+        if state.master_password_reprompt.is_some() || state.needs_unlock() {
+            return Ok(());
+        }
+        state.trust_master_password_reprompt(&load_db().await?);
+        if state.master_password_reprompt.is_some() {
+            return Ok(());
+        }
+    }
+    sync(None, state.clone()).await.context(
+        "failed to sync, which tells the agent which entries ask for the \
+         master password again",
+    )
+}
+
+// Checks a master password against the vault this agent has unlocked.
+struct PasswordCheck {
+    email: String,
+    kdf: rbw::api::KdfType,
+    iterations: u32,
+    memory: Option<u32>,
+    parallelism: Option<u32>,
+    protected_key: String,
+    vault_key: rbw::locked::Keys,
+}
+
+impl PasswordCheck {
+    async fn load(state: &crate::state::State) -> anyhow::Result<Self> {
+        let Some(vault_key) = state.priv_key.clone() else {
+            return Err(rbw::error::coded(
+                rbw::protocol::ErrorCode::Locked,
+                "the vault is locked",
+            ));
+        };
+        let db = load_db().await?;
+        let Some(kdf) = db.kdf else {
+            return Err(anyhow::anyhow!("failed to find kdf type in db"));
+        };
+        let Some(iterations) = db.iterations else {
+            return Err(anyhow::anyhow!(
+                "failed to find number of iterations in db"
+            ));
+        };
+        let Some(protected_key) = db.protected_key else {
+            return Err(anyhow::anyhow!(
+                "failed to find protected key in db"
+            ));
+        };
+        let email = config_email().await?;
+        Ok(Self {
+            email,
+            kdf,
+            iterations,
+            memory: db.memory,
+            parallelism: db.parallelism,
+            protected_key,
+            vault_key,
+        })
+    }
+
+    // The local copy of the vault, where the key derivation's settings and
+    // the protected key come from, is a file another program could replace
+    // with ones its own password opens. So the password must yield the key
+    // of the vault that is unlocked.
+    async fn check(
+        &self,
+        password: &rbw::locked::Password,
+    ) -> anyhow::Result<()> {
+        let email = self.email.clone();
+        let password = password.clone();
+        let (kdf, iterations, memory, parallelism) =
+            (self.kdf, self.iterations, self.memory, self.parallelism);
+        let protected_key = self.protected_key.clone();
+        // the key derivation takes a moment, so keep it off the event loop
+        let vault_key = tokio::task::spawn_blocking(move || {
+            rbw::actions::vault_key(
+                &email,
+                &password,
+                kdf,
+                iterations,
+                memory,
+                parallelism,
+                &protected_key,
+            )
+        })
+        .await
+        .context("the password check stopped")?;
+        let incorrect = || {
+            rbw::error::coded(
+                rbw::protocol::ErrorCode::IncorrectPassword,
+                "incorrect master password",
+            )
+        };
+        match vault_key {
+            Ok(vault_key) if same_key(&vault_key, &self.vault_key) => Ok(()),
+            Ok(_) | Err(rbw::error::Error::IncorrectPassword { .. }) => {
+                Err(incorrect())
+            }
+            Err(e) => Err(e).context("failed to check the password"),
+        }
+    }
+}
+
+// In constant time, as the other key can be one another program chose.
+fn same_key(a: &rbw::locked::Keys, b: &rbw::locked::Keys) -> bool {
+    a.as_bytes()
+        .iter()
+        .zip(b.as_bytes())
+        .fold(0, |differ, (a, b)| differ | (a ^ b))
+        == 0
+}
+
+// Opens an entry with master password reprompt for a while, once the master
+// password checks out: the one given, or else the one pinentry asks for.
+// The state isn't locked meanwhile, so that other requests go on.
+pub async fn unlock_entry(
+    sock: &mut crate::sock::Sock,
+    state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    environment: &rbw::protocol::Environment,
+    id: &str,
+    password: Option<&str>,
+) -> anyhow::Result<()> {
+    let account = PasswordCheck::load(&*state.lock().await).await?;
+    match password {
+        Some(password) => {
+            let mut bytes = rbw::locked::Vec::new();
+            bytes.extend(password.as_bytes().iter().copied());
+            account.check(&rbw::locked::Password::new(bytes)).await?;
+        }
+        None => confirm_master_password(environment, &account).await?,
+    }
+    let mut state = state.lock().await;
+    // locking meanwhile closes every entry
+    if state
+        .priv_key
+        .as_ref()
+        .is_none_or(|key| !same_key(key, &account.vault_key))
+    {
+        return Err(rbw::error::coded(
+            rbw::protocol::ErrorCode::Locked,
+            "the vault is locked",
+        ));
+    }
+    state.unlock_entry(id);
+    drop(state);
+    respond_ack(sock).await
+}
+
+// Asks pinentry for the master password, three times at most.
 async fn confirm_master_password(
     environment: &rbw::protocol::Environment,
+    account: &PasswordCheck,
 ) -> anyhow::Result<()> {
-    let db = load_db().await?;
-
-    let Some(kdf) = db.kdf else {
-        return Err(anyhow::anyhow!("failed to find kdf type in db"));
-    };
-
-    let Some(iterations) = db.iterations else {
-        return Err(anyhow::anyhow!(
-            "failed to find number of iterations in db"
-        ));
-    };
-
-    let memory = db.memory;
-    let parallelism = db.parallelism;
-
-    let Some(protected_key) = db.protected_key else {
-        return Err(anyhow::anyhow!("failed to find protected key in db"));
-    };
-    let Some(protected_private_key) = db.protected_private_key else {
-        return Err(anyhow::anyhow!(
-            "failed to find protected private key in db"
-        ));
-    };
-
-    let email = config_email().await?;
-
-    let mut err_msg = None;
+    let mut err = None;
     for i in 1_u8..=3 {
-        let err = if i > 1 {
-            // this unwrap is safe because we only ever continue the loop
-            // if we have set err_msg
-            Some(format!("{} (attempt {}/3)", err_msg.unwrap(), i))
-        } else {
-            None
-        };
         let password = rbw::pinentry::getpin(
             &config_pinentry().await?,
             "Master Password",
@@ -905,33 +1292,19 @@ async fn confirm_master_password(
         )
         .await
         .context("failed to read password from pinentry")?;
-        match rbw::actions::unlock(
-            &email,
-            &password,
-            kdf,
-            iterations,
-            memory,
-            parallelism,
-            &protected_key,
-            &protected_private_key,
-            &db.protected_org_keys,
-        ) {
-            Ok(_) => {
-                break;
+        match account.check(&password).await {
+            Ok(()) => return Ok(()),
+            Err(e)
+                if i < 3
+                    && rbw::error::code(&e)
+                        == rbw::protocol::ErrorCode::IncorrectPassword =>
+            {
+                err = Some(format!("{e} (attempt {}/3)", i + 1));
             }
-            Err(rbw::error::Error::IncorrectPassword { message }) => {
-                if i == 3 {
-                    return Err(rbw::error::Error::IncorrectPassword {
-                        message,
-                    })
-                    .context("failed to unlock database");
-                }
-                err_msg = Some(message);
-            }
-            Err(e) => return Err(e).context("failed to unlock database"),
+            Err(e) => return Err(e),
         }
     }
-    Ok(())
+    unreachable!()
 }
 
 pub async fn decrypt(
@@ -956,26 +1329,47 @@ pub async fn decrypt_many(
     environment: &rbw::protocol::Environment,
     items: &[rbw::protocol::DecryptItem],
 ) -> anyhow::Result<()> {
+    let to_error = |e: &anyhow::Error| rbw::protocol::DecryptError {
+        error: format!("{e:#}"),
+        code: Some(rbw::error::code(e)),
+    };
+    // once for the whole request; a failure fails each value
+    let learned = learn_master_password_reprompt(&state)
+        .await
+        .map_err(|e| to_error(&e));
+    // the state stays locked for the whole request, as it does while
+    // pinentry asks for the master password
+    let mut state = state.lock().await;
+    let mut request = DecryptRequest::default();
     let mut plaintexts = Vec::with_capacity(items.len());
-    let mut reprompt_declined = false;
     for item in items {
-        // handle_request checked the lock deadline before the batch, but a
-        // reprompt can keep it running for minutes (or across a sleep), so
-        // check again before each value, as separate requests would
-        state.lock().await.lock_if_expired();
+        if let Err(error) = &learned {
+            plaintexts.push(Err(error.clone()));
+            continue;
+        }
+        // handle_request checked the lock deadline before the request, but
+        // a reprompt can keep it running for minutes (or across a sleep), so
+        // check again after one, as separate requests would
+        if std::mem::take(&mut request.prompted) {
+            state.lock_if_expired();
+            if state.needs_unlock() {
+                request.entry_keys.clear();
+            }
+        }
         plaintexts.push(
-            decrypt_cipher_in_request(
-                state.clone(),
+            decrypt_in_request(
+                &mut state,
                 environment,
                 &item.cipherstring,
                 item.entry_key.as_deref(),
                 item.org_id.as_deref(),
-                &mut reprompt_declined,
+                &mut request,
             )
             .await
-            .map_err(|e| format!("{e:#}")),
+            .map_err(|e| to_error(&e)),
         );
     }
+    drop(state);
     sock.send(&rbw::protocol::Response::DecryptMany { plaintexts })
         .await?;
 
@@ -1044,6 +1438,7 @@ pub async fn clipboard_store(
 ) -> anyhow::Result<()> {
     sock.send(&rbw::protocol::Response::Error {
         error: "clipboard not supported".to_string(),
+        code: Some(rbw::protocol::ErrorCode::Unsupported),
     })
     .await?;
 
@@ -1067,7 +1462,7 @@ async fn respond_ack(sock: &mut crate::sock::Sock) -> anyhow::Result<()> {
 
 async fn respond_decrypt(
     sock: &mut crate::sock::Sock,
-    plaintext: String,
+    plaintext: rbw::protocol::Secret,
 ) -> anyhow::Result<()> {
     sock.send(&rbw::protocol::Response::Decrypt { plaintext })
         .await?;
@@ -1085,7 +1480,7 @@ async fn respond_encrypt(
     Ok(())
 }
 
-async fn config_email() -> anyhow::Result<String> {
+pub async fn config_email() -> anyhow::Result<String> {
     let config = rbw::config::Config::load_async().await?;
     config.email.map_or_else(
         || Err(anyhow::anyhow!("failed to find email address in config")),
@@ -1093,7 +1488,7 @@ async fn config_email() -> anyhow::Result<String> {
     )
 }
 
-async fn load_db() -> anyhow::Result<rbw::db::Db> {
+pub async fn load_db() -> anyhow::Result<rbw::db::Db> {
     let config = rbw::config::Config::load_async().await?;
     if let Some(email) = &config.email {
         rbw::db::Db::load_async(&config.server_name(), email)
@@ -1102,6 +1497,18 @@ async fn load_db() -> anyhow::Result<rbw::db::Db> {
     } else {
         Err(anyhow::anyhow!("failed to find email address in config"))
     }
+}
+
+// What the db says of the login, without its entries (see DbMeta).
+#[cfg(target_os = "macos")]
+async fn load_db_meta() -> anyhow::Result<rbw::db::DbMeta> {
+    let config = rbw::config::Config::load_async().await?;
+    let email = config.email.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("failed to find email address in config")
+    })?;
+    rbw::db::Db::load_meta_async(&config.server_name(), email)
+        .await
+        .map_err(anyhow::Error::new)
 }
 
 async fn save_db(db: &rbw::db::Db) -> anyhow::Result<()> {
@@ -1128,8 +1535,11 @@ pub async fn config_pinentry() -> anyhow::Result<rbw::pinentry::Pinentry> {
     })
 }
 
+// With the access token that the sync just used, rather than reading the
+// db again.
 pub async fn subscribe_to_notifications(
     state: std::sync::Arc<tokio::sync::Mutex<crate::state::State>>,
+    access_token: String,
 ) -> anyhow::Result<()> {
     if state.lock().await.notifications_handler.is_connected() {
         return Ok(());
@@ -1138,18 +1548,11 @@ pub async fn subscribe_to_notifications(
     let config = rbw::config::Config::load_async()
         .await
         .context("Config is missing")?;
-    let email = config.email.clone().context("Config is missing email")?;
-    let db = rbw::db::Db::load_async(config.server_name().as_str(), &email)
-        .await?;
-    let access_token =
-        db.access_token.context("Error getting access token")?;
 
-    let websocket_url = format!(
-        "{}/hub?access_token={}",
-        config.notifications_url(),
-        access_token
-    )
-    .replace("https://", "wss://");
+    let websocket_url = crate::notifications::websocket_url(
+        &config.notifications_url(),
+        &access_token,
+    );
 
     let extra_headers = config.extra_headers()?;
 
@@ -1158,8 +1561,12 @@ pub async fn subscribe_to_notifications(
         .notifications_handler
         .connect(websocket_url, extra_headers)
         .await
-        .err()
-        .map_or_else(|| Ok(()), |err| Err(anyhow::anyhow!(err.to_string())))
+        .map_err(|err| {
+            anyhow::anyhow!(crate::notifications::redact(
+                &err.to_string(),
+                &access_token
+            ))
+        })
 }
 
 pub async fn get_ssh_public_keys(
@@ -1184,6 +1591,10 @@ pub async fn get_ssh_public_keys(
         else {
             continue;
         };
+        // archived entries stay out of use, as in the official clients
+        if entry.archived {
+            continue;
+        }
         // one broken entry should not hide every other key
         let plaintext = match decrypt_cipher(
             state.clone(),
@@ -1228,6 +1639,7 @@ pub async fn get_ssh_public_keys(
                 entry.org_id.as_deref(),
             )
             .await
+            .map(|name| name.to_string())
             .unwrap_or_default()
         } else {
             public_key.comment().to_string()
@@ -1267,14 +1679,30 @@ pub async fn find_ssh_private_key(
             let Some(public_key_enc) = public_key else {
                 continue;
             };
-            let public_key_plaintext = decrypt_cipher(
+            if entry.archived {
+                continue;
+            }
+            // one broken entry, for example of an organization whose key is
+            // missing, should not stop the search for the requested key
+            let public_key_plaintext = match decrypt_cipher(
                 state.clone(),
                 &environment,
                 public_key_enc,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),
             )
-            .await?;
+            .await
+            {
+                Ok(plaintext) => plaintext,
+                Err(e) => {
+                    log::warn!(
+                        "skipping entry {} whose SSH public key can't be \
+                         decrypted: {e:#}",
+                        entry.id
+                    );
+                    continue;
+                }
+            };
             // a malformed entry cannot be the requested key, and should not
             // stop the search for it
             let Ok(public_key) =
@@ -1302,7 +1730,7 @@ pub async fn find_ssh_private_key(
 
                 let private_key =
                     ssh_agent_lib::ssh_key::PrivateKey::from_openssh(
-                        private_key_plaintext,
+                        private_key_plaintext.as_str(),
                     )
                     .map_err(anyhow::Error::new)?;
                 let name = decrypt_cipher(
@@ -1313,7 +1741,7 @@ pub async fn find_ssh_private_key(
                     entry.org_id.as_deref(),
                 )
                 .await?;
-                return Ok((name, private_key));
+                return Ok((name.to_string(), private_key));
             }
         }
     }

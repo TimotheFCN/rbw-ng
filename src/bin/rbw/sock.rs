@@ -8,9 +8,12 @@ impl Sock {
     // not returning anyhow::Result here because we want to be able to handle
     // specific kinds of std::io::Results differently
     pub fn connect() -> std::io::Result<Self> {
-        Ok(Self(std::os::unix::net::UnixStream::connect(
-            rbw::dirs::socket_file(),
-        )?))
+        Self::connect_to(&rbw::dirs::socket_file())
+    }
+
+    // The agent of another profile.
+    pub fn connect_to(socket: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self(std::os::unix::net::UnixStream::connect(socket)?))
     }
 
     pub fn send(
@@ -18,12 +21,13 @@ impl Sock {
         msg: &rbw::protocol::Request,
     ) -> anyhow::Result<()> {
         let Self(sock) = self;
-        sock.write_all(
-            serde_json::to_string(msg)
-                .context("failed to serialize message to agent")?
-                .as_bytes(),
-        )
-        .context("failed to send message to agent")?;
+        // requests carry master passwords and secrets
+        let json = zeroize::Zeroizing::new(
+            serde_json::to_vec(msg)
+                .context("failed to serialize message to agent")?,
+        );
+        sock.write_all(&json)
+            .context("failed to send message to agent")?;
         sock.write_all(b"\n")
             .context("failed to send message to agent")?;
         Ok(())
@@ -32,7 +36,7 @@ impl Sock {
     pub fn recv(&mut self) -> anyhow::Result<rbw::protocol::Response> {
         let Self(sock) = self;
         let mut buf = std::io::BufReader::new(sock);
-        let mut line = String::new();
+        let mut line = zeroize::Zeroizing::new(String::new());
         buf.read_line(&mut line)
             .context("failed to read message from agent")?;
         serde_json::from_str(&line)
