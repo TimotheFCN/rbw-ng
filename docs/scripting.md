@@ -68,7 +68,10 @@ contain `/`.
 
 `rbw profiles --json` lists the profiles on this computer, as
 `[{"profile":"work","userEmail":"you@example.com","serverUrl":null}]`, with a
-`null` profile for the default one. `rbw purge --all` removes the profile
+`null` profile for the default one. With `--status`, each profile also has
+`status`, `lastSync` and `touchId`, as `rbw status --json` says them (see
+[Status](#status)), so that one command polls every account; it starts no
+agent, and a profile whose agent doesn't run is `locked`. `rbw purge --all` removes the profile
 `RBW_PROFILE` selects: its local vault, its configuration, every other file
 it keeps and its SSH agent service.
 
@@ -189,7 +192,9 @@ never by name.
 | --- | --- |
 | `rbw item list` | every entry, without secrets |
 | `rbw item list --secrets` | every entry, with passwords, codes' secrets, notes, custom fields and password history |
+| `rbw item list --type login\|note\|card\|identity\|ssh-key` | the entries of one type only, with or without `--secrets` |
 | `rbw item get ID` | one entry, with its secrets |
+| `rbw item get ID --with-code` | the same, with a login's current code in `totpCode`, as `rbw item code` prints it |
 | `rbw item get ID --field username\|password\|totp\|notes` | one value; for `totp`, the current code |
 | `rbw item code ID` | the current code as `{"code":"123456","period":30,"expiresAt":1795000000}`, with `expiresAt` in Unix seconds |
 | `rbw item unlock ID [--password-stdin]` | opens an entry that asks for the master password again (see below) |
@@ -216,8 +221,13 @@ partial update: they don't decrypt or send the entry's secrets, and they work
 on entries in read-only collections too. An unknown folder fails with
 `not_found`.
 
-Archived entries are left out of `rbw item list`. An unknown id, or a field
-the entry doesn't have, fails with `not_found`.
+Archived entries are left out of `rbw item list`. `--type` decrypts only the
+entries of that type, which is faster than filtering the whole list. An
+unknown id, or a field the entry doesn't have, fails with `not_found`.
+
+`--with-code` spares a program that shows a login with its code a second
+command. A login without a TOTP secret, or with one that isn't a valid secret,
+gets no `totpCode`, and `get` still prints it.
 
 `create` and `edit` take JSON or base64 JSON (what `bw encode` makes) on stdin.
 They print the entry as the server saved it, without secrets. They save:
@@ -242,7 +252,9 @@ the entry on stdin, as `rbw item get` printed it, the edit fails with
 fails if the entry changed since the last sync.
 
 Entries shared through an organization are read, edited and deleted like the
-others; an edit keeps the entry's `organizationId`. These aren't supported
+others; an edit keeps the entry's `organizationId`, also when the item on stdin
+leaves the key out. An `organizationId` that is there, `null` included, must be
+the entry's. These aren't supported
 yet:
 
 * creating an entry in an organization, or moving one into or out of it;

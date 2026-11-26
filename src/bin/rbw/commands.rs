@@ -2553,9 +2553,13 @@ struct Profile {
     user_email: Option<String>,
     // null for bitwarden.com
     server_url: Option<String>,
+    // with --status: status, lastSync and touchId, as rbw status --json
+    // says them
+    #[serde(flatten)]
+    status: Option<crate::scripting::VaultStatus>,
 }
 
-pub fn profiles(json: bool) -> anyhow::Result<()> {
+pub fn profiles(json: bool, status: bool) -> anyhow::Result<()> {
     let profiles: Vec<_> = rbw::dirs::profiles()
         .into_iter()
         .map(|(profile, file)| {
@@ -2563,10 +2567,14 @@ pub fn profiles(json: bool) -> anyhow::Result<()> {
                 .ok()
                 .and_then(|json| serde_json::from_str(&json).ok())
                 .unwrap_or_default();
+            let status = status.then(|| {
+                crate::scripting::profile_status(profile.as_deref(), &config)
+            });
             Profile {
                 profile,
                 user_email: config.email,
                 server_url: config.base_url,
+                status,
             }
         })
         .collect();

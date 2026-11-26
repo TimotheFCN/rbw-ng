@@ -8,9 +8,12 @@ impl Sock {
     // not returning anyhow::Result here because we want to be able to handle
     // specific kinds of std::io::Results differently
     pub fn connect() -> std::io::Result<Self> {
-        Ok(Self(std::os::unix::net::UnixStream::connect(
-            rbw::dirs::socket_file(),
-        )?))
+        Self::connect_to(&rbw::dirs::socket_file())
+    }
+
+    // The agent of another profile.
+    pub fn connect_to(socket: &std::path::Path) -> std::io::Result<Self> {
+        Ok(Self(std::os::unix::net::UnixStream::connect(socket)?))
     }
 
     pub fn send(

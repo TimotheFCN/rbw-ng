@@ -52,6 +52,11 @@ service.
     it without them.
   * `rbw item code` prints a login's current code with its period and when
     it expires, so a program can count it down.
+  * `rbw item get --with-code` adds that code to the item as `totpCode`, and
+    `rbw item list --type` lists, and decrypts, the entries of one type
+    only.
+  * `rbw item edit` keeps the entry's organization when the item on stdin
+    has no `organizationId`.
   * `RBW_ERROR_FORMAT=json` prints errors as JSON with a stable code, such
     as `locked` or `two_step_required`, so that programs don't depend on
     the wording of messages.
@@ -61,7 +66,9 @@ service.
   for programs that show entries with their icons.
 * `rbw profiles [--json]` lists the profiles on this computer, and
   `rbw purge --all` removes a profile with its configuration and every file
-  it keeps.
+  it keeps. `rbw profiles --json --status` adds each profile's `status`,
+  `lastSync` and `touchId`, as `rbw status --json` says them, without
+  starting any agent.
 * `rbw ssh-agent install` runs `rbw-agent` as a login service of launchd
   (macOS) or systemd (Linux). The service manager holds the agent's sockets
   and starts the agent when a program connects, and `rbw` uses the same

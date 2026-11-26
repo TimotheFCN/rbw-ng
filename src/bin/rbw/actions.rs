@@ -255,7 +255,18 @@ pub fn unlock_touch_id() -> anyhow::Result<()> {
 
 // Whether the vault is unlocked, and whether Touch ID can unlock it.
 pub fn status() -> anyhow::Result<(bool, bool)> {
-    let mut sock = connect()?;
+    status_from(connect()?)
+}
+
+// The same for the agent of another profile, at its socket; an agent that
+// doesn't run isn't started.
+pub fn profile_status(
+    socket: &std::path::Path,
+) -> anyhow::Result<(bool, bool)> {
+    status_from(crate::sock::Sock::connect_to(socket)?)
+}
+
+fn status_from(mut sock: crate::sock::Sock) -> anyhow::Result<(bool, bool)> {
     sock.send(&rbw::protocol::Request::new(
         get_environment(),
         rbw::protocol::Action::Status,
