@@ -1,6 +1,6 @@
 # Changelog
 
-## [1.19.0] - 2026-11-24
+## [1.19.0] - 2026-11-26
 
 Programs can drive `rbw` without a terminal, the way they would drive
 Bitwarden's official CLI: log in, unlock and read or save entries as JSON,
