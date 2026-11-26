@@ -360,11 +360,13 @@ pub enum Response {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         code: Option<ErrorCode>,
     },
+    // secrets in an answer are wiped from memory when dropped too; on the
+    // wire they are plain strings, as before
     Decrypt {
-        plaintext: String,
+        plaintext: Secret,
     },
     DecryptMany {
-        plaintexts: Vec<Result<String, DecryptError>>,
+        plaintexts: Vec<Result<Secret, DecryptError>>,
     },
     Encrypt {
         cipherstring: String,
@@ -373,11 +375,42 @@ pub enum Response {
         version: u32,
     },
     Session {
-        session: String,
+        session: Secret,
     },
     Status {
         unlocked: bool,
         // Touch ID can unlock the locked vault now
         touch_id: bool,
     },
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn secrets_in_answers_are_plain_strings_on_the_wire() {
+        let json = r#"{"type":"DecryptMany","plaintexts":[{"Ok":"hunter2"},{"Err":{"error":"no","code":{"code":"locked"}}}]}"#;
+        let res: Response = serde_json::from_str(json).unwrap();
+        let Response::DecryptMany { plaintexts } = &res else {
+            panic!("{res:?}");
+        };
+        assert_eq!(plaintexts[0].as_ref().unwrap().as_str(), "hunter2");
+        assert_eq!(serde_json::to_string(&res).unwrap(), json);
+
+        let res = Response::Decrypt {
+            plaintext: Secret::new("hunter2".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_string(&res).unwrap(),
+            r#"{"type":"Decrypt","plaintext":"hunter2"}"#
+        );
+        let res = Response::Session {
+            session: Secret::new("key".to_string()),
+        };
+        assert_eq!(
+            serde_json::to_string(&res).unwrap(),
+            r#"{"type":"Session","session":"key"}"#
+        );
+    }
 }

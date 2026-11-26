@@ -130,7 +130,7 @@ service.
     vault, which a program could replace with keys that its own password
     opens.
   * `rbw item edit` needs every kind of entry with re-prompt open, not only
-    logins.
+    logins, and `rbw item delete` needs it open too.
 * `rbw register` with a wrong API key on Vaultwarden says the key is
   incorrect instead of reporting a server error.
 * Logging in or registering with a server address that leads to no Bitwarden
@@ -138,6 +138,29 @@ service.
   `RBW_ERROR_FORMAT=json`, reporting `not_found`.
 * An agent started while another one answers on rbw's socket now leaves it
   alone instead of taking over its path.
+* A program that polls `rbw` with `RBW_NONINTERACTIVE`, such as `rbw status`
+  every few seconds, no longer takes the place of the terminal or display
+  that the SSH agent asks for the master password and confirmations on.
+  `rbw status`, `rbw unlocked` and version checks no longer take it either.
+* The SSH agent offers no key of an archived entry, and an entry whose public
+  key can't be decrypted, for example of an organization whose key is
+  missing, no longer stops it from finding the requested key.
+* `rbw-agent` no longer exits when it can't lock more memory against
+  swapping, as it could with many organization keys: the secrets that don't
+  fit stay unlocked, and it says so once in `agent.err`.
+* Argon2 settings from the server that are missing or out of range fail the
+  unlock instead of making `rbw-agent` exit, and more than 2 GiB of memory
+  is refused so that a server can't make the agent run out of memory.
+* `rbw-agent` wipes the secrets it answers with from its memory, as it does
+  for the ones it is sent, and `rbw item create` and `edit` wipe the item
+  read from stdin.
+* `rbw config set` writes the configuration to a new file and renames it into
+  place, so a crash never leaves half a configuration. A new configuration
+  folder is private. Two session saves at once no longer write into the same
+  temporary file.
+* The agent no longer exits when the server's notifications can't be
+  subscribed to, follows them on `http://` servers too, and logs no access
+  token when it can't reach them.
 * `rbw` and `rbw-agent` refuse an `RBW_PROFILE` that contains `/` or isn't
   UTF-8. Such a profile kept its files outside its own folders, so that
   `RBW_PROFILE=x/../.. rbw purge --all` removed the home folder, and one that

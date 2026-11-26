@@ -96,7 +96,10 @@ pub fn decrypt_many(
 
     let res = sock.recv()?;
     match res {
-        rbw::protocol::Response::DecryptMany { plaintexts } => Ok(plaintexts),
+        rbw::protocol::Response::DecryptMany { plaintexts } => Ok(plaintexts
+            .into_iter()
+            .map(|plaintext| plaintext.map(into_string))
+            .collect()),
         rbw::protocol::Response::Error { error, .. }
             if error.contains("unknown variant `DecryptMany`") =>
         {
@@ -137,12 +140,20 @@ fn decrypt_one(
 
     let res = sock.recv()?;
     match res {
-        rbw::protocol::Response::Decrypt { plaintext } => Ok(Ok(plaintext)),
+        rbw::protocol::Response::Decrypt { plaintext } => {
+            Ok(Ok(into_string(plaintext)))
+        }
         rbw::protocol::Response::Error { error, code } => {
             Ok(Err(rbw::protocol::DecryptError { error, code }))
         }
         _ => Err(anyhow::anyhow!("unexpected message: {res:?}")),
     }
+}
+
+// The plaintexts go into what rbw prints, so it takes the strings without
+// a copy.
+fn into_string(mut secret: rbw::protocol::Secret) -> String {
+    std::mem::take(&mut *secret)
 }
 
 pub fn encrypt(
@@ -197,7 +208,7 @@ pub fn login_with(
     password: rbw::protocol::Secret,
     code: Option<rbw::protocol::LoginCode>,
     session: bool,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<rbw::protocol::Secret>> {
     session_action(rbw::protocol::Action::LoginWith {
         password,
         code,
@@ -218,7 +229,7 @@ pub fn register_with(
 pub fn unlock_with(
     password: rbw::protocol::Secret,
     session: bool,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<rbw::protocol::Secret>> {
     session_action(rbw::protocol::Action::UnlockWith { password, session })
 }
 
@@ -267,7 +278,7 @@ pub fn unlock_session(session: rbw::protocol::Secret) -> anyhow::Result<()> {
 // An action that answers with a session key when it made one.
 fn session_action(
     action: rbw::protocol::Action,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<Option<rbw::protocol::Secret>> {
     let mut sock = connect()?;
 
     sock.send(&rbw::protocol::Request::new(get_environment(), action))?;

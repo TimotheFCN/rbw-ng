@@ -969,7 +969,7 @@ async fn decrypt_cipher(
     cipherstring: &str,
     entry_key: Option<&str>,
     org_id: Option<&str>,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<rbw::protocol::Secret> {
     decrypt_cipher_in_request(
         state,
         environment,
@@ -993,7 +993,7 @@ async fn decrypt_cipher_in_request(
     entry_key: Option<&str>,
     org_id: Option<&str>,
     reprompt_declined: &mut bool,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<rbw::protocol::Secret> {
     learn_master_password_reprompt(&state).await?;
     let cipherstring = rbw::cipherstring::CipherString::new(cipherstring)
         .context("failed to parse encrypted secret")?;
@@ -1064,9 +1064,13 @@ async fn decrypt_cipher_in_request(
             .decrypt_symmetric(keys, entry_key.as_ref())
             .context("failed to decrypt encrypted secret")?,
     )
-    .context("failed to parse decrypted secret")?;
+    .map_err(|e| {
+        // the bytes are the secret, even if they aren't text
+        zeroize::Zeroize::zeroize(&mut e.into_bytes());
+        anyhow::anyhow!("failed to parse decrypted secret")
+    })?;
 
-    Ok(plaintext)
+    Ok(rbw::protocol::Secret::new(plaintext))
 }
 
 // Before the agent decrypts anything, it learns which values need the
@@ -1393,7 +1397,7 @@ async fn respond_ack(sock: &mut crate::sock::Sock) -> anyhow::Result<()> {
 
 async fn respond_decrypt(
     sock: &mut crate::sock::Sock,
-    plaintext: String,
+    plaintext: rbw::protocol::Secret,
 ) -> anyhow::Result<()> {
     sock.send(&rbw::protocol::Response::Decrypt { plaintext })
         .await?;
@@ -1470,12 +1474,10 @@ pub async fn subscribe_to_notifications(
     let access_token =
         db.access_token.context("Error getting access token")?;
 
-    let websocket_url = format!(
-        "{}/hub?access_token={}",
-        config.notifications_url(),
-        access_token
-    )
-    .replace("https://", "wss://");
+    let websocket_url = crate::notifications::websocket_url(
+        &config.notifications_url(),
+        &access_token,
+    );
 
     let extra_headers = config.extra_headers()?;
 
@@ -1484,8 +1486,12 @@ pub async fn subscribe_to_notifications(
         .notifications_handler
         .connect(websocket_url, extra_headers)
         .await
-        .err()
-        .map_or_else(|| Ok(()), |err| Err(anyhow::anyhow!(err.to_string())))
+        .map_err(|err| {
+            anyhow::anyhow!(crate::notifications::redact(
+                &err.to_string(),
+                &access_token
+            ))
+        })
 }
 
 pub async fn get_ssh_public_keys(
@@ -1510,6 +1516,10 @@ pub async fn get_ssh_public_keys(
         else {
             continue;
         };
+        // archived entries stay out of use, as in the official clients
+        if entry.archived {
+            continue;
+        }
         // one broken entry should not hide every other key
         let plaintext = match decrypt_cipher(
             state.clone(),
@@ -1554,6 +1564,7 @@ pub async fn get_ssh_public_keys(
                 entry.org_id.as_deref(),
             )
             .await
+            .map(|name| name.to_string())
             .unwrap_or_default()
         } else {
             public_key.comment().to_string()
@@ -1593,14 +1604,30 @@ pub async fn find_ssh_private_key(
             let Some(public_key_enc) = public_key else {
                 continue;
             };
-            let public_key_plaintext = decrypt_cipher(
+            if entry.archived {
+                continue;
+            }
+            // one broken entry, for example of an organization whose key is
+            // missing, should not stop the search for the requested key
+            let public_key_plaintext = match decrypt_cipher(
                 state.clone(),
                 &environment,
                 public_key_enc,
                 entry.key.as_deref(),
                 entry.org_id.as_deref(),
             )
-            .await?;
+            .await
+            {
+                Ok(plaintext) => plaintext,
+                Err(e) => {
+                    log::warn!(
+                        "skipping entry {} whose SSH public key can't be \
+                         decrypted: {e:#}",
+                        entry.id
+                    );
+                    continue;
+                }
+            };
             // a malformed entry cannot be the requested key, and should not
             // stop the search for it
             let Ok(public_key) =
@@ -1628,7 +1655,7 @@ pub async fn find_ssh_private_key(
 
                 let private_key =
                     ssh_agent_lib::ssh_key::PrivateKey::from_openssh(
-                        private_key_plaintext,
+                        private_key_plaintext.as_str(),
                     )
                     .map_err(anyhow::Error::new)?;
                 let name = decrypt_cipher(
@@ -1639,7 +1666,7 @@ pub async fn find_ssh_private_key(
                     entry.org_id.as_deref(),
                 )
                 .await?;
-                return Ok((name, private_key));
+                return Ok((name.to_string(), private_key));
             }
         }
     }

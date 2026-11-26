@@ -330,9 +330,9 @@ pub struct Db {
     pub reprompt_mac: Option<String>,
 }
 
-// A temporary file in the same directory as the db, so that renaming it over
-// the db is atomic. Unique per process and per save.
-fn temp_file(file: &std::path::Path) -> std::path::PathBuf {
+// A temporary file in the same directory as the db (or the config), so that
+// renaming it over the file is atomic. Unique per process and per save.
+pub(crate) fn temp_file(file: &std::path::Path) -> std::path::PathBuf {
     static COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
